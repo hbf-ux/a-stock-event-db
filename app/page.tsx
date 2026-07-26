@@ -50,7 +50,7 @@ export default function Home() {
   const exportCsv = () => { const a = document.createElement("a"); a.href = "/api/export?format=csv"; a.download = "pledge-events.csv"; a.click(); flash("已从线上数据库生成 CSV"); };
   const syncAnnouncements = async () => {
     flash("正在同步官方公告适配器…");
-    try { const response = await fetch("/api/sync", { method: "POST" }); if (!response.ok) throw new Error(); const result = await response.json() as {events_created:number}; await loadEvents(); flash(result.events_created ? `同步完成，新增 ${result.events_created} 条事件` : "同步完成，当前数据已是最新"); }
+    try { const response = await fetch("/api/sync", { method: "POST", headers:{"content-type":"application/json"}, body:JSON.stringify({date:date || new Date().toISOString().slice(0,10)}) }); if (!response.ok) throw new Error(); const result = await response.json() as {announcements_found:number;announcements_inserted:number}; await loadEvents(); flash(`同步完成：发现 ${result.announcements_found} 条，新增 ${result.announcements_inserted} 条待解析公告`); }
     catch { flash("同步任务失败，请在系统日志中检查"); }
   };
 

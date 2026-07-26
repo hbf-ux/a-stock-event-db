@@ -50,6 +50,40 @@ async function seed(db: D1Database) {
   return demo.length;
 }
 
+type CninfoAnnouncement = { secCode: string; secName: string; announcementId: string; announcementTitle: string; announcementTime: number; adjunctUrl: string };
+type CninfoResult = { announcements?: CninfoAnnouncement[]; totalRecordNum?: number };
+const stripHtml = (value: string) => value.replace(/<[^>]+>/g, "").replaceAll("&amp;", "&").trim();
+const toDate = (timestamp: number) => new Date(timestamp).toISOString().slice(0, 10);
+const hex = (buffer: ArrayBuffer) => [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+async function fetchCninfo(date: string) {
+  const all: CninfoAnnouncement[] = [];
+  for (const column of ["szse", "sse"]) {
+    const body = new URLSearchParams({ pageNum: "1", pageSize: "100", column, tabName: "fulltext", plate: "", stock: "", searchkey: "质押", secid: "", category: "", trade: "", seDate: `${date}~${date}`, sortName: "", sortType: "", isHLtitle: "true" });
+    const response = await fetch("https://www.cninfo.com.cn/new/hisAnnouncement/query", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded; charset=UTF-8", accept: "application/json, text/plain, */*", referer: "https://www.cninfo.com.cn/new/disclosure", "user-agent": "Mozilla/5.0 (compatible; StockEventDB/1.0; public-disclosure-research)" }, body });
+    if (!response.ok) throw new Error(`巨潮资讯 ${column} 返回 ${response.status}`);
+    const data = await response.json<CninfoResult>();
+    all.push(...(data.announcements || []));
+  }
+  return [...new Map(all.map((item) => [item.announcementId, item])).values()];
+}
+
+async function ingestCninfo(db: D1Database, date: string) {
+  const announcements = await fetchCninfo(date); const now = new Date().toISOString(); let inserted = 0;
+  for (const item of announcements) {
+    const title = stripHtml(item.announcementTitle); const pdfUrl = `https://static.cninfo.com.cn/${item.adjunctUrl}`;
+    const existing = await db.prepare("SELECT announcement_id FROM announcement WHERE announcement_id=?").bind(item.announcementId).first();
+    if (existing) continue;
+    await db.batch([
+      db.prepare("INSERT OR IGNORE INTO stock_info (code,name,exchange,status) VALUES (?,?,?,?)").bind(item.secCode,item.secName,item.secCode.startsWith("6") ? "上交所" : item.secCode.startsWith("9") || item.secCode.startsWith("8") ? "北交所" : "深交所","上市"),
+      db.prepare("INSERT INTO announcement (announcement_id,stock_code,stock_name,title,announce_date,pdf_url,source,crawl_time,md5,parse_status) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(item.announcementId,item.secCode,item.secName,title,toDate(item.announcementTime),pdfUrl,"巨潮资讯",now,`pending:${item.announcementId}`,"queued"),
+      db.prepare("INSERT INTO review_queue (announcement_id,event_type,reason,payload,status,created_at) VALUES (?,?,?,?,?,?)").bind(item.announcementId,"pledge","等待 PDF 归档与结构化解析",JSON.stringify({ stockCode:item.secCode,stockName:item.secName,title,pdfUrl }),"pending",now),
+    ]);
+    inserted++;
+  }
+  return { found: announcements.length, inserted };
+}
+
 async function api(request: Request, env: Env): Promise<Response> {
   await ensureSchema(env.DB);
   const url = new URL(request.url);
@@ -58,11 +92,18 @@ async function api(request: Request, env: Env): Promise<Response> {
     return json({ status: "ok", storage: { d1: true, r2: true }, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/sync" && request.method === "POST") {
+    const input = await request.json<{date?:string}>().catch(() => ({})); const date = input.date && /^\d{4}-\d{2}-\d{2}$/.test(input.date) ? input.date : new Date(Date.now() - 86400000).toISOString().slice(0,10);
     const startedAt = new Date().toISOString();
     const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("official-adapters",startedAt,"running","V1 适配器初始化").first<{id:number}>();
-    const created = await seed(env.DB);
-    await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,message=? WHERE id=?").bind(new Date().toISOString(),"completed",created,created,created ? "初始化公开披露样例数据" : "数据已是最新",run?.id).run();
-    return json({ ok: true, run_id: run?.id, announcements_found: created, events_created: created, mode: "adapter-ready" });
+    try {
+      const result = await ingestCninfo(env.DB,date);
+      await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,message=? WHERE id=?").bind(new Date().toISOString(),"completed",result.found,0,`巨潮资讯 ${date}：新增 ${result.inserted} 条待解析公告`,run?.id).run();
+      return json({ ok:true,run_id:run?.id,date,announcements_found:result.found,announcements_inserted:result.inserted,events_created:0,mode:"cninfo-live" });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "同步失败";
+      await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,failures=1,message=? WHERE id=?").bind(new Date().toISOString(),"failed",message,run?.id).run();
+      return json({ ok:false,run_id:run?.id,error:message },{status:502});
+    }
   }
   if (url.pathname === "/api/events" && request.method === "GET") {
     await seed(env.DB);
@@ -79,6 +120,20 @@ async function api(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/api/announcements" && request.method === "GET") {
     const result = await env.DB.prepare("SELECT announcement_id AS announcementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,source,crawl_time AS crawlTime,md5,sha256,parse_status AS parseStatus FROM announcement ORDER BY announce_date DESC LIMIT 500").all();
     return json({ data: result.results, total: result.results.length });
+  }
+  if (url.pathname === "/api/sync-runs" && request.method === "GET") {
+    const result = await env.DB.prepare("SELECT id,source,started_at AS startedAt,finished_at AS finishedAt,status,announcements_found AS announcementsFound,events_created AS eventsCreated,failures,message FROM sync_run ORDER BY id DESC LIMIT 100").all();
+    return json({ data: result.results });
+  }
+  if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/archive") && request.method === "POST") {
+    const id = url.pathname.split("/")[3]; const item = await env.DB.prepare("SELECT pdf_url AS pdfUrl FROM announcement WHERE announcement_id=?").bind(id).first<{pdfUrl:string}>();
+    if (!item?.pdfUrl) return json({error:"announcement not found"},{status:404});
+    const response = await fetch(item.pdfUrl,{headers:{referer:"https://www.cninfo.com.cn/","user-agent":"Mozilla/5.0 (compatible; StockEventDB/1.0)"}}); if (!response.ok) return json({error:`PDF download failed: ${response.status}`},{status:502});
+    const bytes = await response.arrayBuffer(); const sha256 = hex(await crypto.subtle.digest("SHA-256",bytes)); const key = `announcements/${id}.pdf`;
+    await env.DOCUMENTS.put(key,bytes,{httpMetadata:{contentType:"application/pdf"},customMetadata:{announcementId:id,sha256}});
+    await env.DB.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status=? WHERE announcement_id=?").bind(key,sha256,"archived",id).run();
+    await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"archive",JSON.stringify({key,sha256,size:bytes.byteLength}),"worker",new Date().toISOString()).run();
+    return json({ok:true,key,sha256,size:bytes.byteLength});
   }
   if (url.pathname === "/api/reviews" && request.method === "GET") {
     const result = await env.DB.prepare("SELECT * FROM review_queue ORDER BY created_at DESC LIMIT 200").all();
