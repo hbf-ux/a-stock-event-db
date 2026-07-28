@@ -91,6 +91,7 @@ async function fetchWithRetry(input: RequestInfo | URL, init?: RequestInit, atte
     try {
       const response = await fetch(input,init);
       if (response.ok || (response.status < 500 && response.status !== 429)) return response;
+      if (attempt === attempts) return response;
       lastError = new Error(`HTTP ${response.status}`);
     } catch (error) { lastError = error; }
     if (attempt < attempts) await wait(300 * 3 ** (attempt - 1));
@@ -211,7 +212,10 @@ const validateParsedRows = (rows: ParsedPledge[]) => rows.map((row) => {
 async function parseWithOpenAI(pdfBase64: string, title: string, env: Env) {
   if (!env.OPENAI_API_KEY) return [];
   const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json" }, body:JSON.stringify({ model:env.OPENAI_OCR_MODEL || "gpt-5.6-luna", input:[{ role:"user", content:[{ type:"input_file", filename:"announcement.pdf", file_data:`data:application/pdf;base64,${pdfBase64}` },{ type:"input_text", text:`Extract every share pledge or release row from this A-share announcement titled ${title}. Return JSON only as {\"events\":[{\"shareholder\":\"\",\"pledgee\":\"\",\"pledge_amount\":\"\",\"pledge_ratio\":\"\",\"total_ratio\":\"\",\"start_date\":\"\",\"end_date\":\"\",\"purpose\":\"\",\"type\":\"新增质押|补充质押|解除质押|解除后再质押\"}]}. Never invent missing values.` }] }] }) });
-  if (!response.ok) throw new Error(`OpenAI OCR failed: ${response.status}`);
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0,500);
+    throw new Error(`OpenAI OCR failed: ${response.status}${detail ? ` ${detail}` : ""}`);
+  }
   const payload = await response.json<Record<string, unknown>>();
   const outputText = String(payload.output_text || ((payload.output as Array<{content?:Array<{text?:string}>}> | undefined)?.flatMap((item) => item.content || []).map((item) => item.text || "").join("") || ""));
   const jsonText = outputText.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
@@ -368,7 +372,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   const url = new URL(request.url);
   if (url.pathname === "/api/health") {
     const stats = await env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews").first();
-    return json({ status: "ok", storage: { d1: true, r2: true }, stats, timestamp: new Date().toISOString() });
+    return json({ status: "ok", storage: { d1: true, r2: true }, ocr: { configured: Boolean(env.OPENAI_API_KEY), model: env.OPENAI_OCR_MODEL || "gpt-5.6-luna" }, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
@@ -436,6 +440,17 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (url.pathname === "/api/process" && request.method === "POST") {
     const input = await request.json<{limit?:number}>().catch(() => ({}));
     return json({ ok:true,...await processPendingQueue(env.DB,env.DOCUMENTS,Number(input.limit) || 3,env) });
+  }
+  if (url.pathname === "/api/reprocess-reviews" && request.method === "POST") {
+    const input = await request.json<{limit?:number}>().catch(() => ({}));
+    const limit = Math.min(Math.max(Number(input.limit) || 3,1),5);
+    const pending = await env.DB.prepare("SELECT DISTINCT announcement_id AS id FROM review_queue WHERE status='pending' ORDER BY created_at ASC LIMIT ?").bind(limit).all<{id:string}>();
+    const results: unknown[] = [];
+    for (const row of pending.results) {
+      try { results.push(await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env)); }
+      catch (error) { results.push({id:row.id,status:"failed",error:error instanceof Error ? error.message : "reprocess failed"}); }
+    }
+    return json({ok:true,requested:limit,processed:results.length,results});
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/process") && request.method === "POST") {
     const id = url.pathname.split("/")[3];
