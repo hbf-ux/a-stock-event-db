@@ -183,11 +183,15 @@ async function api(request: Request, env: Env): Promise<Response> {
     const add = (sql: string, value: string | null) => { if (value) { conditions.push(sql); values.push(value); } };
     add("p.announce_date = ?", url.searchParams.get("date"));
     add("p.type = ?", url.searchParams.get("event_type"));
+    add("p.stock_code = ?", url.searchParams.get("stock"));
+    const shareholder = url.searchParams.get("shareholder"); if (shareholder) { conditions.push("p.shareholder LIKE ?"); values.push(`%${shareholder}%`); }
+    const pledgee = url.searchParams.get("pledgee"); if (pledgee) { conditions.push("p.pledgee LIKE ?"); values.push(`%${pledgee}%`); }
     const q = url.searchParams.get("q"); if (q) { conditions.push("(p.stock_code LIKE ? OR p.stock_name LIKE ? OR p.shareholder LIKE ? OR p.pledgee LIKE ?)"); values.push(...Array(4).fill(`%${q}%`)); }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-    const sql = `SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,p.confidence,p.parser_version AS parserVersion,a.source,a.pdf_url AS pdfUrl,a.md5,a.sha256 FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id ${where} ORDER BY p.announce_date DESC,p.id DESC LIMIT 500`;
-    const result = await env.DB.prepare(sql).bind(...values).all();
-    return json({ data: result.results, total: result.results.length, traceable: true });
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 100, 1), 500); const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
+    const sql = `SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,p.confidence,p.parser_version AS parserVersion,a.source,a.pdf_url AS pdfUrl,a.md5,a.sha256 FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id ${where} ORDER BY p.announce_date DESC,p.id DESC LIMIT ? OFFSET ?`;
+    const [result,count] = await Promise.all([env.DB.prepare(sql).bind(...values,limit,offset).all(),env.DB.prepare(`SELECT COUNT(*) AS total FROM pledge p ${where}`).bind(...values).first<{total:number}>()]);
+    return json({ data: result.results, total: count?.total || 0, limit, offset, traceable: true });
   }
   if (url.pathname === "/api/announcements" && request.method === "GET") {
     const result = await env.DB.prepare("SELECT announcement_id AS announcementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,source,crawl_time AS crawlTime,md5,sha256,parse_status AS parseStatus FROM announcement ORDER BY announce_date DESC LIMIT 500").all();
@@ -260,6 +264,13 @@ async function api(request: Request, env: Env): Promise<Response> {
     const format = url.searchParams.get("format") || "csv";
     if (format === "json") return json(result.results, { headers: { "content-disposition": "attachment; filename=pledge-events.json" } });
     const cols = ["announce_date","stock_code","stock_name","shareholder","pledgee","pledge_amount_text","pledge_ratio","total_ratio","type"];
+    if (format === "xls") {
+      const escapeXml = (value: unknown) => String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
+      const labels = ["公告日期","股票代码","股票名称","股东名称","质权人","质押数量","占其持股","占总股本","事件类型"];
+      const rowXml = (cells: unknown[]) => `<Row>${cells.map((cell) => `<Cell><Data ss:Type="String">${escapeXml(cell)}</Data></Cell>`).join("")}</Row>`;
+      const xml = `<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="股权质押"><Table>${rowXml(labels)}${result.results.map((row) => rowXml(cols.map((col) => row[col]))).join("")}</Table></Worksheet></Workbook>`;
+      return new Response(xml,{headers:{"content-type":"application/vnd.ms-excel; charset=utf-8","content-disposition":"attachment; filename=pledge-events.xls"}});
+    }
     const csv = "\ufeff" + cols.join(",") + "\n" + result.results.map((r) => cols.map((c) => `"${String(r[c] ?? "").replaceAll('"','""')}"`).join(",")).join("\n");
     return new Response(csv, { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=pledge-events.csv" } });
   }

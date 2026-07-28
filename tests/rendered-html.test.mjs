@@ -15,6 +15,7 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(page, /人工审核工作台/);
   assert.match(page, /审核通过并入库/);
   assert.match(page, /系统运行日志/);
+  assert.match(page, /导出格式/);
   assert.match(page, /\/api\/announcements\/\$\{row\.announcementId\}\/process/);
   assert.match(worker, /from "unpdf"/);
   assert.match(worker, /async function processAnnouncement/);
@@ -22,6 +23,8 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /manual-review-v1/);
   assert.match(worker, /review already completed/);
   assert.match(worker, /completed_with_errors/);
+  assert.match(worker, /application\/vnd\.ms-excel/);
+  assert.match(worker, /p\.shareholder LIKE/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
   assert.match(layout, /A股事件库/);
 });

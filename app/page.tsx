@@ -43,6 +43,7 @@ export default function Home() {
   const [notice, setNotice] = useState("");
   const [state, setState] = useState<"loading" | "online" | "error">("loading");
   const [syncing, setSyncing] = useState(false);
+  const [exportFormat, setExportFormat] = useState<"xls" | "csv" | "json">("xls");
 
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 3500); };
   const loadAll = useCallback(async () => {
@@ -129,6 +130,11 @@ export default function Home() {
     flash(status === "approved" ? "审核通过，事件已写入数据库" : "该公告已标记为不入库");
   };
 
+  const exportData = () => {
+    window.location.href = `/api/export?format=${exportFormat}`;
+    flash(`正在导出 ${exportFormat === "xls" ? "Excel" : exportFormat.toUpperCase()} 文件`);
+  };
+
   const rawCount = health.stats?.announcements ?? announcements.length;
   const eventCount = health.stats?.events ?? events.length;
   const pendingCount = health.stats?.pending_reviews ?? announcements.filter((row) => row.parseStatus !== "parsed").length;
@@ -155,7 +161,7 @@ export default function Home() {
     <section className="content">
       <header><div className="crumb">{view === "announcements" ? "公告中心 / 官方披露" : "事件中心 / 股权质押"}</div><div className="headerRight"><div className="globalSearch">⌕<input aria-label="全局搜索" placeholder="搜索股票、股东或公告…" value={query} onChange={(e) => setQuery(e.target.value)} /></div><div className="avatar">研</div></div></header>
       <div className="page">
-        <div className="titleRow"><div><p className="eyebrow">{pageEyebrow} · {state.toUpperCase()}</p><h1>{pageTitle}</h1><p>{pageDescription}</p></div><div className="actions"><button className="secondary" disabled={syncing} onClick={() => void sync()}>{syncing ? "处理中…" : "↻ 同步公告"}</button>{view === "announcements" && <button className="secondary" disabled={syncing || pendingCount === 0} onClick={() => void processPending()}>⚙ 处理待解析</button>}<button className="primary" onClick={() => { window.location.href = "/api/export?format=csv"; }}>⇩ 导出数据</button></div></div>
+        <div className="titleRow"><div><p className="eyebrow">{pageEyebrow} · {state.toUpperCase()}</p><h1>{pageTitle}</h1><p>{pageDescription}</p></div><div className="actions"><button className="secondary" disabled={syncing} onClick={() => void sync()}>{syncing ? "处理中…" : "↻ 同步公告"}</button>{view === "announcements" && <button className="secondary" disabled={syncing || pendingCount === 0} onClick={() => void processPending()}>⚙ 处理待解析</button>}<div className="exportGroup"><select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value as "xls" | "csv" | "json")}><option value="xls">Excel</option><option value="csv">CSV</option><option value="json">JSON</option></select><button className="primary" onClick={exportData}>⇩ 导出</button></div></div></div>
         <div className="stats"><div><span className="statIcon blue">▥</span><p>已抓取公告</p><strong>{rawCount}</strong><small>官方原始披露</small></div><div><span className="statIcon violet">◇</span><p>结构化质押事件</p><strong>{eventCount}</strong><small>通过完整性校验</small></div><div><span className="statIcon amber">◷</span><p>待解析 / 审核</p><strong>{pendingCount}</strong><small><b className="warn">需处理</b></small></div><div><span className="statIcon green">✓</span><p>当前解析率</p><strong>{parsedRate}</strong><small>事件数 / 公告数</small></div></div>
         {eventCount === 0 && rawCount > 0 && <div className="dataNotice"><b>真实数据不为空：</b>已抓取 {rawCount} 条官方公告，其中 {pendingCount} 条等待 PDF 归档和字段解析。系统不会用不完整字段伪造质押事件。</div>}
         {view === "reviews" ? <ReviewPanel reviews={reviews} onOpen={openReview} /> : view === "logs" ? <LogsPanel runs={syncRuns} /> : <section className="panel">
