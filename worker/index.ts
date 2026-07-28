@@ -200,13 +200,17 @@ async function api(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/api/process" && request.method === "POST") {
     const input = await request.json<{limit?:number}>().catch(() => ({}));
     const limit = Math.min(Math.max(Number(input.limit) || 3, 1), 10);
+    const startedAt = new Date().toISOString();
+    const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("pdf-parser",startedAt,"running",`开始处理最多 ${limit} 条公告`).first<{id:number}>();
     const pending = await env.DB.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived','review') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
     const results: unknown[] = [];
+    let parsed = 0; let failures = 0;
     for (const row of pending.results) {
-      try { results.push(await processAnnouncement(env.DB, env.DOCUMENTS, row.id)); }
-      catch (error) { results.push({ id: row.id, status: "failed", error: error instanceof Error ? error.message : "parse failed" }); }
+      try { const result = await processAnnouncement(env.DB, env.DOCUMENTS, row.id); results.push(result); if (result.status === "parsed") parsed++; }
+      catch (error) { failures++; results.push({ id: row.id, status: "failed", error: error instanceof Error ? error.message : "parse failed" }); }
     }
-    return json({ ok: true, processed: results.length, results });
+    await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(new Date().toISOString(),failures ? "completed_with_errors" : "completed",results.length,parsed,failures,`处理 ${results.length} 条，生成 ${parsed} 条事件，失败 ${failures} 条`,run?.id).run();
+    return json({ ok: true, run_id: run?.id, processed: results.length, events_created: parsed, failures, results });
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/process") && request.method === "POST") {
     const id = url.pathname.split("/")[3];
