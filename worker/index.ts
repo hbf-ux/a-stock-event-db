@@ -240,7 +240,7 @@ async function legacyProcessAnnouncement(db: D1Database, documents: R2Bucket, id
     r2Key = `announcements/${id}.pdf`;
     await documents.put(r2Key, bytes, { httpMetadata: { contentType: "application/pdf" }, customMetadata: { announcementId: id, sha256 } });
   }
-  const pdf = await getDocumentProxy(new Uint8Array(bytes));
+  const pdf = await getDocumentProxy(new Uint8Array(bytes.slice(0)));
   const extracted = await extractText(pdf, { mergePages: true });
   const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
   await documents.put(`announcements/${id}.txt`, text, { httpMetadata: { contentType: "text/plain; charset=utf-8" } });
@@ -274,7 +274,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
     bytes = await response.arrayBuffer(); sha256 = hex(await crypto.subtle.digest("SHA-256",bytes)); r2Key = `announcements/${id}.pdf`;
     await documents.put(r2Key,bytes,{httpMetadata:{contentType:"application/pdf"},customMetadata:{announcementId:id,sha256}});
   }
-  const pdf = await getDocumentProxy(new Uint8Array(bytes)); const extracted = await extractText(pdf,{mergePages:true});
+  const pdf = await getDocumentProxy(new Uint8Array(bytes.slice(0))); const extracted = await extractText(pdf,{mergePages:true});
   const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
   let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.1"; let confidence = rows.length > 1 ? 0.88 : 0.82;
