@@ -19,6 +19,7 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(page, /后台解析已启动/);
   assert.match(page, /近 14 日公告趋势/);
   assert.match(page, /主要质权人/);
+  assert.match(page, /回补 7 日/);
   assert.match(page, /\/api\/announcements\/\$\{row\.announcementId\}\/process/);
   assert.match(worker, /from "unpdf"/);
   assert.match(worker, /async function processAnnouncement/);
@@ -34,6 +35,7 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /parse_attempts=parse_attempts\+1/);
   assert.match(worker, /ALTER TABLE announcement ADD COLUMN parse_attempts/);
   assert.match(worker, /\/api\/stats/);
+  assert.match(worker, /\/api\/backfill/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
   assert.match(layout, /A股事件库/);
 });

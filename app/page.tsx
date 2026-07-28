@@ -102,6 +102,18 @@ export default function Home() {
     finally { setSyncing(false); }
   };
 
+  const backfill = async () => {
+    setSyncing(true); flash("正在回补近 7 日官方公告…");
+    try {
+      const response = await fetch("/api/backfill",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({days:7,endDate:date || undefined})});
+      const result = await response.json() as { announcements_found?:number;announcements_inserted?:number;failures?:number;error?:string };
+      if (!response.ok) throw new Error(result.error || "历史回补失败");
+      await loadAll(); setView("announcements");
+      flash(`回补完成：发现 ${result.announcements_found || 0} 条，新增 ${result.announcements_inserted || 0} 条，失败日期 ${result.failures || 0} 个`);
+    } catch (error) { flash(error instanceof Error ? error.message : "历史回补失败"); }
+    finally { setSyncing(false); }
+  };
+
   const archive = async (row: AnnouncementRow) => {
     flash(`正在下载并解析 ${row.stockName} 的公告 PDF…`);
     const response = await fetch(`/api/announcements/${row.announcementId}/process`, { method: "POST" });
@@ -171,7 +183,7 @@ export default function Home() {
     <section className="content">
       <header><div className="crumb">{view === "announcements" ? "公告中心 / 官方披露" : "事件中心 / 股权质押"}</div><div className="headerRight"><div className="globalSearch">⌕<input aria-label="全局搜索" placeholder="搜索股票、股东或公告…" value={query} onChange={(e) => setQuery(e.target.value)} /></div><div className="avatar">研</div></div></header>
       <div className="page">
-        <div className="titleRow"><div><p className="eyebrow">{pageEyebrow} · {state.toUpperCase()}</p><h1>{pageTitle}</h1><p>{pageDescription}</p></div><div className="actions"><button className="secondary" disabled={syncing} onClick={() => void sync()}>{syncing ? "处理中…" : "↻ 同步公告"}</button>{view === "announcements" && <button className="secondary" disabled={syncing || pendingCount === 0} onClick={() => void processPending()}>⚙ 处理待解析</button>}<div className="exportGroup"><select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value as "xls" | "csv" | "json")}><option value="xls">Excel</option><option value="csv">CSV</option><option value="json">JSON</option></select><button className="primary" onClick={exportData}>⇩ 导出</button></div></div></div>
+        <div className="titleRow"><div><p className="eyebrow">{pageEyebrow} · {state.toUpperCase()}</p><h1>{pageTitle}</h1><p>{pageDescription}</p></div><div className="actions"><button className="secondary" disabled={syncing} onClick={() => void sync()}>{syncing ? "处理中…" : "↻ 同步公告"}</button>{view === "announcements" && <button className="secondary" disabled={syncing} onClick={() => void backfill()}>↶ 回补 7 日</button>}{view === "announcements" && <button className="secondary" disabled={syncing || pendingCount === 0} onClick={() => void processPending()}>⚙ 处理待解析</button>}<div className="exportGroup"><select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value as "xls" | "csv" | "json")}><option value="xls">Excel</option><option value="csv">CSV</option><option value="json">JSON</option></select><button className="primary" onClick={exportData}>⇩ 导出</button></div></div></div>
         <div className="stats"><div><span className="statIcon blue">▥</span><p>已抓取公告</p><strong>{rawCount}</strong><small>官方原始披露</small></div><div><span className="statIcon violet">◇</span><p>结构化质押事件</p><strong>{eventCount}</strong><small>通过完整性校验</small></div><div><span className="statIcon amber">◷</span><p>待解析 / 审核</p><strong>{pendingCount}</strong><small><b className="warn">需处理</b></small></div><div><span className="statIcon green">✓</span><p>当前解析率</p><strong>{parsedRate}</strong><small>事件数 / 公告数</small></div></div>
         {eventCount === 0 && rawCount > 0 && <div className="dataNotice"><b>真实数据不为空：</b>已抓取 {rawCount} 条官方公告，其中 {pendingCount} 条等待 PDF 归档和字段解析。系统不会用不完整字段伪造质押事件。</div>}
         {view === "dashboard" ? <DashboardPanel stats={statsData} runs={syncRuns} /> : view === "reviews" ? <ReviewPanel reviews={reviews} onOpen={openReview} /> : view === "logs" ? <LogsPanel runs={syncRuns} /> : <section className="panel">

@@ -230,6 +230,22 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       return json({ ok:false,run_id:run?.id,error:message },{status:502});
     }
   }
+  if (url.pathname === "/api/backfill" && request.method === "POST") {
+    const input = await request.json<{days?:number;endDate?:string}>().catch(() => ({}));
+    const days = Math.min(Math.max(Number(input.days) || 7,1),7);
+    const endDate = input.endDate && /^\d{4}-\d{2}-\d{2}$/.test(input.endDate) ? input.endDate : new Date().toISOString().slice(0,10);
+    const end = new Date(`${endDate}T00:00:00Z`); const startedAt = new Date().toISOString();
+    const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("historical-backfill",startedAt,"running",`回补 ${days} 日公告`).first<{id:number}>();
+    let found = 0; let inserted = 0; let failures = 0; const dates: {date:string;found:number;inserted:number;error?:string}[] = [];
+    for (let index = days - 1; index >= 0; index--) {
+      const current = new Date(end); current.setUTCDate(end.getUTCDate() - index); const date = current.toISOString().slice(0,10);
+      try { const result = await ingestCninfo(env.DB,date); found += result.found; inserted += result.inserted; dates.push({date,...result}); }
+      catch (error) { failures++; dates.push({date,found:0,inserted:0,error:error instanceof Error ? error.message : "sync failed"}); }
+    }
+    await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,failures=?,message=? WHERE id=?").bind(new Date().toISOString(),failures ? "completed_with_errors" : "completed",found,failures,`回补 ${days} 日：发现 ${found} 条，新增 ${inserted} 条，失败日期 ${failures} 个`,run?.id).run();
+    ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,10));
+    return json({ok:true,run_id:run?.id,days,end_date:endDate,announcements_found:found,announcements_inserted:inserted,failures,dates,auto_processing:true});
+  }
   if (url.pathname === "/api/events" && request.method === "GET") {
     const conditions: string[] = []; const values: string[] = [];
     const add = (sql: string, value: string | null) => { if (value) { conditions.push(sql); values.push(value); } };
