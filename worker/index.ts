@@ -278,21 +278,23 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   const pdf = await getDocumentProxy(new Uint8Array(bytes)); const extracted = await extractText(pdf,{mergePages:true});
   const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
-  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.1"; let confidence = rows.length > 1 ? 0.88 : 0.82;
+  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.1"; let confidence = rows.length > 1 ? 0.88 : 0.82; let ocrError = "";
   if (!rows.some((row) => !row.missing.length) && env?.OPENAI_API_KEY) {
-    const visionRows = await parseWithOpenAI(pdfBase64,item.title,env);
-    await documents.put(`announcements/${id}.ocr.json`,JSON.stringify({parser:"openai-responses",rows:visionRows}),{httpMetadata:{contentType:"application/json; charset=utf-8"}});
-    if (visionRows.length) { rows = validateParsedRows(visionRows); parserVersion = `openai-vision-v1:${env.OPENAI_OCR_MODEL || "gpt-5.6-luna"}`; confidence = 0.9; }
+    try {
+      const visionRows = await parseWithOpenAI(pdfBase64,item.title,env);
+      await documents.put(`announcements/${id}.ocr.json`,JSON.stringify({parser:"openai-responses",rows:visionRows}),{httpMetadata:{contentType:"application/json; charset=utf-8"}});
+      if (visionRows.length) { rows = validateParsedRows(visionRows); parserVersion = `openai-vision-v1:${env.OPENAI_OCR_MODEL || "gpt-5.6-luna"}`; confidence = 0.9; }
+    } catch (error) { ocrError = error instanceof Error ? error.message : "OCR failed"; }
   }
   const completeRows = rows.filter((row) => !row.missing.length); const parsed = rows[0]; const now = new Date().toISOString();
   if (!completeRows.length) {
     const missing = parsed?.missing || ["股东","质权人","质押数量"];
     await db.batch([
       db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review',last_error=NULL WHERE announcement_id=?").bind(r2Key,sha256,id),
-      db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(`自动解析缺少字段：${missing.join("、")}${env?.OPENAI_API_KEY ? "；OCR 未识别出完整记录" : "；OCR 尚未配置"}`,JSON.stringify({...parsed,candidates:rows,textKey:`announcements/${id}.txt`,ocrConfigured:Boolean(env?.OPENAI_API_KEY)}),id),
+      db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(`自动解析缺少字段：${missing.join("、")}${ocrError ? `；OCR 失败：${ocrError}` : env?.OPENAI_API_KEY ? "；OCR 未识别出完整记录" : "；OCR 尚未配置"}`,JSON.stringify({...parsed,candidates:rows,textKey:`announcements/${id}.txt`,ocrConfigured:Boolean(env?.OPENAI_API_KEY),ocrError}),id),
       db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"parse_review",JSON.stringify({missing,parserVersion,ocrConfigured:Boolean(env?.OPENAI_API_KEY)}),"worker",now),
     ]);
-    return {id,status:"review",missing,ocr_attempted:Boolean(env?.OPENAI_API_KEY)};
+    return {id,status:"review",missing,ocr_attempted:Boolean(env?.OPENAI_API_KEY),ocr_error:ocrError || undefined};
   }
   const statements: D1PreparedStatement[] = [];
   for (let index = 0; index < completeRows.length; index++) {
