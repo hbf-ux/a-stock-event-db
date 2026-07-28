@@ -117,8 +117,8 @@ const amountNumber = (value: string) => {
 function parsePledgeText(text: string, title: string) {
   const compact = cleanText(text);
   const shareholder = firstMatch(compact, [/(?:股东名称|股东姓名|出质人)[：:]?\s*([^\n]{2,80})/i, /(?:股东|出质人)\s+([^\n]{2,80})/i]);
-  const pledgee = firstMatch(compact, [/(?:质权人|质权方|质押权人)[：:]?\s*([^\n]{2,100})/i, /(?:质权人|质押权人)\s+([^\n]{2,100})/i]);
-  const amountText = firstMatch(compact, [/(?:本次质押(?:股数|数量)?|质押股数|质押数量|解除质押(?:股数|数量)?)[：:]?\s*([\d,.]+\s*(?:万|亿)?\s*股)/i, /([\d,.]+\s*(?:万|亿)?\s*股)\s*(?:占其所持股份|占所持股份)/i]);
+  const pledgee = firstMatch(compact, [/质押给\s*([^，。]{2,60}?(?:有限责任公司|有限公司))/i, /(?:质权人|质权方|质押权人)[：:]?\s*([^\n]{2,100})/i, /(?:质权人|质押权人)\s+([^\n]{2,100})/i]);
+  const amountText = firstMatch(compact, [/(?:本次质押(?:股数|数量)?|质押股数|质押数量|解除质押(?:股数|数量)?)[：:]?\s*([\d,.]+\s*(?:万|亿)?\s*股)/i, /([\d,.]+\s*(?:万|亿)?\s*股)\s*(?:占其所持股份|占所持股份|占公司总股本)/i]);
   const pledgeRatio = firstMatch(compact, [/(?:占其所持股份比例|占所持股份比例)[：:]?\s*([\d.]+%)/i]);
   const totalRatio = firstMatch(compact, [/(?:占公司总股本比例|占总股本比例)[：:]?\s*([\d.]+%)/i]);
   const startDate = firstMatch(compact, [/(?:质押起始日|起始日)[：:]?\s*(\d{4}[年./-]\d{1,2}[月./-]\d{1,2}日?)/i]);
@@ -134,7 +134,7 @@ type ParsedPledge = ReturnType<typeof parsePledgeText>;
 function parseFlattenedTableRows(text: string, title: string): ParsedPledge[] {
   const flat = text.replace(/\r?\n/g," ").replace(/\s+/g," ").trim();
   const namedPeople = [...new Set([...flat.matchAll(/([\u4e00-\u9fff·]{2,4})\s*(?:先生|女士)/g)].map((match) => match[1]))];
-  const rowPattern = /([\u4e00-\u9fff·](?:\s*[\u4e00-\u9fff·]){1,19})\s+是\s+([\d,.]+)\s*(?:股)?\s+([\d.]+%)\s+([\d.]+%)\s+(.{0,260}?)(?=(?:[\u4e00-\u9fff·](?:\s*[\u4e00-\u9fff·]){1,19}\s+是\s+[\d,.]+\s+(?:股\s+)?[\d.]+%)|\s+合计\s|\s+[二三四五六]、|$)/g;
+  const rowPattern = /([\u4e00-\u9fff·](?:\s*[\u4e00-\u9fff·]){1,19})\s+是\s+([\d,.]+)\s*(?:股)?\s+([\d.]+)%?\s+([\d.]+)%?\s+(.{0,260}?)(?=(?:[\u4e00-\u9fff·](?:\s*[\u4e00-\u9fff·]){1,19}\s+是\s+[\d,.]+\s+(?:股\s+)?[\d.]+%?)|\s+合计\s|\s+[二三四五六]、|$)/g;
   const rows: ParsedPledge[] = []; let previousShareholder = "";
   for (const match of flat.matchAll(rowPattern)) {
     let shareholder = match[1].replace(/\s/g,"").replace(/^.*(?:质押用途|用途|质权人|到期日|起始日|限售股)/,"");
@@ -148,11 +148,11 @@ function parseFlattenedTableRows(text: string, title: string): ParsedPledge[] {
     else if (shareholder.length > 10 || /(借款|质押|融资|用途|证券|银行|信托)/.test(shareholder)) shareholder = "";
     const amountText = `${match[2]} 股`; const tail = match[5];
     const dates = [...tail.matchAll(/\d{4}\s*[年/.\-]\s*\d{1,2}\s*[月/.\-]\s*\d{1,2}\s*日?/g)].map((item) => item[0].replace(/\s/g,""));
-    const compactTail = tail.replace(/\s/g,""); const organizationMatches = [...compactTail.matchAll(/[\u4e00-\u9fff（）()]{2,14}(?:证券|银行|信托)[\u4e00-\u9fff（）()]{0,8}(?:股份有限公司|有限责任公司|有限公司)/g)];
+    const compactTail = tail.replace(/\s/g,""); const organizationMatches = [...compactTail.matchAll(/[\u4e00-\u9fff（）()]{2,30}(?:股份有限公司|有限责任公司|有限公司)/g)];
     let pledgee = organizationMatches.at(-1)?.[0] || "";
     pledgee = pledgee.replace(/^.*(?:为止|日期|到期日|解除质押日|否|是)/,"");
     const amount = amountNumber(amountText); const missing = [!shareholder && "股东", !pledgee && "质权人", !amount && "质押数量"].filter(Boolean);
-    rows.push({shareholder,pledgee,amount,amountText,pledgeRatio:match[3],totalRatio:match[4],startDate:dates[0] || "",endDate:dates[1] || "",purpose:"",type:pledgeType(title),missing});
+    rows.push({shareholder,pledgee,amount,amountText,pledgeRatio:`${match[3]}%`,totalRatio:`${match[4]}%`,startDate:dates[0] || "",endDate:dates[1] || "",purpose:"",type:pledgeType(title),missing});
     if (!missing.length) previousShareholder = shareholder;
   }
   return rows.filter((row) => row.shareholder !== "股东名称" && row.shareholder !== "股东");

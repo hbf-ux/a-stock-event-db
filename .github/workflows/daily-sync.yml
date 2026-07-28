@@ -38,8 +38,13 @@ jobs:
             -H "Content-Type: application/json" \
             -d "{\"date\":\"$sync_date\"}" \
             "$SITE_URL/api/sync"
-          curl --fail-with-body --retry 3 --retry-all-errors \
-            -H "OAI-Sites-Authorization: Bearer $SITES_BYPASS_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d '{"limit":10}' \
-            "$SITE_URL/api/process"
+          for batch in 1 2 3 4; do
+            response=$(curl --fail-with-body --retry 3 --retry-all-errors \
+              -H "OAI-Sites-Authorization: Bearer $SITES_BYPASS_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"limit":10}' \
+              "$SITE_URL/api/process")
+            echo "$response"
+            processed=$(printf '%s' "$response" | jq -r '.processed // 0')
+            if [ "$processed" -eq 0 ]; then break; fi
+          done
