@@ -131,8 +131,26 @@ function parsePledgeText(text: string, title: string) {
 
 type ParsedPledge = ReturnType<typeof parsePledgeText>;
 
+function parseFlattenedTableRows(text: string, title: string): ParsedPledge[] {
+  const flat = text.replace(/\r?\n/g," ").replace(/\s+/g," ").trim();
+  const rowPattern = /([\u4e00-\u9fff·]{2,20})\s+是\s+([\d,.]+)\s*(?:股)?\s+([\d.]+%)\s+([\d.]+%)\s+(.{0,260}?)(?=(?:[\u4e00-\u9fff·]{2,20}\s+是\s+[\d,.]+\s+(?:股\s+)?[\d.]+%)|\s+合计\s|\s+[二三四五六]、|$)/g;
+  const rows: ParsedPledge[] = [];
+  for (const match of flat.matchAll(rowPattern)) {
+    const shareholder = match[1].replace(/\s/g,""); const amountText = `${match[2]} 股`; const tail = match[5];
+    const dates = [...tail.matchAll(/\d{4}\s*[年/.\-]\s*\d{1,2}\s*[月/.\-]\s*\d{1,2}\s*日?/g)].map((item) => item[0].replace(/\s/g,""));
+    const compactTail = tail.replace(/\s/g,""); const organizationMatches = [...compactTail.matchAll(/[\u4e00-\u9fff（）()]{2,14}(?:证券|银行|信托)[\u4e00-\u9fff（）()]{0,12}(?:股份有限公司|有限责任公司|有限公司)?/g)];
+    let pledgee = organizationMatches.at(-1)?.[0] || "";
+    pledgee = pledgee.replace(/^.*(?:为止|日期|到期日|解除质押日|否|是)/,"");
+    const amount = amountNumber(amountText); const missing = [!shareholder && "股东", !pledgee && "质权人", !amount && "质押数量"].filter(Boolean);
+    rows.push({shareholder,pledgee,amount,amountText,pledgeRatio:match[3],totalRatio:match[4],startDate:dates[0] || "",endDate:dates[1] || "",purpose:"",type:pledgeType(title),missing});
+  }
+  return rows.filter((row) => row.shareholder !== "股东名称" && row.shareholder !== "股东");
+}
+
 function parsePledgeRows(text: string, title: string): ParsedPledge[] {
   const fallback = parsePledgeText(text, title);
+  const flattenedRows = parseFlattenedTableRows(text,title);
+  if (flattenedRows.some((row) => !row.missing.length)) return flattenedRows;
   const rows: ParsedPledge[] = [];
   const seen = new Set<string>();
   for (const rawLine of text.split(/\r?\n/)) {
