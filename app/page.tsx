@@ -7,6 +7,7 @@ type AnnouncementRow = { announcementId: string; stockCode: string; stockName: s
 type ReviewRow = { id: number; announcementId: string; reason: string; payload: string; status: string; stockCode: string; stockName: string; title: string; announceDate: string; pdfUrl?: string };
 type ReviewForm = { shareholder: string; pledgee: string; amount: string; amountText: string; pledgeRatio: string; totalRatio: string; type: string };
 type SyncRun = { id: number; source: string; startedAt: string; finishedAt?: string; status: string; announcementsFound: number; eventsCreated: number; failures: number; message?: string };
+type StatsData = { daily: { date: string; announcements: number; parsed: number }[]; eventTypes: { name: string; value: number }[]; pledgees: { name: string; value: number; amount: number }[]; statuses: { name: string; value: number }[] };
 type Health = { stats?: { announcements?: number; events?: number; pending_reviews?: number } };
 
 const statusText: Record<string, string> = { queued: "待归档", archived: "待解析", parsed: "已解析", pending: "待处理", review: "待审核", rejected: "已驳回" };
@@ -29,14 +30,21 @@ function LogsPanel({ runs }: { runs: SyncRun[] }) {
   return <section className="panel logsPanel"><div className="panelHead"><div><h2>系统运行日志</h2><span>公告同步与 PDF 解析任务的执行记录</span></div><span className="tag release">最近 {runs.length} 次</span></div><div className="tableWrap"><table><thead><tr><th>开始时间</th><th>任务</th><th>状态</th><th>处理公告</th><th>生成事件</th><th>失败</th><th>运行结果</th></tr></thead><tbody>{runs.map((run) => <tr key={run.id}><td className="mono">{new Date(run.startedAt).toLocaleString("zh-CN", { hour12: false })}</td><td><b>{run.source === "pdf-parser" ? "PDF 解析" : "官方公告同步"}</b><small>任务 #{run.id}</small></td><td><span className={`tag ${run.status === "completed" ? "release" : run.status === "failed" ? "new" : "extra"}`}>{statusLabel[run.status] || run.status}</span></td><td className="mono">{run.announcementsFound}</td><td className="mono">{run.eventsCreated}</td><td className={run.failures ? "failCount mono" : "mono"}>{run.failures}</td><td title={run.message}>{run.message || "—"}</td></tr>)}{!runs.length && <tr><td colSpan={7} className="empty">尚无运行记录；同步公告或处理待解析任务后会自动记录。</td></tr>}</tbody></table></div><div className="pagination"><span>日志按时间倒序排列</span></div></section>;
 }
 
+function DashboardPanel({ stats, runs }: { stats: StatsData; runs: SyncRun[] }) {
+  const maxDaily = Math.max(...stats.daily.map((row) => row.announcements),1);
+  const maxPledgee = Math.max(...stats.pledgees.map((row) => row.value),1);
+  return <div className="dashboardGrid"><section className="panel trendPanel"><div className="panelHead"><div><h2>近 14 日公告趋势</h2><span>官方公告数量与已解析数量</span></div></div><div className="barChart">{stats.daily.map((row) => <div className="barItem" key={row.date}><div className="barTrack"><i style={{ height:`${Math.max((row.announcements/maxDaily)*100,4)}%` }}></i><b style={{ height:`${Math.max((row.parsed/maxDaily)*100,0)}%` }}></b></div><strong>{row.announcements}</strong><span>{row.date.slice(5)}</span></div>)}{!stats.daily.length && <p className="chartEmpty">同步公告后显示趋势</p>}</div></section><section className="panel distributionPanel"><div className="panelHead"><div><h2>解析状态分布</h2><span>公告生产链路健康度</span></div></div><div className="statusList">{stats.statuses.map((row) => <div key={row.name}><span className={`statusDot ${row.name}`}></span><b>{statusText[row.name] || row.name}</b><strong>{row.value}</strong></div>)}{!stats.statuses.length && <p className="chartEmpty">暂无状态数据</p>}</div></section><section className="panel pledgeePanel"><div className="panelHead"><div><h2>主要质权人</h2><span>按结构化事件数量排名</span></div></div><div className="rankList">{stats.pledgees.map((row,index) => <div key={row.name}><em>{index+1}</em><span title={row.name}>{row.name}</span><i><b style={{width:`${(row.value/maxPledgee)*100}%`}}></b></i><strong>{row.value}</strong></div>)}{!stats.pledgees.length && <p className="chartEmpty">解析事件后显示排名</p>}</div></section><section className="panel recentPanel"><div className="panelHead"><div><h2>最近运行</h2><span>同步与解析任务</span></div></div><div className="recentRuns">{runs.slice(0,5).map((run) => <div key={run.id}><span className={`runState ${run.status}`}></span><p><b>{run.source === "pdf-parser" ? "PDF 解析" : "公告同步"}</b><small>{new Date(run.startedAt).toLocaleString("zh-CN",{hour12:false})}</small></p><strong>{run.status === "completed" ? "成功" : run.status === "failed" ? "失败" : "已完成"}</strong></div>)}{!runs.length && <p className="chartEmpty">暂无运行记录</p>}</div></section></div>;
+}
+
 export default function Home() {
-  const [view, setView] = useState<"announcements" | "events" | "reviews" | "logs">("announcements");
+  const [view, setView] = useState<"dashboard" | "announcements" | "events" | "reviews" | "logs">("announcements");
   const [query, setQuery] = useState("");
   const [date, setDate] = useState(() => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()));
   const [events, setEvents] = useState<EventRow[]>([]);
   const [announcements, setAnnouncements] = useState<AnnouncementRow[]>([]);
   const [reviews, setReviews] = useState<ReviewRow[]>([]);
   const [syncRuns, setSyncRuns] = useState<SyncRun[]>([]);
+  const [statsData, setStatsData] = useState<StatsData>({ daily:[],eventTypes:[],pledgees:[],statuses:[] });
   const [editingReview, setEditingReview] = useState<ReviewRow | null>(null);
   const [reviewForm, setReviewForm] = useState<ReviewForm>({ shareholder: "", pledgee: "", amount: "", amountText: "", pledgeRatio: "", totalRatio: "", type: "新增质押" });
   const [health, setHealth] = useState<Health>({});
@@ -48,20 +56,22 @@ export default function Home() {
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 3500); };
   const loadAll = useCallback(async () => {
     try {
-      const [eventResponse, announcementResponse, healthResponse, reviewResponse, runResponse] = await Promise.all([
+      const [eventResponse, announcementResponse, healthResponse, reviewResponse, runResponse, statsResponse] = await Promise.all([
         fetch("/api/events", { cache: "no-store" }),
         fetch("/api/announcements", { cache: "no-store" }),
         fetch("/api/health", { cache: "no-store" }),
         fetch("/api/reviews", { cache: "no-store" }),
         fetch("/api/sync-runs", { cache: "no-store" }),
+        fetch("/api/stats", { cache: "no-store" }),
       ]);
-      if (!eventResponse.ok || !announcementResponse.ok || !healthResponse.ok || !reviewResponse.ok || !runResponse.ok) throw new Error("API unavailable");
+      if (!eventResponse.ok || !announcementResponse.ok || !healthResponse.ok || !reviewResponse.ok || !runResponse.ok || !statsResponse.ok) throw new Error("API unavailable");
       const eventPayload = await eventResponse.json() as { data: EventRow[] };
       const announcementPayload = await announcementResponse.json() as { data: AnnouncementRow[] };
       setEvents(eventPayload.data);
       setAnnouncements(announcementPayload.data);
       setReviews((await reviewResponse.json() as { data: ReviewRow[] }).data);
       setSyncRuns((await runResponse.json() as { data: SyncRun[] }).data);
+      setStatsData(await statsResponse.json() as StatsData);
       setHealth(await healthResponse.json() as Health);
       setState("online");
       if (!eventPayload.data.length && announcementPayload.data.length) setView("announcements");
@@ -139,15 +149,15 @@ export default function Home() {
   const eventCount = health.stats?.events ?? events.length;
   const pendingCount = health.stats?.pending_reviews ?? announcements.filter((row) => row.parseStatus !== "parsed").length;
   const parsedRate = rawCount ? `${((eventCount / rawCount) * 100).toFixed(1)}%` : "0.0%";
-  const pageTitle = view === "announcements" ? "公告中心" : view === "reviews" ? "人工审核" : view === "logs" ? "系统日志" : "股权质押";
-  const pageDescription = view === "announcements" ? "真实官方公告已入库；待解析公告保留在审核队列。" : view === "reviews" ? "补全自动解析缺失字段，审核操作全程留痕。" : view === "logs" ? "监控公告同步、PDF 解析与异常处理结果。" : "仅展示字段校验通过的结构化质押事件。";
-  const pageEyebrow = view === "announcements" ? "OFFICIAL ANNOUNCEMENTS" : view === "reviews" ? "REVIEW QUEUE" : view === "logs" ? "SYSTEM OPERATIONS" : "PLEDGE EVENTS";
+  const pageTitle = view === "dashboard" ? "数据总览" : view === "announcements" ? "公告中心" : view === "reviews" ? "人工审核" : view === "logs" ? "系统日志" : "股权质押";
+  const pageDescription = view === "dashboard" ? "基于真实公告与结构化事件的运行概览。" : view === "announcements" ? "真实官方公告已入库；待解析公告保留在审核队列。" : view === "reviews" ? "补全自动解析缺失字段，审核操作全程留痕。" : view === "logs" ? "监控公告同步、PDF 解析与异常处理结果。" : "仅展示字段校验通过的结构化质押事件。";
+  const pageEyebrow = view === "dashboard" ? "DATA OVERVIEW" : view === "announcements" ? "OFFICIAL ANNOUNCEMENTS" : view === "reviews" ? "REVIEW QUEUE" : view === "logs" ? "SYSTEM OPERATIONS" : "PLEDGE EVENTS";
 
   return <main className="shell">
     <aside className="sidebar">
       <div className="brand"><div className="brandMark">事</div><div><strong>A股事件库</strong><span>STOCK EVENT DB</span></div></div>
       <nav><p className="navLabel">工作台</p>
-        <button><i>⌂</i>总览</button>
+        <button className={view === "dashboard" ? "active" : ""} onClick={() => setView("dashboard")}><i>⌂</i>总览</button>
         <button className={view === "announcements" ? "active" : ""} onClick={() => setView("announcements")}><i>▤</i>公告中心</button>
         <button className={view === "events" ? "active" : ""} onClick={() => setView("events")}><i>⌘</i>事件中心</button>
         <button className={view === "reviews" ? "active" : ""} onClick={() => setView("reviews")}><i>✓</i>人工审核<em>{reviews.filter((row) => row.status === "pending").length}</em></button>
@@ -164,7 +174,7 @@ export default function Home() {
         <div className="titleRow"><div><p className="eyebrow">{pageEyebrow} · {state.toUpperCase()}</p><h1>{pageTitle}</h1><p>{pageDescription}</p></div><div className="actions"><button className="secondary" disabled={syncing} onClick={() => void sync()}>{syncing ? "处理中…" : "↻ 同步公告"}</button>{view === "announcements" && <button className="secondary" disabled={syncing || pendingCount === 0} onClick={() => void processPending()}>⚙ 处理待解析</button>}<div className="exportGroup"><select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value as "xls" | "csv" | "json")}><option value="xls">Excel</option><option value="csv">CSV</option><option value="json">JSON</option></select><button className="primary" onClick={exportData}>⇩ 导出</button></div></div></div>
         <div className="stats"><div><span className="statIcon blue">▥</span><p>已抓取公告</p><strong>{rawCount}</strong><small>官方原始披露</small></div><div><span className="statIcon violet">◇</span><p>结构化质押事件</p><strong>{eventCount}</strong><small>通过完整性校验</small></div><div><span className="statIcon amber">◷</span><p>待解析 / 审核</p><strong>{pendingCount}</strong><small><b className="warn">需处理</b></small></div><div><span className="statIcon green">✓</span><p>当前解析率</p><strong>{parsedRate}</strong><small>事件数 / 公告数</small></div></div>
         {eventCount === 0 && rawCount > 0 && <div className="dataNotice"><b>真实数据不为空：</b>已抓取 {rawCount} 条官方公告，其中 {pendingCount} 条等待 PDF 归档和字段解析。系统不会用不完整字段伪造质押事件。</div>}
-        {view === "reviews" ? <ReviewPanel reviews={reviews} onOpen={openReview} /> : view === "logs" ? <LogsPanel runs={syncRuns} /> : <section className="panel">
+        {view === "dashboard" ? <DashboardPanel stats={statsData} runs={syncRuns} /> : view === "reviews" ? <ReviewPanel reviews={reviews} onOpen={openReview} /> : view === "logs" ? <LogsPanel runs={syncRuns} /> : <section className="panel">
           <div className="panelHead"><div><h2>{view === "announcements" ? "官方公告明细" : "质押事件明细"}</h2><span>{view === "announcements" ? "原始披露层 · 可追溯到官方 PDF" : "结构化事件层 · 已通过字段校验"}</span></div><div className="viewBtns"><button className={view === "announcements" ? "chosen" : ""} onClick={() => setView("announcements")}>原始公告</button><button className={view === "events" ? "chosen" : ""} onClick={() => setView("events")}>结构化事件</button></div></div>
           <div className="filters"><label><span>公告日期</span><input type="date" value={date} onChange={(e) => setDate(e.target.value)} /></label><label className="wide"><span>股票 / 公告 / 相关方</span><input placeholder="输入关键词搜索" value={query} onChange={(e) => setQuery(e.target.value)} /></label><button className="searchBtn">查询</button><button className="reset" onClick={() => { setDate(""); setQuery(""); }}>重置</button></div>
           {view === "announcements" ? <><div className="resultMeta">共找到 <b>{filteredAnnouncements.length}</b> 条真实公告<span>来源：巨潮资讯官方披露</span></div><div className="tableWrap"><table className="announcementTable"><thead><tr><th>公告日期</th><th>股票</th><th>公告标题</th><th>状态</th><th>来源</th><th>哈希</th><th></th></tr></thead><tbody>{filteredAnnouncements.map((row) => <tr key={row.announcementId}><td className="mono">{row.announceDate}</td><td><b>{row.stockName}</b><small>{row.stockCode}</small></td><td title={row.title}>{row.title}</td><td><span className={`tag ${row.parseStatus === "parsed" ? "release" : row.parseStatus === "archived" ? "extra" : "new"}`}>{statusText[row.parseStatus] || row.parseStatus}</span></td><td><span className="sourceDot"></span>{row.source}</td><td className="mono">{row.sha256 ? `${row.sha256.slice(0, 10)}…` : "待归档"}</td><td><button className="detail" onClick={() => row.parseStatus === "queued" ? void archive(row) : window.open(row.pdfUrl, "_blank", "noopener,noreferrer")}>{row.parseStatus === "queued" ? "归档 PDF" : "查看原文"} ↗</button></td></tr>)}{!filteredAnnouncements.length && <tr><td colSpan={7} className="empty">该日期暂无已抓取公告；点击“同步公告”从巨潮资讯获取。</td></tr>}</tbody></table></div></> : <><div className="resultMeta">共找到 <b>{filteredEvents.length}</b> 条结构化事件<span>仅包含字段校验通过的数据</span></div><div className="tableWrap"><table><thead><tr><th>公告日期</th><th>股票</th><th>股东名称</th><th>质权人</th><th>质押数量</th><th>占其持股</th><th>占总股本</th><th>事件类型</th><th>来源</th></tr></thead><tbody>{filteredEvents.map((row) => <tr key={row.announcementId || row.id}><td>{row.date}</td><td><b>{row.name}</b><small>{row.code}</small></td><td>{row.shareholder}</td><td>{row.pledgee}</td><td>{row.amount}</td><td>{row.ratio}</td><td>{row.total}</td><td><span className="tag new">{row.type}</span></td><td>{row.source}</td></tr>)}{!filteredEvents.length && <tr><td colSpan={9} className="empty">已有真实公告，但尚未产生字段完整的质押事件。请先在公告中心归档 PDF。</td></tr>}</tbody></table></div></>}

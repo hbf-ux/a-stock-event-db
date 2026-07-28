@@ -206,6 +206,15 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const stats = await env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews").first();
     return json({ status: "ok", storage: { d1: true, r2: true }, stats, timestamp: new Date().toISOString() });
   }
+  if (url.pathname === "/api/stats" && request.method === "GET") {
+    const [daily,eventTypes,pledgees,statuses] = await Promise.all([
+      env.DB.prepare("SELECT announce_date AS date,COUNT(*) AS announcements,SUM(CASE WHEN parse_status='parsed' THEN 1 ELSE 0 END) AS parsed FROM announcement GROUP BY announce_date ORDER BY announce_date DESC LIMIT 14").all(),
+      env.DB.prepare("SELECT type AS name,COUNT(*) AS value FROM pledge GROUP BY type ORDER BY value DESC").all(),
+      env.DB.prepare("SELECT pledgee AS name,COUNT(*) AS value,SUM(pledge_amount) AS amount FROM pledge GROUP BY pledgee ORDER BY value DESC,amount DESC LIMIT 8").all(),
+      env.DB.prepare("SELECT parse_status AS name,COUNT(*) AS value FROM announcement GROUP BY parse_status ORDER BY value DESC").all(),
+    ]);
+    return json({ daily:daily.results.reverse(),eventTypes:eventTypes.results,pledgees:pledgees.results,statuses:statuses.results });
+  }
   if (url.pathname === "/api/sync" && request.method === "POST") {
     const input = await request.json<{date?:string}>().catch(() => ({})); const date = input.date && /^\d{4}-\d{2}-\d{2}$/.test(input.date) ? input.date : new Date(Date.now() - 86400000).toISOString().slice(0,10);
     const startedAt = new Date().toISOString();
