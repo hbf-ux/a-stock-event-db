@@ -129,6 +129,20 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   return { id, status: "parsed", event: parsed };
 }
 
+async function processPendingQueue(db: D1Database, documents: R2Bucket, requestedLimit = 3) {
+  const limit = Math.min(Math.max(requestedLimit, 1), 10);
+  const startedAt = new Date().toISOString();
+  const run = await db.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("pdf-parser",startedAt,"running",`开始处理最多 ${limit} 条公告`).first<{id:number}>();
+  const pending = await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
+  const results: unknown[] = []; let parsed = 0; let failures = 0;
+  for (const row of pending.results) {
+    try { const result = await processAnnouncement(db,documents,row.id); results.push(result); if (result.status === "parsed") parsed++; }
+    catch (error) { failures++; results.push({ id:row.id,status:"failed",error:error instanceof Error ? error.message : "parse failed" }); }
+  }
+  await db.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(new Date().toISOString(),failures ? "completed_with_errors" : "completed",results.length,parsed,failures,`处理 ${results.length} 条，生成 ${parsed} 条事件，失败 ${failures} 条`,run?.id).run();
+  return { run_id:run?.id,processed:results.length,events_created:parsed,failures,results };
+}
+
 async function fetchCninfo(date: string) {
   const all: CninfoAnnouncement[] = [];
   for (const column of ["szse", "sse"]) {
@@ -157,7 +171,7 @@ async function ingestCninfo(db: D1Database, date: string) {
   return { found: announcements.length, inserted };
 }
 
-async function api(request: Request, env: Env): Promise<Response> {
+async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   await ensureSchema(env.DB);
   const url = new URL(request.url);
   if (url.pathname === "/api/health") {
@@ -171,7 +185,8 @@ async function api(request: Request, env: Env): Promise<Response> {
     try {
       const result = await ingestCninfo(env.DB,date);
       await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,message=? WHERE id=?").bind(new Date().toISOString(),"completed",result.found,0,`巨潮资讯 ${date}：新增 ${result.inserted} 条待解析公告`,run?.id).run();
-      return json({ ok:true,run_id:run?.id,date,announcements_found:result.found,announcements_inserted:result.inserted,events_created:0,mode:"cninfo-live" });
+      ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,3));
+      return json({ ok:true,run_id:run?.id,date,announcements_found:result.found,announcements_inserted:result.inserted,events_created:0,auto_processing:true,mode:"cninfo-live" });
     } catch (error) {
       const message = error instanceof Error ? error.message : "同步失败";
       await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,failures=1,message=? WHERE id=?").bind(new Date().toISOString(),"failed",message,run?.id).run();
@@ -203,18 +218,7 @@ async function api(request: Request, env: Env): Promise<Response> {
   }
   if (url.pathname === "/api/process" && request.method === "POST") {
     const input = await request.json<{limit?:number}>().catch(() => ({}));
-    const limit = Math.min(Math.max(Number(input.limit) || 3, 1), 10);
-    const startedAt = new Date().toISOString();
-    const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("pdf-parser",startedAt,"running",`开始处理最多 ${limit} 条公告`).first<{id:number}>();
-    const pending = await env.DB.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived','review') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
-    const results: unknown[] = [];
-    let parsed = 0; let failures = 0;
-    for (const row of pending.results) {
-      try { const result = await processAnnouncement(env.DB, env.DOCUMENTS, row.id); results.push(result); if (result.status === "parsed") parsed++; }
-      catch (error) { failures++; results.push({ id: row.id, status: "failed", error: error instanceof Error ? error.message : "parse failed" }); }
-    }
-    await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(new Date().toISOString(),failures ? "completed_with_errors" : "completed",results.length,parsed,failures,`处理 ${results.length} 条，生成 ${parsed} 条事件，失败 ${failures} 条`,run?.id).run();
-    return json({ ok: true, run_id: run?.id, processed: results.length, events_created: parsed, failures, results });
+    return json({ ok:true,...await processPendingQueue(env.DB,env.DOCUMENTS,Number(input.limit) || 3) });
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/process") && request.method === "POST") {
     const id = url.pathname.split("/")[3];
@@ -285,7 +289,7 @@ async function api(request: Request, env: Env): Promise<Response> {
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/")) { try { return await api(request, env); } catch (error) { return json({ error: error instanceof Error ? error.message : "internal error" }, { status: 500 }); } }
+    if (url.pathname.startsWith("/api/")) { try { return await api(request, env, ctx); } catch (error) { return json({ error: error instanceof Error ? error.message : "internal error" }, { status: 500 }); } }
     if (url.pathname === "/_vinext/image") {
       const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
       return handleImageOptimization(request, { fetchAsset: (path) => env.ASSETS.fetch(new Request(new URL(path, request.url))), transformImage: async (body, { width, format, quality }) => { const result = await env.IMAGES.input(body).transform(width > 0 ? { width } : {}).output({ format, quality }); return result.response(); } }, allowedWidths);

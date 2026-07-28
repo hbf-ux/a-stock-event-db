@@ -32,7 +32,7 @@ function LogsPanel({ runs }: { runs: SyncRun[] }) {
 export default function Home() {
   const [view, setView] = useState<"announcements" | "events" | "reviews" | "logs">("announcements");
   const [query, setQuery] = useState("");
-  const [date, setDate] = useState("2026-07-24");
+  const [date, setDate] = useState(() => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()));
   const [events, setEvents] = useState<EventRow[]>([]);
   const [announcements, setAnnouncements] = useState<AnnouncementRow[]>([]);
   const [reviews, setReviews] = useState<ReviewRow[]>([]);
@@ -83,11 +83,11 @@ export default function Home() {
     setSyncing(true);
     try {
       const response = await fetch("/api/sync", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ date: date || new Date().toISOString().slice(0, 10) }) });
-      const result = await response.json() as { announcements_found?: number; announcements_inserted?: number; error?: string };
+      const result = await response.json() as { announcements_found?: number; announcements_inserted?: number; auto_processing?: boolean; error?: string };
       if (!response.ok) throw new Error(result.error || "同步失败");
       await loadAll();
       setView("announcements");
-      flash(`同步完成：发现 ${result.announcements_found || 0} 条，新增 ${result.announcements_inserted || 0} 条`);
+      flash(`同步完成：发现 ${result.announcements_found || 0} 条，新增 ${result.announcements_inserted || 0} 条；后台解析已启动`);
     } catch (error) { flash(error instanceof Error ? error.message : "同步失败"); }
     finally { setSyncing(false); }
   };
