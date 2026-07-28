@@ -1,5 +1,6 @@
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { extractText, getDocumentProxy } from "unpdf";
 
 interface Env {
   ASSETS: Fetcher;
@@ -56,6 +57,78 @@ const stripHtml = (value: string) => value.replace(/<[^>]+>/g, "").replaceAll("&
 const toDate = (timestamp: number) => new Date(timestamp).toISOString().slice(0, 10);
 const hex = (buffer: ArrayBuffer) => [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
 
+const cleanText = (value: string) => value.replace(/\u00a0/g, " ").replace(/[ \t]+/g, " ").replace(/\r/g, "").trim();
+const firstMatch = (text: string, patterns: RegExp[]) => {
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return cleanText(match[1]).replace(/[：:；;，,。]$/, "");
+  }
+  return "";
+};
+const pledgeType = (title: string) => title.includes("解除") && title.includes("再质押") ? "解除后再质押" : title.includes("解除") ? "解除质押" : title.includes("补充") ? "补充质押" : "新增质押";
+const amountNumber = (value: string) => {
+  const numeric = Number(value.replace(/,/g, "").match(/[\d.]+/)?.[0] || 0);
+  if (/亿/.test(value)) return numeric * 100000000;
+  if (/万/.test(value)) return numeric * 10000;
+  return numeric;
+};
+
+function parsePledgeText(text: string, title: string) {
+  const compact = cleanText(text);
+  const shareholder = firstMatch(compact, [/(?:股东名称|股东姓名|出质人)[：:]?\s*([^\n]{2,80})/i, /(?:股东|出质人)\s+([^\n]{2,80})/i]);
+  const pledgee = firstMatch(compact, [/(?:质权人|质权方|质押权人)[：:]?\s*([^\n]{2,100})/i, /(?:质权人|质押权人)\s+([^\n]{2,100})/i]);
+  const amountText = firstMatch(compact, [/(?:本次质押(?:股数|数量)?|质押股数|质押数量|解除质押(?:股数|数量)?)[：:]?\s*([\d,.]+\s*(?:万|亿)?\s*股)/i, /([\d,.]+\s*(?:万|亿)?\s*股)\s*(?:占其所持股份|占所持股份)/i]);
+  const pledgeRatio = firstMatch(compact, [/(?:占其所持股份比例|占所持股份比例)[：:]?\s*([\d.]+%)/i]);
+  const totalRatio = firstMatch(compact, [/(?:占公司总股本比例|占总股本比例)[：:]?\s*([\d.]+%)/i]);
+  const startDate = firstMatch(compact, [/(?:质押起始日|起始日)[：:]?\s*(\d{4}[年./-]\d{1,2}[月./-]\d{1,2}日?)/i]);
+  const endDate = firstMatch(compact, [/(?:质押到期日|到期日)[：:]?\s*(\d{4}[年./-]\d{1,2}[月./-]\d{1,2}日?|办理解除质押登记之日)/i]);
+  const purpose = firstMatch(compact, [/(?:质押用途|用途)[：:]?\s*([^\n]{2,80})/i]);
+  const amount = amountNumber(amountText);
+  const missing = [!shareholder && "股东", !pledgee && "质权人", !amount && "质押数量"].filter(Boolean);
+  return { shareholder, pledgee, amount, amountText, pledgeRatio, totalRatio, startDate, endDate, purpose, type: pledgeType(title), missing };
+}
+
+async function processAnnouncement(db: D1Database, documents: R2Bucket, id: string) {
+  const item = await db.prepare("SELECT announcement_id AS id,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,r2_key AS r2Key,sha256 FROM announcement WHERE announcement_id=?").bind(id).first<{id:string;stockCode:string;stockName:string;title:string;announceDate:string;pdfUrl:string;r2Key?:string;sha256?:string}>();
+  if (!item) throw new Error("announcement not found");
+  let bytes: ArrayBuffer;
+  let r2Key = item.r2Key;
+  let sha256 = item.sha256;
+  if (r2Key) {
+    const object = await documents.get(r2Key);
+    if (!object) throw new Error("archived PDF not found");
+    bytes = await object.arrayBuffer();
+  } else {
+    const response = await fetch(item.pdfUrl, { headers: { referer: "https://www.cninfo.com.cn/", "user-agent": "Mozilla/5.0 (compatible; StockEventDB/1.0)" } });
+    if (!response.ok) throw new Error(`PDF download failed: ${response.status}`);
+    bytes = await response.arrayBuffer();
+    sha256 = hex(await crypto.subtle.digest("SHA-256", bytes));
+    r2Key = `announcements/${id}.pdf`;
+    await documents.put(r2Key, bytes, { httpMetadata: { contentType: "application/pdf" }, customMetadata: { announcementId: id, sha256 } });
+  }
+  const pdf = await getDocumentProxy(new Uint8Array(bytes));
+  const extracted = await extractText(pdf, { mergePages: true });
+  const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
+  await documents.put(`announcements/${id}.txt`, text, { httpMetadata: { contentType: "text/plain; charset=utf-8" } });
+  const parsed = parsePledgeText(text, item.title);
+  const now = new Date().toISOString();
+  if (parsed.missing.length) {
+    await db.batch([
+      db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review' WHERE announcement_id=?").bind(r2Key, sha256, id),
+      db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(`自动解析缺少字段：${parsed.missing.join("、")}`, JSON.stringify({ ...parsed, textKey: `announcements/${id}.txt` }), id),
+      db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement", id, "parse_review", JSON.stringify({ missing: parsed.missing, parserVersion: "unpdf-rules-v1" }), "worker", now),
+    ]);
+    return { id, status: "review", missing: parsed.missing };
+  }
+  await db.batch([
+    db.prepare("INSERT OR IGNORE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id,item.stockCode,item.stockName,parsed.shareholder,parsed.pledgee,parsed.amount,parsed.amountText,parsed.pledgeRatio||null,parsed.totalRatio||null,parsed.startDate||null,parsed.endDate||null,parsed.purpose||null,parsed.type,item.announceDate,0.82,"unpdf-rules-v1",now),
+    db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='parsed' WHERE announcement_id=?").bind(r2Key, sha256, id),
+    db.prepare("UPDATE review_queue SET status='approved',reason='自动解析字段完整',reviewed_at=?,reviewer='worker',resolution=? WHERE announcement_id=? AND status='pending'").bind(now,JSON.stringify(parsed),id),
+    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("pledge",id,"auto_parse",JSON.stringify({ ...parsed, parserVersion: "unpdf-rules-v1" }),"worker",now),
+  ]);
+  return { id, status: "parsed", event: parsed };
+}
+
 async function fetchCninfo(date: string) {
   const all: CninfoAnnouncement[] = [];
   for (const column of ["szse", "sse"]) {
@@ -106,7 +179,6 @@ async function api(request: Request, env: Env): Promise<Response> {
     }
   }
   if (url.pathname === "/api/events" && request.method === "GET") {
-    await seed(env.DB);
     const conditions: string[] = []; const values: string[] = [];
     const add = (sql: string, value: string | null) => { if (value) { conditions.push(sql); values.push(value); } };
     add("p.announce_date = ?", url.searchParams.get("date"));
@@ -124,6 +196,21 @@ async function api(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/api/sync-runs" && request.method === "GET") {
     const result = await env.DB.prepare("SELECT id,source,started_at AS startedAt,finished_at AS finishedAt,status,announcements_found AS announcementsFound,events_created AS eventsCreated,failures,message FROM sync_run ORDER BY id DESC LIMIT 100").all();
     return json({ data: result.results });
+  }
+  if (url.pathname === "/api/process" && request.method === "POST") {
+    const input = await request.json<{limit?:number}>().catch(() => ({}));
+    const limit = Math.min(Math.max(Number(input.limit) || 3, 1), 10);
+    const pending = await env.DB.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived','review') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
+    const results: unknown[] = [];
+    for (const row of pending.results) {
+      try { results.push(await processAnnouncement(env.DB, env.DOCUMENTS, row.id)); }
+      catch (error) { results.push({ id: row.id, status: "failed", error: error instanceof Error ? error.message : "parse failed" }); }
+    }
+    return json({ ok: true, processed: results.length, results });
+  }
+  if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/process") && request.method === "POST") {
+    const id = url.pathname.split("/")[3];
+    return json(await processAnnouncement(env.DB, env.DOCUMENTS, id));
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/archive") && request.method === "POST") {
     const id = url.pathname.split("/")[3]; const item = await env.DB.prepare("SELECT pdf_url AS pdfUrl FROM announcement WHERE announcement_id=?").bind(id).first<{pdfUrl:string}>();

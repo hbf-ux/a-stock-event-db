@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "./extra.css";
 
 export const metadata: Metadata = {
   title: "A股事件库｜公开披露事件数据库",

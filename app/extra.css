@@ -1,0 +1,10 @@
+.dataNotice{margin:-2px 0 18px;padding:13px 16px;border:1px solid #b9d7ff;border-radius:8px;background:#edf6ff;color:#315b88;font-size:12px}
+.dataNotice b{color:#125bbd}
+.announcementTable th:nth-child(1){width:96px}
+.announcementTable th:nth-child(2){width:100px}
+.announcementTable th:nth-child(3){width:390px}
+.announcementTable th:nth-child(4){width:82px}
+.announcementTable th:nth-child(5){width:92px}
+.announcementTable th:nth-child(6){width:105px}
+.announcementTable th:nth-child(7){width:90px}
+button:disabled{cursor:not-allowed;opacity:.6}
