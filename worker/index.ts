@@ -223,18 +223,33 @@ async function api(request: Request, env: Env): Promise<Response> {
     return json({ok:true,key,sha256,size:bytes.byteLength});
   }
   if (url.pathname === "/api/reviews" && request.method === "GET") {
-    const result = await env.DB.prepare("SELECT * FROM review_queue ORDER BY created_at DESC LIMIT 200").all();
+    const result = await env.DB.prepare("SELECT r.id,r.announcement_id AS announcementId,r.event_type AS eventType,r.reason,r.payload,r.status,r.created_at AS createdAt,r.reviewed_at AS reviewedAt,r.resolution,a.stock_code AS stockCode,a.stock_name AS stockName,a.title,a.announce_date AS announceDate,a.pdf_url AS pdfUrl FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id ORDER BY CASE WHEN r.status='pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 200").all();
     return json({ data: result.results });
   }
   if (url.pathname.startsWith("/api/reviews/") && request.method === "PATCH") {
-    const id = Number(url.pathname.split("/").pop()); const body = await request.json<{status?:string;resolution?:string}>();
+    const id = Number(url.pathname.split("/").pop());
+    const body = await request.json<{status?:string;resolution?:string;shareholder?:string;pledgee?:string;amount?:number;amountText?:string;pledgeRatio?:string;totalRatio?:string;type?:string}>();
     if (!id || !["approved","rejected"].includes(body.status || "")) return json({ error: "invalid review update" }, { status: 400 });
-    const before = await env.DB.prepare("SELECT * FROM review_queue WHERE id=?").bind(id).first();
-    await env.DB.batch([
-      env.DB.prepare("UPDATE review_queue SET status=?,resolution=?,reviewed_at=?,reviewer=? WHERE id=?").bind(body.status,body.resolution || "",new Date().toISOString(),"site-user",id),
-      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("review_queue",String(id),"review",JSON.stringify(before),JSON.stringify(body),"site-user",new Date().toISOString()),
-    ]);
-    return json({ ok: true });
+    const before = await env.DB.prepare("SELECT * FROM review_queue WHERE id=?").bind(id).first<{announcement_id:string;status:string}>();
+    if (!before) return json({ error: "review not found" }, { status: 404 });
+    if (before.status !== "pending") return json({ error: "review already completed" }, { status: 409 });
+    const now = new Date().toISOString();
+    const statements: D1PreparedStatement[] = [
+      env.DB.prepare("UPDATE review_queue SET status=?,resolution=?,reviewed_at=?,reviewer=? WHERE id=?").bind(body.status,body.resolution || "",now,"site-user",id),
+      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("review_queue",String(id),"review",JSON.stringify(before),JSON.stringify(body),"site-user",now),
+    ];
+    if (body.status === "approved") {
+      const announcement = await env.DB.prepare("SELECT stock_code AS stockCode,stock_name AS stockName,announce_date AS announceDate FROM announcement WHERE announcement_id=?").bind(before.announcement_id).first<{stockCode:string;stockName:string;announceDate:string}>();
+      if (!announcement || !body.shareholder?.trim() || !body.pledgee?.trim() || !Number(body.amount)) return json({ error: "股东、质权人和质押数量为必填项" }, { status: 400 });
+      statements.push(
+        env.DB.prepare("INSERT OR REPLACE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,type,announce_date,confidence,parser_version,parsed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(before.announcement_id,announcement.stockCode,announcement.stockName,body.shareholder.trim(),body.pledgee.trim(),Number(body.amount),body.amountText || String(body.amount),body.pledgeRatio || null,body.totalRatio || null,body.type || "新增质押",announcement.announceDate,1,"manual-review-v1",now),
+        env.DB.prepare("UPDATE announcement SET parse_status='parsed' WHERE announcement_id=?").bind(before.announcement_id),
+      );
+    } else {
+      statements.push(env.DB.prepare("UPDATE announcement SET parse_status='rejected' WHERE announcement_id=?").bind(before.announcement_id));
+    }
+    await env.DB.batch(statements);
+    return json({ ok: true, status: body.status });
   }
   if (url.pathname === "/api/export" && request.method === "GET") {
     const result = await env.DB.prepare("SELECT announce_date,stock_code,stock_name,shareholder,pledgee,pledge_amount_text,pledge_ratio,total_ratio,type FROM pledge ORDER BY announce_date DESC").all<Record<string, unknown>>();
