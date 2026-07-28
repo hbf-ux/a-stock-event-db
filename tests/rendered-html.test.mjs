@@ -28,6 +28,9 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /p\.shareholder LIKE/);
   assert.match(worker, /ctx\.waitUntil\(processPendingQueue/);
   assert.match(worker, /parse_status IN \('queued','archived'\)/);
+  assert.match(worker, /fetchWithRetry/);
+  assert.match(worker, /parse_attempts=parse_attempts\+1/);
+  assert.match(worker, /ALTER TABLE announcement ADD COLUMN parse_attempts/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
   assert.match(layout, /A股事件库/);
 });

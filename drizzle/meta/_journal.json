@@ -8,6 +8,13 @@
       "when": 1785077904825,
       "tag": "0000_careless_manta",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1785214108243,
+      "tag": "0001_overrated_wolf_cub",
+      "breakpoints": true
     }
   ]
 }

@@ -3,13 +3,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 type EventRow = { id?: string; announcementId?: string; date: string; code: string; name: string; shareholder: string; pledgee: string; amount: string; ratio: string; total: string; type: string; source: string; pdfUrl?: string };
-type AnnouncementRow = { announcementId: string; stockCode: string; stockName: string; title: string; announceDate: string; pdfUrl?: string; source: string; md5: string; sha256?: string; parseStatus: string };
+type AnnouncementRow = { announcementId: string; stockCode: string; stockName: string; title: string; announceDate: string; pdfUrl?: string; source: string; md5: string; sha256?: string; parseStatus: string; parseAttempts?: number; lastError?: string };
 type ReviewRow = { id: number; announcementId: string; reason: string; payload: string; status: string; stockCode: string; stockName: string; title: string; announceDate: string; pdfUrl?: string };
 type ReviewForm = { shareholder: string; pledgee: string; amount: string; amountText: string; pledgeRatio: string; totalRatio: string; type: string };
 type SyncRun = { id: number; source: string; startedAt: string; finishedAt?: string; status: string; announcementsFound: number; eventsCreated: number; failures: number; message?: string };
 type Health = { stats?: { announcements?: number; events?: number; pending_reviews?: number } };
 
-const statusText: Record<string, string> = { queued: "待归档", archived: "待解析", parsed: "已解析", pending: "待处理" };
+const statusText: Record<string, string> = { queued: "待归档", archived: "待解析", parsed: "已解析", pending: "待处理", review: "待审核", rejected: "已驳回" };
 
 function ReviewPanel({ reviews, onOpen }: { reviews: ReviewRow[]; onOpen: (review: ReviewRow) => void }) {
   const pending = reviews.filter((row) => row.status === "pending");

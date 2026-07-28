@@ -15,7 +15,7 @@ const json = (data: unknown, init: ResponseInit = {}) => new Response(JSON.strin
 async function ensureSchema(db: D1Database) {
   const statements = [
     `CREATE TABLE IF NOT EXISTS stock_info (code TEXT PRIMARY KEY, name TEXT NOT NULL, exchange TEXT NOT NULL, industry TEXT, list_date TEXT, status TEXT NOT NULL DEFAULT '上市')`,
-    `CREATE TABLE IF NOT EXISTS announcement (announcement_id TEXT PRIMARY KEY, stock_code TEXT NOT NULL, stock_name TEXT NOT NULL, title TEXT NOT NULL, announce_date TEXT NOT NULL, pdf_url TEXT, r2_key TEXT, source TEXT NOT NULL, crawl_time TEXT NOT NULL, md5 TEXT NOT NULL UNIQUE, sha256 TEXT, parse_status TEXT NOT NULL DEFAULT 'pending')`,
+    `CREATE TABLE IF NOT EXISTS announcement (announcement_id TEXT PRIMARY KEY, stock_code TEXT NOT NULL, stock_name TEXT NOT NULL, title TEXT NOT NULL, announce_date TEXT NOT NULL, pdf_url TEXT, r2_key TEXT, source TEXT NOT NULL, crawl_time TEXT NOT NULL, md5 TEXT NOT NULL UNIQUE, sha256 TEXT, parse_status TEXT NOT NULL DEFAULT 'pending', parse_attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT)`,
     `CREATE TABLE IF NOT EXISTS pledge (id INTEGER PRIMARY KEY AUTOINCREMENT, announcement_id TEXT NOT NULL, stock_code TEXT NOT NULL, stock_name TEXT NOT NULL, shareholder TEXT NOT NULL, pledgee TEXT NOT NULL, pledge_amount REAL NOT NULL, pledge_amount_text TEXT NOT NULL, pledge_ratio TEXT, total_ratio TEXT, start_date TEXT, end_date TEXT, purpose TEXT, type TEXT NOT NULL, announce_date TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0, parser_version TEXT NOT NULL, parsed_at TEXT NOT NULL, UNIQUE(announcement_id, shareholder, type))`,
     `CREATE TABLE IF NOT EXISTS review_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, announcement_id TEXT NOT NULL, event_type TEXT NOT NULL, reason TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, reviewed_at TEXT, reviewer TEXT, resolution TEXT)`,
     `CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, before_json TEXT, after_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL)`,
@@ -27,6 +27,10 @@ async function ensureSchema(db: D1Database) {
     `CREATE INDEX IF NOT EXISTS announcement_date_idx ON announcement (announce_date)`,
   ];
   await db.batch(statements.map((sql) => db.prepare(sql)));
+  const announcementColumns = await db.prepare("PRAGMA table_info(announcement)").all<{name:string}>();
+  const names = new Set(announcementColumns.results.map((column) => column.name));
+  if (!names.has("parse_attempts")) await db.prepare("ALTER TABLE announcement ADD COLUMN parse_attempts INTEGER NOT NULL DEFAULT 0").run();
+  if (!names.has("last_error")) await db.prepare("ALTER TABLE announcement ADD COLUMN last_error TEXT").run();
 }
 
 const demo = [
@@ -56,6 +60,19 @@ type CninfoResult = { announcements?: CninfoAnnouncement[]; totalRecordNum?: num
 const stripHtml = (value: string) => value.replace(/<[^>]+>/g, "").replaceAll("&amp;", "&").trim();
 const toDate = (timestamp: number) => new Date(timestamp).toISOString().slice(0, 10);
 const hex = (buffer: ArrayBuffer) => [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
+const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve,milliseconds));
+async function fetchWithRetry(input: RequestInfo | URL, init?: RequestInit, attempts = 3) {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const response = await fetch(input,init);
+      if (response.ok || (response.status < 500 && response.status !== 429)) return response;
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) { lastError = error; }
+    if (attempt < attempts) await wait(300 * 3 ** (attempt - 1));
+  }
+  throw lastError instanceof Error ? lastError : new Error("request failed after retries");
+}
 
 const cleanText = (value: string) => value.replace(/\u00a0/g, " ").replace(/[ \t]+/g, " ").replace(/\r/g, "").trim();
 const firstMatch = (text: string, patterns: RegExp[]) => {
@@ -99,7 +116,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
     if (!object) throw new Error("archived PDF not found");
     bytes = await object.arrayBuffer();
   } else {
-    const response = await fetch(item.pdfUrl, { headers: { referer: "https://www.cninfo.com.cn/", "user-agent": "Mozilla/5.0 (compatible; StockEventDB/1.0)" } });
+    const response = await fetchWithRetry(item.pdfUrl, { headers: { referer: "https://www.cninfo.com.cn/", "user-agent": "Mozilla/5.0 (compatible; StockEventDB/1.0)" } });
     if (!response.ok) throw new Error(`PDF download failed: ${response.status}`);
     bytes = await response.arrayBuffer();
     sha256 = hex(await crypto.subtle.digest("SHA-256", bytes));
@@ -114,7 +131,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   const now = new Date().toISOString();
   if (parsed.missing.length) {
     await db.batch([
-      db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review' WHERE announcement_id=?").bind(r2Key, sha256, id),
+      db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review',last_error=NULL WHERE announcement_id=?").bind(r2Key, sha256, id),
       db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(`自动解析缺少字段：${parsed.missing.join("、")}`, JSON.stringify({ ...parsed, textKey: `announcements/${id}.txt` }), id),
       db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement", id, "parse_review", JSON.stringify({ missing: parsed.missing, parserVersion: "unpdf-rules-v1" }), "worker", now),
     ]);
@@ -122,7 +139,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   }
   await db.batch([
     db.prepare("INSERT OR IGNORE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id,item.stockCode,item.stockName,parsed.shareholder,parsed.pledgee,parsed.amount,parsed.amountText,parsed.pledgeRatio||null,parsed.totalRatio||null,parsed.startDate||null,parsed.endDate||null,parsed.purpose||null,parsed.type,item.announceDate,0.82,"unpdf-rules-v1",now),
-    db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='parsed' WHERE announcement_id=?").bind(r2Key, sha256, id),
+    db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='parsed',last_error=NULL WHERE announcement_id=?").bind(r2Key, sha256, id),
     db.prepare("UPDATE review_queue SET status='approved',reason='自动解析字段完整',reviewed_at=?,reviewer='worker',resolution=? WHERE announcement_id=? AND status='pending'").bind(now,JSON.stringify(parsed),id),
     db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("pledge",id,"auto_parse",JSON.stringify({ ...parsed, parserVersion: "unpdf-rules-v1" }),"worker",now),
   ]);
@@ -137,7 +154,18 @@ async function processPendingQueue(db: D1Database, documents: R2Bucket, requeste
   const results: unknown[] = []; let parsed = 0; let failures = 0;
   for (const row of pending.results) {
     try { const result = await processAnnouncement(db,documents,row.id); results.push(result); if (result.status === "parsed") parsed++; }
-    catch (error) { failures++; results.push({ id:row.id,status:"failed",error:error instanceof Error ? error.message : "parse failed" }); }
+    catch (error) {
+      failures++; const message = error instanceof Error ? error.message : "parse failed";
+      await db.prepare("UPDATE announcement SET parse_attempts=parse_attempts+1,last_error=? WHERE announcement_id=?").bind(message,row.id).run();
+      const attempt = await db.prepare("SELECT parse_attempts AS attempts FROM announcement WHERE announcement_id=?").bind(row.id).first<{attempts:number}>();
+      if ((attempt?.attempts || 0) >= 3) {
+        await db.batch([
+          db.prepare("UPDATE announcement SET parse_status='review' WHERE announcement_id=?").bind(row.id),
+          db.prepare("UPDATE review_queue SET reason=?,payload=json_set(payload,'$.lastError',?,'$.parseAttempts',?) WHERE announcement_id=? AND status='pending'").bind(`自动处理连续失败 ${(attempt?.attempts || 0)} 次`,message,attempt?.attempts || 0,row.id),
+        ]);
+      }
+      results.push({ id:row.id,status:"failed",attempts:attempt?.attempts || 0,error:message });
+    }
   }
   await db.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(new Date().toISOString(),failures ? "completed_with_errors" : "completed",results.length,parsed,failures,`处理 ${results.length} 条，生成 ${parsed} 条事件，失败 ${failures} 条`,run?.id).run();
   return { run_id:run?.id,processed:results.length,events_created:parsed,failures,results };
@@ -147,7 +175,7 @@ async function fetchCninfo(date: string) {
   const all: CninfoAnnouncement[] = [];
   for (const column of ["szse", "sse"]) {
     const body = new URLSearchParams({ pageNum: "1", pageSize: "100", column, tabName: "fulltext", plate: "", stock: "", searchkey: "质押", secid: "", category: "", trade: "", seDate: `${date}~${date}`, sortName: "", sortType: "", isHLtitle: "true" });
-    const response = await fetch("https://www.cninfo.com.cn/new/hisAnnouncement/query", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded; charset=UTF-8", accept: "application/json, text/plain, */*", referer: "https://www.cninfo.com.cn/new/disclosure", "user-agent": "Mozilla/5.0 (compatible; StockEventDB/1.0; public-disclosure-research)" }, body });
+    const response = await fetchWithRetry("https://www.cninfo.com.cn/new/hisAnnouncement/query", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded; charset=UTF-8", accept: "application/json, text/plain, */*", referer: "https://www.cninfo.com.cn/new/disclosure", "user-agent": "Mozilla/5.0 (compatible; StockEventDB/1.0; public-disclosure-research)" }, body });
     if (!response.ok) throw new Error(`巨潮资讯 ${column} 返回 ${response.status}`);
     const data = await response.json<CninfoResult>();
     all.push(...(data.announcements || []));
@@ -209,7 +237,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ data: result.results, total: count?.total || 0, limit, offset, traceable: true });
   }
   if (url.pathname === "/api/announcements" && request.method === "GET") {
-    const result = await env.DB.prepare("SELECT announcement_id AS announcementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,source,crawl_time AS crawlTime,md5,sha256,parse_status AS parseStatus FROM announcement ORDER BY announce_date DESC LIMIT 500").all();
+    const result = await env.DB.prepare("SELECT announcement_id AS announcementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,source,crawl_time AS crawlTime,md5,sha256,parse_status AS parseStatus,parse_attempts AS parseAttempts,last_error AS lastError FROM announcement ORDER BY announce_date DESC LIMIT 500").all();
     return json({ data: result.results, total: result.results.length });
   }
   if (url.pathname === "/api/sync-runs" && request.method === "GET") {

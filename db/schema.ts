@@ -22,6 +22,8 @@ export const announcements = sqliteTable("announcement", {
   md5: text("md5").notNull(),
   sha256: text("sha256"),
   parseStatus: text("parse_status").notNull().default("pending"),
+  parseAttempts: integer("parse_attempts").notNull().default(0),
+  lastError: text("last_error"),
 }, (table) => [uniqueIndex("announcement_md5_uq").on(table.md5)]);
 
 export const pledges = sqliteTable("pledge", {
