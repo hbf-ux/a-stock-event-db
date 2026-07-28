@@ -45,7 +45,8 @@ export const pledges = sqliteTable("pledge", {
   confidence: real("confidence").notNull().default(0),
   parserVersion: text("parser_version").notNull(),
   parsedAt: text("parsed_at").notNull(),
-}, (table) => [uniqueIndex("pledge_announcement_shareholder_uq").on(table.announcementId, table.shareholder, table.type)]);
+  eventFingerprint: text("event_fingerprint").notNull(),
+}, (table) => [uniqueIndex("pledge_event_fingerprint_uq").on(table.eventFingerprint)]);
 
 export const reviewQueue = sqliteTable("review_queue", {
   id: integer("id").primaryKey({ autoIncrement: true }),

@@ -85,6 +85,14 @@ or enforce explicit server-side membership or allowlist checks.
 Use SIWC for account pages, user-specific dashboards, saved records, and write
 actions tied to the current ChatGPT user. Leave public content anonymous.
 
+## Stock Event Production Automation
+
+GitHub Actions runs `.github/workflows/daily-sync.yml` at 18:30 China Standard Time on weekdays. It calls the private production API with the repository-level `SITES_BYPASS_TOKEN`, synchronizes that day's CNINFO announcements, and drains up to ten pending parser jobs. A manual run can supply a `YYYY-MM-DD` date.
+
+When normal PDF text/table extraction cannot produce a complete pledge row, the worker can send the archived PDF to the OpenAI Responses API for vision-based extraction. Configure `OPENAI_API_KEY` as a secret Sites runtime variable to enable this fallback. `OPENAI_OCR_MODEL` is optional and defaults to `gpt-5.6-luna`. Without a key, incomplete documents remain traceable in R2 and move to the review queue with an explicit OCR configuration reason.
+
+Table-like PDF text can produce multiple pledge events per announcement. Each event receives a SHA-256 fingerprint; the runtime migration replaces the former announcement/shareholder/type uniqueness rule while preserving existing records.
+
 ## Useful Commands
 
 - `npm run dev`: start local development

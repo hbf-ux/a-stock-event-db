@@ -1,0 +1,45 @@
+name: Daily official announcement sync
+
+on:
+  schedule:
+    # 18:30 Asia/Shanghai, Monday through Friday.
+    - cron: "30 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Announcement date (YYYY-MM-DD); defaults to today in Asia/Shanghai"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-event-daily-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Sync official announcements
+        env:
+          SITE_URL: https://a-stock-event-db.h4883758.chatgpt.site
+          SITES_BYPASS_TOKEN: ${{ secrets.SITES_BYPASS_TOKEN }}
+          MANUAL_DATE: ${{ inputs.date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SITES_BYPASS_TOKEN"
+          sync_date="${MANUAL_DATE:-$(TZ=Asia/Shanghai date +%F)}"
+          curl --fail-with-body --retry 3 --retry-all-errors \
+            -H "OAI-Sites-Authorization: Bearer $SITES_BYPASS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"date\":\"$sync_date\"}" \
+            "$SITE_URL/api/sync"
+          curl --fail-with-body --retry 3 --retry-all-errors \
+            -H "OAI-Sites-Authorization: Bearer $SITES_BYPASS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"limit":10}' \
+            "$SITE_URL/api/process"

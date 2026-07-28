@@ -6,6 +6,8 @@ interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
   DOCUMENTS: R2Bucket;
+  OPENAI_API_KEY?: string;
+  OPENAI_OCR_MODEL?: string;
   IMAGES: { input(stream: ReadableStream): { transform(options: Record<string, unknown>): { output(options: { format: string; quality: number }): Promise<{ response(): Response }> } } };
 }
 interface ExecutionContext { waitUntil(promise: Promise<unknown>): void; passThroughOnException(): void; }
@@ -31,6 +33,19 @@ async function ensureSchema(db: D1Database) {
   const names = new Set(announcementColumns.results.map((column) => column.name));
   if (!names.has("parse_attempts")) await db.prepare("ALTER TABLE announcement ADD COLUMN parse_attempts INTEGER NOT NULL DEFAULT 0").run();
   if (!names.has("last_error")) await db.prepare("ALTER TABLE announcement ADD COLUMN last_error TEXT").run();
+  const pledgeColumns = await db.prepare("PRAGMA table_info(pledge)").all<{name:string}>();
+  if (!pledgeColumns.results.some((column) => column.name === "event_fingerprint")) {
+    await db.batch([
+      db.prepare(`CREATE TABLE pledge_v2 (id INTEGER PRIMARY KEY AUTOINCREMENT, announcement_id TEXT NOT NULL, stock_code TEXT NOT NULL, stock_name TEXT NOT NULL, shareholder TEXT NOT NULL, pledgee TEXT NOT NULL, pledge_amount REAL NOT NULL, pledge_amount_text TEXT NOT NULL, pledge_ratio TEXT, total_ratio TEXT, start_date TEXT, end_date TEXT, purpose TEXT, type TEXT NOT NULL, announce_date TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0, parser_version TEXT NOT NULL, parsed_at TEXT NOT NULL, event_fingerprint TEXT UNIQUE)`),
+      db.prepare(`INSERT INTO pledge_v2 (id,announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint) SELECT id,announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,'legacy:' || id FROM pledge`),
+      db.prepare("DROP TABLE pledge"),
+      db.prepare("ALTER TABLE pledge_v2 RENAME TO pledge"),
+      db.prepare("CREATE INDEX pledge_date_idx ON pledge (announce_date)"),
+      db.prepare("CREATE INDEX pledge_stock_idx ON pledge (stock_code)"),
+      db.prepare("CREATE INDEX pledge_shareholder_idx ON pledge (shareholder)"),
+      db.prepare("CREATE INDEX pledge_pledgee_idx ON pledge (pledgee)"),
+    ]);
+  }
 }
 
 const demo = [
@@ -105,7 +120,65 @@ function parsePledgeText(text: string, title: string) {
   return { shareholder, pledgee, amount, amountText, pledgeRatio, totalRatio, startDate, endDate, purpose, type: pledgeType(title), missing };
 }
 
-async function processAnnouncement(db: D1Database, documents: R2Bucket, id: string) {
+type ParsedPledge = ReturnType<typeof parsePledgeText>;
+
+function parsePledgeRows(text: string, title: string): ParsedPledge[] {
+  const fallback = parsePledgeText(text, title);
+  const rows: ParsedPledge[] = [];
+  const seen = new Set<string>();
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = cleanText(rawLine);
+    const amountText = line.match(/[\d,.]+\s*(?:万|亿)?\s*股/)?.[0] || "";
+    const percentages = [...line.matchAll(/[\d.]+%/g)].map((match) => match[0]);
+    if (!amountText || percentages.length < 1) continue;
+    const cells = rawLine.split(/\t|\s{2,}/).map(cleanText).filter(Boolean);
+    const amountIndex = cells.findIndex((cell) => cell.includes(amountText.replace(/\s/g, "")) || cleanText(cell).includes(cleanText(amountText)));
+    if (amountIndex < 1) continue;
+    const before = cells.slice(0, amountIndex).filter((cell) => !/^(序号|名称|股东|出质人)$/.test(cell));
+    const after = cells.slice(amountIndex + 1);
+    const shareholder = before[0] || fallback.shareholder;
+    const pledgee = after.find((cell) => /(银行|证券|信托|公司|质权人)/.test(cell) && !cell.includes("%")) || before[1] || fallback.pledgee;
+    const amount = amountNumber(amountText);
+    const key = `${shareholder}|${pledgee}|${amountText}|${percentages.join("|")}`;
+    if (!shareholder || !pledgee || !amount || seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ ...fallback, shareholder, pledgee, amount, amountText, pledgeRatio: percentages[0] || "", totalRatio: percentages[1] || "", missing: [] });
+  }
+  if (!rows.length || (!fallback.missing.length && !rows.some((row) => row.shareholder === fallback.shareholder && row.amount === fallback.amount))) rows.unshift(fallback);
+  return rows.filter((row, index, all) => index === all.findIndex((other) => `${other.shareholder}|${other.pledgee}|${other.amountText}|${other.type}` === `${row.shareholder}|${row.pledgee}|${row.amountText}|${row.type}`));
+}
+
+const arrayBufferToBase64 = (buffer: ArrayBuffer) => {
+  const bytes = new Uint8Array(buffer); let binary = "";
+  for (let index = 0; index < bytes.length; index += 32768) binary += String.fromCharCode(...bytes.subarray(index, index + 32768));
+  return btoa(binary);
+};
+
+function normalizeVisionRows(value: unknown, title: string): ParsedPledge[] {
+  const source = Array.isArray(value) ? value : (value && typeof value === "object" && Array.isArray((value as {events?:unknown[]}).events) ? (value as {events:unknown[]}).events : []);
+  return source.map((entry) => {
+    const row = entry as Record<string, unknown>; const amountText = String(row.pledge_amount ?? row.amount ?? "");
+    const parsed = { shareholder:String(row.shareholder ?? "").trim(), pledgee:String(row.pledgee ?? "").trim(), amount:amountNumber(amountText), amountText, pledgeRatio:String(row.pledge_ratio ?? ""), totalRatio:String(row.total_ratio ?? ""), startDate:String(row.start_date ?? ""), endDate:String(row.end_date ?? ""), purpose:String(row.purpose ?? ""), type:String(row.type ?? pledgeType(title)), missing:[] as unknown[] };
+    parsed.missing = [!parsed.shareholder && "股东", !parsed.pledgee && "质权人", !parsed.amount && "质押数量"].filter(Boolean);
+    return parsed as ParsedPledge;
+  });
+}
+
+async function parseWithOpenAI(bytes: ArrayBuffer, title: string, env: Env) {
+  if (!env.OPENAI_API_KEY) return [];
+  const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json" }, body:JSON.stringify({ model:env.OPENAI_OCR_MODEL || "gpt-5.6-luna", input:[{ role:"user", content:[{ type:"input_file", filename:"announcement.pdf", file_data:`data:application/pdf;base64,${arrayBufferToBase64(bytes)}` },{ type:"input_text", text:`Extract every share pledge or release row from this A-share announcement titled ${title}. Return JSON only as {\"events\":[{\"shareholder\":\"\",\"pledgee\":\"\",\"pledge_amount\":\"\",\"pledge_ratio\":\"\",\"total_ratio\":\"\",\"start_date\":\"\",\"end_date\":\"\",\"purpose\":\"\",\"type\":\"新增质押|补充质押|解除质押|解除后再质押\"}]}. Never invent missing values.` }] }] }) });
+  if (!response.ok) throw new Error(`OpenAI OCR failed: ${response.status}`);
+  const payload = await response.json<Record<string, unknown>>();
+  const outputText = String(payload.output_text || ((payload.output as Array<{content?:Array<{text?:string}>}> | undefined)?.flatMap((item) => item.content || []).map((item) => item.text || "").join("") || ""));
+  const jsonText = outputText.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
+  return normalizeVisionRows(JSON.parse(jsonText), title);
+}
+
+async function fingerprint(id: string, row: ParsedPledge, index: number) {
+  return hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode([id,row.shareholder,row.pledgee,row.amountText,row.startDate,row.type,index].join("|"))));
+}
+
+async function legacyProcessAnnouncement(db: D1Database, documents: R2Bucket, id: string) {
   const item = await db.prepare("SELECT announcement_id AS id,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,r2_key AS r2Key,sha256 FROM announcement WHERE announcement_id=?").bind(id).first<{id:string;stockCode:string;stockName:string;title:string;announceDate:string;pdfUrl:string;r2Key?:string;sha256?:string}>();
   if (!item) throw new Error("announcement not found");
   let bytes: ArrayBuffer;
@@ -146,14 +219,58 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   return { id, status: "parsed", event: parsed };
 }
 
-async function processPendingQueue(db: D1Database, documents: R2Bucket, requestedLimit = 3) {
+async function processAnnouncement(db: D1Database, documents: R2Bucket, id: string, env?: Env) {
+  const item = await db.prepare("SELECT announcement_id AS id,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,r2_key AS r2Key,sha256 FROM announcement WHERE announcement_id=?").bind(id).first<{id:string;stockCode:string;stockName:string;title:string;announceDate:string;pdfUrl:string;r2Key?:string;sha256?:string}>();
+  if (!item) throw new Error("announcement not found");
+  let bytes: ArrayBuffer; let r2Key = item.r2Key; let sha256 = item.sha256;
+  if (r2Key) { const object = await documents.get(r2Key); if (!object) throw new Error("archived PDF not found"); bytes = await object.arrayBuffer(); }
+  else {
+    const response = await fetchWithRetry(item.pdfUrl,{headers:{referer:"https://www.cninfo.com.cn/","user-agent":"Mozilla/5.0 (compatible; StockEventDB/1.0)"}});
+    if (!response.ok) throw new Error(`PDF download failed: ${response.status}`);
+    bytes = await response.arrayBuffer(); sha256 = hex(await crypto.subtle.digest("SHA-256",bytes)); r2Key = `announcements/${id}.pdf`;
+    await documents.put(r2Key,bytes,{httpMetadata:{contentType:"application/pdf"},customMetadata:{announcementId:id,sha256}});
+  }
+  const pdf = await getDocumentProxy(new Uint8Array(bytes)); const extracted = await extractText(pdf,{mergePages:true});
+  const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
+  await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
+  let rows = parsePledgeRows(text,item.title); let parserVersion = "unpdf-table-rules-v2"; let confidence = rows.length > 1 ? 0.88 : 0.82;
+  if (!rows.some((row) => !row.missing.length) && env?.OPENAI_API_KEY) {
+    const visionRows = await parseWithOpenAI(bytes,item.title,env);
+    await documents.put(`announcements/${id}.ocr.json`,JSON.stringify({parser:"openai-responses",rows:visionRows}),{httpMetadata:{contentType:"application/json; charset=utf-8"}});
+    if (visionRows.length) { rows = visionRows; parserVersion = `openai-vision-v1:${env.OPENAI_OCR_MODEL || "gpt-5.6-luna"}`; confidence = 0.9; }
+  }
+  const completeRows = rows.filter((row) => !row.missing.length); const parsed = rows[0]; const now = new Date().toISOString();
+  if (!completeRows.length) {
+    const missing = parsed?.missing || ["股东","质权人","质押数量"];
+    await db.batch([
+      db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review',last_error=NULL WHERE announcement_id=?").bind(r2Key,sha256,id),
+      db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(`自动解析缺少字段：${missing.join("、")}${env?.OPENAI_API_KEY ? "；OCR 未识别出完整记录" : "；OCR 尚未配置"}`,JSON.stringify({...parsed,candidates:rows,textKey:`announcements/${id}.txt`,ocrConfigured:Boolean(env?.OPENAI_API_KEY)}),id),
+      db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"parse_review",JSON.stringify({missing,parserVersion,ocrConfigured:Boolean(env?.OPENAI_API_KEY)}),"worker",now),
+    ]);
+    return {id,status:"review",missing,ocr_attempted:Boolean(env?.OPENAI_API_KEY)};
+  }
+  const statements: D1PreparedStatement[] = [];
+  for (let index = 0; index < completeRows.length; index++) {
+    const row = completeRows[index]; const eventFingerprint = await fingerprint(id,row,index);
+    statements.push(db.prepare("INSERT OR IGNORE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id,item.stockCode,item.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,item.announceDate,confidence,parserVersion,now,eventFingerprint));
+  }
+  statements.push(
+    db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='parsed',last_error=NULL WHERE announcement_id=?").bind(r2Key,sha256,id),
+    db.prepare("UPDATE review_queue SET status='approved',reason='自动解析字段完整',reviewed_at=?,reviewer='worker',resolution=? WHERE announcement_id=? AND status='pending'").bind(now,JSON.stringify(completeRows),id),
+    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("pledge",id,"auto_parse",JSON.stringify({events:completeRows,eventCount:completeRows.length,parserVersion}),"worker",now),
+  );
+  await db.batch(statements);
+  return {id,status:"parsed",events:completeRows,event_count:completeRows.length,parser_version:parserVersion};
+}
+
+async function processPendingQueue(db: D1Database, documents: R2Bucket, requestedLimit = 3, env?: Env) {
   const limit = Math.min(Math.max(requestedLimit, 1), 10);
   const startedAt = new Date().toISOString();
   const run = await db.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("pdf-parser",startedAt,"running",`开始处理最多 ${limit} 条公告`).first<{id:number}>();
   const pending = await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
   const results: unknown[] = []; let parsed = 0; let failures = 0;
   for (const row of pending.results) {
-    try { const result = await processAnnouncement(db,documents,row.id); results.push(result); if (result.status === "parsed") parsed++; }
+    try { const result = await processAnnouncement(db,documents,row.id,env); results.push(result); if (result.status === "parsed") parsed += result.event_count || 1; }
     catch (error) {
       failures++; const message = error instanceof Error ? error.message : "parse failed";
       await db.prepare("UPDATE announcement SET parse_attempts=parse_attempts+1,last_error=? WHERE announcement_id=?").bind(message,row.id).run();
@@ -222,7 +339,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     try {
       const result = await ingestCninfo(env.DB,date);
       await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,message=? WHERE id=?").bind(new Date().toISOString(),"completed",result.found,0,`巨潮资讯 ${date}：新增 ${result.inserted} 条待解析公告`,run?.id).run();
-      ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,3));
+      ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,3,env));
       return json({ ok:true,run_id:run?.id,date,announcements_found:result.found,announcements_inserted:result.inserted,events_created:0,auto_processing:true,mode:"cninfo-live" });
     } catch (error) {
       const message = error instanceof Error ? error.message : "同步失败";
@@ -243,7 +360,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       catch (error) { failures++; dates.push({date,found:0,inserted:0,error:error instanceof Error ? error.message : "sync failed"}); }
     }
     await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,failures=?,message=? WHERE id=?").bind(new Date().toISOString(),failures ? "completed_with_errors" : "completed",found,failures,`回补 ${days} 日：发现 ${found} 条，新增 ${inserted} 条，失败日期 ${failures} 个`,run?.id).run();
-    ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,10));
+    ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,10,env));
     return json({ok:true,run_id:run?.id,days,end_date:endDate,announcements_found:found,announcements_inserted:inserted,failures,dates,auto_processing:true});
   }
   if (url.pathname === "/api/events" && request.method === "GET") {
@@ -271,11 +388,11 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   }
   if (url.pathname === "/api/process" && request.method === "POST") {
     const input = await request.json<{limit?:number}>().catch(() => ({}));
-    return json({ ok:true,...await processPendingQueue(env.DB,env.DOCUMENTS,Number(input.limit) || 3) });
+    return json({ ok:true,...await processPendingQueue(env.DB,env.DOCUMENTS,Number(input.limit) || 3,env) });
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/process") && request.method === "POST") {
     const id = url.pathname.split("/")[3];
-    return json(await processAnnouncement(env.DB, env.DOCUMENTS, id));
+    return json(await processAnnouncement(env.DB, env.DOCUMENTS, id, env));
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/archive") && request.method === "POST") {
     const id = url.pathname.split("/")[3]; const item = await env.DB.prepare("SELECT pdf_url AS pdfUrl FROM announcement WHERE announcement_id=?").bind(id).first<{pdfUrl:string}>();
