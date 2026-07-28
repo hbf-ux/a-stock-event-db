@@ -46,6 +46,15 @@ async function ensureSchema(db: D1Database) {
       db.prepare("CREATE INDEX pledge_pledgee_idx ON pledge (pledgee)"),
     ]);
   }
+  const invalidEvents = await db.prepare("SELECT DISTINCT announcement_id FROM pledge WHERE pledgee LIKE '占其%' OR pledgee LIKE '占公司%' OR pledgee LIKE '质押数量%'").all<{announcement_id:string}>();
+  if (invalidEvents.results.length) {
+    const ids = invalidEvents.results.map((row) => row.announcement_id);
+    for (const id of ids) await db.batch([
+      db.prepare("DELETE FROM pledge WHERE announcement_id=? AND (pledgee LIKE '占其%' OR pledgee LIKE '占公司%' OR pledgee LIKE '质押数量%')").bind(id),
+      db.prepare("UPDATE announcement SET parse_status='review',last_error='entity validation rejected parser output' WHERE announcement_id=?").bind(id),
+      db.prepare("UPDATE review_queue SET status='pending',reviewed_at=NULL,reviewer=NULL,reason='实体校验未通过：质权人疑似表头文本' WHERE announcement_id=?").bind(id),
+    ]);
+  }
 }
 
 const demo = [
@@ -164,6 +173,12 @@ function normalizeVisionRows(value: unknown, title: string): ParsedPledge[] {
   });
 }
 
+const validateParsedRows = (rows: ParsedPledge[]) => rows.map((row) => {
+  const invalidPledgee = row.pledgee.length < 3 || /^(占其|占公司|质押数量|比例|本次|股东)/.test(row.pledgee);
+  const missing = [!row.shareholder && "股东", (!row.pledgee || invalidPledgee) && "质权人", !row.amount && "质押数量"].filter(Boolean);
+  return {...row,missing} as ParsedPledge;
+});
+
 async function parseWithOpenAI(bytes: ArrayBuffer, title: string, env: Env) {
   if (!env.OPENAI_API_KEY) return [];
   const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json" }, body:JSON.stringify({ model:env.OPENAI_OCR_MODEL || "gpt-5.6-luna", input:[{ role:"user", content:[{ type:"input_file", filename:"announcement.pdf", file_data:`data:application/pdf;base64,${arrayBufferToBase64(bytes)}` },{ type:"input_text", text:`Extract every share pledge or release row from this A-share announcement titled ${title}. Return JSON only as {\"events\":[{\"shareholder\":\"\",\"pledgee\":\"\",\"pledge_amount\":\"\",\"pledge_ratio\":\"\",\"total_ratio\":\"\",\"start_date\":\"\",\"end_date\":\"\",\"purpose\":\"\",\"type\":\"新增质押|补充质押|解除质押|解除后再质押\"}]}. Never invent missing values.` }] }] }) });
@@ -233,11 +248,11 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   const pdf = await getDocumentProxy(new Uint8Array(bytes)); const extracted = await extractText(pdf,{mergePages:true});
   const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
-  let rows = parsePledgeRows(text,item.title); let parserVersion = "unpdf-table-rules-v2"; let confidence = rows.length > 1 ? 0.88 : 0.82;
+  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.1"; let confidence = rows.length > 1 ? 0.88 : 0.82;
   if (!rows.some((row) => !row.missing.length) && env?.OPENAI_API_KEY) {
     const visionRows = await parseWithOpenAI(bytes,item.title,env);
     await documents.put(`announcements/${id}.ocr.json`,JSON.stringify({parser:"openai-responses",rows:visionRows}),{httpMetadata:{contentType:"application/json; charset=utf-8"}});
-    if (visionRows.length) { rows = visionRows; parserVersion = `openai-vision-v1:${env.OPENAI_OCR_MODEL || "gpt-5.6-luna"}`; confidence = 0.9; }
+    if (visionRows.length) { rows = validateParsedRows(visionRows); parserVersion = `openai-vision-v1:${env.OPENAI_OCR_MODEL || "gpt-5.6-luna"}`; confidence = 0.9; }
   }
   const completeRows = rows.filter((row) => !row.missing.length); const parsed = rows[0]; const now = new Date().toISOString();
   if (!completeRows.length) {
