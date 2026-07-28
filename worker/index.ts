@@ -46,7 +46,7 @@ async function ensureSchema(db: D1Database) {
       db.prepare("CREATE INDEX pledge_pledgee_idx ON pledge (pledgee)"),
     ]);
   }
-  const invalidEvents = await db.prepare("SELECT DISTINCT announcement_id FROM pledge WHERE pledgee LIKE '占其%' OR pledgee LIKE '占公司%' OR pledgee LIKE '质押数量%' OR pledgee LIKE '%有限公司补充%' OR shareholder IN ('借款','质押','补充质押','偿还借款')").all<{announcement_id:string}>();
+  const invalidEvents = await db.prepare("SELECT DISTINCT announcement_id FROM pledge WHERE pledgee LIKE '占其%' OR pledgee LIKE '占公司%' OR pledgee LIKE '质押数量%' OR pledgee LIKE '%有限公司补充%' OR shareholder IN ('借款','质押','补充质押','偿还借款') OR (parser_version LIKE 'unpdf-table-rules%' AND (shareholder LIKE '%质押%' OR shareholder LIKE '%融资%'))").all<{announcement_id:string}>();
   if (invalidEvents.results.length) {
     const ids = invalidEvents.results.map((row) => row.announcement_id);
     for (const id of ids) await db.batch([
@@ -133,11 +133,15 @@ type ParsedPledge = ReturnType<typeof parsePledgeText>;
 
 function parseFlattenedTableRows(text: string, title: string): ParsedPledge[] {
   const flat = text.replace(/\r?\n/g," ").replace(/\s+/g," ").trim();
+  const namedPeople = [...new Set([...flat.matchAll(/([\u4e00-\u9fff·]{2,4})\s*(?:先生|女士)/g)].map((match) => match[1]))];
   const rowPattern = /([\u4e00-\u9fff·](?:\s*[\u4e00-\u9fff·]){1,19})\s+是\s+([\d,.]+)\s*(?:股)?\s+([\d.]+%)\s+([\d.]+%)\s+(.{0,260}?)(?=(?:[\u4e00-\u9fff·](?:\s*[\u4e00-\u9fff·]){1,19}\s+是\s+[\d,.]+\s+(?:股\s+)?[\d.]+%)|\s+合计\s|\s+[二三四五六]、|$)/g;
   const rows: ParsedPledge[] = []; let previousShareholder = "";
   for (const match of flat.matchAll(rowPattern)) {
     let shareholder = match[1].replace(/\s/g,"").replace(/^.*(?:质押用途|用途|质权人|到期日|起始日|限售股)/,"");
-    if (/^(借款|质押|补充质押|偿还借款)$/.test(shareholder) && previousShareholder) shareholder = previousShareholder;
+    const namedPerson = namedPeople.filter((name) => shareholder.endsWith(name)).sort((a,b) => b.length-a.length)[0];
+    if (namedPerson) shareholder = namedPerson;
+    else if ((shareholder.length > 10 || /(借款|质押|融资|用途|证券|银行|信托)/.test(shareholder)) && previousShareholder) shareholder = previousShareholder;
+    else if (shareholder.length > 10 || /(借款|质押|融资|用途|证券|银行|信托)/.test(shareholder)) shareholder = "";
     const amountText = `${match[2]} 股`; const tail = match[5];
     const dates = [...tail.matchAll(/\d{4}\s*[年/.\-]\s*\d{1,2}\s*[月/.\-]\s*\d{1,2}\s*日?/g)].map((item) => item[0].replace(/\s/g,""));
     const compactTail = tail.replace(/\s/g,""); const organizationMatches = [...compactTail.matchAll(/[\u4e00-\u9fff（）()]{2,14}(?:证券|银行|信托)[\u4e00-\u9fff（）()]{0,8}(?:股份有限公司|有限责任公司|有限公司)/g)];
