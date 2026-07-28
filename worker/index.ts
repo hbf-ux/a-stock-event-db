@@ -208,9 +208,9 @@ const validateParsedRows = (rows: ParsedPledge[]) => rows.map((row) => {
   return {...row,missing} as ParsedPledge;
 });
 
-async function parseWithOpenAI(bytes: ArrayBuffer, title: string, env: Env) {
+async function parseWithOpenAI(pdfBase64: string, title: string, env: Env) {
   if (!env.OPENAI_API_KEY) return [];
-  const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json" }, body:JSON.stringify({ model:env.OPENAI_OCR_MODEL || "gpt-5.6-luna", input:[{ role:"user", content:[{ type:"input_file", filename:"announcement.pdf", file_data:`data:application/pdf;base64,${arrayBufferToBase64(bytes)}` },{ type:"input_text", text:`Extract every share pledge or release row from this A-share announcement titled ${title}. Return JSON only as {\"events\":[{\"shareholder\":\"\",\"pledgee\":\"\",\"pledge_amount\":\"\",\"pledge_ratio\":\"\",\"total_ratio\":\"\",\"start_date\":\"\",\"end_date\":\"\",\"purpose\":\"\",\"type\":\"新增质押|补充质押|解除质押|解除后再质押\"}]}. Never invent missing values.` }] }] }) });
+  const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json" }, body:JSON.stringify({ model:env.OPENAI_OCR_MODEL || "gpt-5.6-luna", input:[{ role:"user", content:[{ type:"input_file", filename:"announcement.pdf", file_data:`data:application/pdf;base64,${pdfBase64}` },{ type:"input_text", text:`Extract every share pledge or release row from this A-share announcement titled ${title}. Return JSON only as {\"events\":[{\"shareholder\":\"\",\"pledgee\":\"\",\"pledge_amount\":\"\",\"pledge_ratio\":\"\",\"total_ratio\":\"\",\"start_date\":\"\",\"end_date\":\"\",\"purpose\":\"\",\"type\":\"新增质押|补充质押|解除质押|解除后再质押\"}]}. Never invent missing values.` }] }] }) });
   if (!response.ok) throw new Error(`OpenAI OCR failed: ${response.status}`);
   const payload = await response.json<Record<string, unknown>>();
   const outputText = String(payload.output_text || ((payload.output as Array<{content?:Array<{text?:string}>}> | undefined)?.flatMap((item) => item.content || []).map((item) => item.text || "").join("") || ""));
@@ -274,12 +274,13 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
     bytes = await response.arrayBuffer(); sha256 = hex(await crypto.subtle.digest("SHA-256",bytes)); r2Key = `announcements/${id}.pdf`;
     await documents.put(r2Key,bytes,{httpMetadata:{contentType:"application/pdf"},customMetadata:{announcementId:id,sha256}});
   }
-  const pdf = await getDocumentProxy(new Uint8Array(bytes.slice(0))); const extracted = await extractText(pdf,{mergePages:true});
+  const pdfBase64 = env?.OPENAI_API_KEY ? arrayBufferToBase64(bytes) : "";
+  const pdf = await getDocumentProxy(new Uint8Array(bytes)); const extracted = await extractText(pdf,{mergePages:true});
   const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
   let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.1"; let confidence = rows.length > 1 ? 0.88 : 0.82;
   if (!rows.some((row) => !row.missing.length) && env?.OPENAI_API_KEY) {
-    const visionRows = await parseWithOpenAI(bytes,item.title,env);
+    const visionRows = await parseWithOpenAI(pdfBase64,item.title,env);
     await documents.put(`announcements/${id}.ocr.json`,JSON.stringify({parser:"openai-responses",rows:visionRows}),{httpMetadata:{contentType:"application/json; charset=utf-8"}});
     if (visionRows.length) { rows = validateParsedRows(visionRows); parserVersion = `openai-vision-v1:${env.OPENAI_OCR_MODEL || "gpt-5.6-luna"}`; confidence = 0.9; }
   }
