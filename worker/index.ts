@@ -140,7 +140,11 @@ function parseFlattenedTableRows(text: string, title: string): ParsedPledge[] {
     let shareholder = match[1].replace(/\s/g,"").replace(/^.*(?:质押用途|用途|质权人|到期日|起始日|限售股)/,"");
     const namedPerson = namedPeople.filter((name) => shareholder.endsWith(name)).sort((a,b) => b.length-a.length)[0];
     if (namedPerson) shareholder = namedPerson;
-    else if ((shareholder.length > 10 || /(借款|质押|融资|用途|证券|银行|信托)/.test(shareholder)) && previousShareholder) shareholder = previousShareholder;
+    else {
+      const suffixPerson = [4,3,2].map((length) => shareholder.slice(-length)).find((name) => flat.includes(`${name}先生`) || flat.includes(`${name}女士`));
+      if (suffixPerson) shareholder = suffixPerson;
+    }
+    if ((shareholder.length > 10 || /(借款|质押|融资|用途|证券|银行|信托)/.test(shareholder)) && previousShareholder) shareholder = previousShareholder;
     else if (shareholder.length > 10 || /(借款|质押|融资|用途|证券|银行|信托)/.test(shareholder)) shareholder = "";
     const amountText = `${match[2]} 股`; const tail = match[5];
     const dates = [...tail.matchAll(/\d{4}\s*[年/.\-]\s*\d{1,2}\s*[月/.\-]\s*\d{1,2}\s*日?/g)].map((item) => item[0].replace(/\s/g,""));
