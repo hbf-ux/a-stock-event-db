@@ -53,6 +53,8 @@ export default function Home() {
   const [syncing, setSyncing] = useState(false);
   const [reprocessing, setReprocessing] = useState(false);
   const [exportFormat, setExportFormat] = useState<"xls" | "csv" | "json">("xls");
+  const [showPlans, setShowPlans] = useState(false);
+  const [plan] = useState<"free" | "pro">("free");
 
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 3500); };
   const loadAll = useCallback(async () => {
@@ -167,6 +169,7 @@ export default function Home() {
   };
 
   const exportData = () => {
+    if (plan === "free" && exportFormat !== "csv") { setShowPlans(true); flash("专业版支持 Excel 与 JSON 导出"); return; }
     window.location.href = `/api/export?format=${exportFormat}`;
     flash(`正在导出 ${exportFormat === "xls" ? "Excel" : exportFormat.toUpperCase()} 文件`);
   };
@@ -195,7 +198,7 @@ export default function Home() {
       <div className="sideBottom"><button className={view === "logs" ? "active" : ""} onClick={() => setView("logs")}><i>≡</i>系统日志</button><div className="system"><span></span><div><b>{state === "online" ? "数据库在线" : state === "loading" ? "正在连接" : "连接异常"}</b><small>D1 · R2 · Worker API</small></div></div></div>
     </aside>
     <section className="content">
-      <header><div className="crumb">{view === "announcements" ? "公告中心 / 官方披露" : "事件中心 / 股权质押"}</div><div className="headerRight"><div className="globalSearch">⌕<input aria-label="全局搜索" placeholder="搜索股票、股东或公告…" value={query} onChange={(e) => setQuery(e.target.value)} /></div><div className="avatar">研</div></div></header>
+      <header><div className="crumb">{view === "announcements" ? "公告中心 / 官方披露" : "事件中心 / 股权质押"}</div><div className="headerRight"><div className="globalSearch">⌕<input aria-label="全局搜索" placeholder="搜索股票、股东或公告…" value={query} onChange={(e) => setQuery(e.target.value)} /></div><button className="planBadge" onClick={() => setShowPlans(true)}>{plan === "free" ? "免费研究版" : "专业版"}</button><div className="avatar">研</div></div></header>
       <div className="page">
         <div className="titleRow"><div><p className="eyebrow">{pageEyebrow} · {state.toUpperCase()}</p><h1>{pageTitle}</h1><p>{pageDescription}</p></div><div className="actions"><button className="secondary" disabled={syncing} onClick={() => void sync()}>{syncing ? "处理中…" : "↻ 同步公告"}</button>{view === "announcements" && <button className="secondary" disabled={syncing} onClick={() => void backfill()}>↶ 回补 7 日</button>}{view === "announcements" && <button className="secondary" disabled={syncing || pendingCount === 0} onClick={() => void processPending()}>⚙ 处理待解析</button>}<div className="exportGroup"><select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value as "xls" | "csv" | "json")}><option value="xls">Excel</option><option value="csv">CSV</option><option value="json">JSON</option></select><button className="primary" onClick={exportData}>⇩ 导出</button></div></div></div>
         <div className="stats"><div><span className="statIcon blue">▥</span><p>已抓取公告</p><strong>{rawCount}</strong><small>官方原始披露</small></div><div><span className="statIcon violet">◇</span><p>结构化质押事件</p><strong>{eventCount}</strong><small>通过完整性校验</small></div><div><span className="statIcon amber">◷</span><p>待解析 / 审核</p><strong>{pendingCount}</strong><small><b className="warn">需处理</b></small></div><div><span className="statIcon green">✓</span><p>当前解析率</p><strong>{parsedRate}</strong><small>事件数 / 公告数</small></div></div>
@@ -210,6 +213,7 @@ export default function Home() {
       </div>
     </section>
     {editingReview && <div className="overlay" onClick={() => setEditingReview(null)}><aside className="drawer reviewDrawer" onClick={(event) => event.stopPropagation()}><button className="close" onClick={() => setEditingReview(null)}>×</button><p className="eyebrow">MANUAL REVIEW</p><h2>补全质押事件字段</h2><div className="reviewSource"><b>{editingReview.stockName} · {editingReview.stockCode}</b><span>{editingReview.title}</span><small>{editingReview.reason}</small></div><div className="reviewForm"><label><span>股东名称 *</span><input value={reviewForm.shareholder} onChange={(event) => setReviewForm({ ...reviewForm, shareholder: event.target.value })} /></label><label><span>质权人 *</span><input value={reviewForm.pledgee} onChange={(event) => setReviewForm({ ...reviewForm, pledgee: event.target.value })} /></label><label><span>质押数量（股）*</span><input type="number" min="0" value={reviewForm.amount} onChange={(event) => setReviewForm({ ...reviewForm, amount: event.target.value })} /></label><label><span>数量原文</span><input placeholder="例如：1,000万股" value={reviewForm.amountText} onChange={(event) => setReviewForm({ ...reviewForm, amountText: event.target.value })} /></label><div className="reviewGrid"><label><span>占其持股</span><input placeholder="12.53%" value={reviewForm.pledgeRatio} onChange={(event) => setReviewForm({ ...reviewForm, pledgeRatio: event.target.value })} /></label><label><span>占总股本</span><input placeholder="3.15%" value={reviewForm.totalRatio} onChange={(event) => setReviewForm({ ...reviewForm, totalRatio: event.target.value })} /></label></div><label><span>事件类型</span><select value={reviewForm.type} onChange={(event) => setReviewForm({ ...reviewForm, type: event.target.value })}><option>新增质押</option><option>补充质押</option><option>解除质押</option><option>解除后再质押</option></select></label></div><div className="reviewActions"><button className="secondary danger" onClick={() => void resolveReview("rejected")}>驳回，不入库</button><button className="primary" disabled={!reviewForm.shareholder.trim() || !reviewForm.pledgee.trim() || !Number(reviewForm.amount)} onClick={() => void resolveReview("approved")}>审核通过并入库</button></div></aside></div>}
+    {showPlans && <div className="overlay" onClick={() => setShowPlans(false)}><aside className="drawer plansDrawer" onClick={(event) => event.stopPropagation()}><button className="close" onClick={() => setShowPlans(false)}>×</button><p className="eyebrow">RESEARCH PLANS</p><h2>情报工作台</h2><p className="planIntro">免费查看官方公告与结构化事件；专业版面向研究团队提供更高效的筛选与导出。</p><div className="pricingGrid"><div className="priceCard"><span>免费研究版</span><strong>¥0</strong><small>公告浏览 · CSV 导出 · 原文追溯</small><button className="secondary" onClick={() => setShowPlans(false)}>当前方案</button></div><div className="priceCard featured"><span>专业版</span><strong>¥99<small>/月</small></strong><small>Excel/JSON 导出 · 高级筛选 · 历史数据与团队席位</small><button className="primary" onClick={() => flash("专业版订阅将在支付接入后开放")}>预约开通</button></div></div><p className="planNote">当前为产品内测阶段，不会产生任何扣费。</p></aside></div>}
     {notice && <div className="toast">✓ {notice}</div>}
   </main>;
 }
