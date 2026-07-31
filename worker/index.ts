@@ -29,6 +29,9 @@ async function ensureSchema(db: D1Database) {
     `CREATE INDEX IF NOT EXISTS announcement_date_idx ON announcement (announce_date)`,
   ];
   await db.batch(statements.map((sql) => db.prepare(sql)));
+  // Recover runs interrupted by an isolate restart so the operations page does not
+  // report a job as running forever. Keep the original row for auditability.
+  await db.prepare("UPDATE sync_run SET status='failed', finished_at=?, failures=failures+1, message=COALESCE(message,'') || '；运行实例超时，已自动标记失败' WHERE status='running' AND started_at < datetime('now','-30 minutes')").bind(new Date().toISOString()).run();
   const announcementColumns = await db.prepare("PRAGMA table_info(announcement)").all<{name:string}>();
   const names = new Set(announcementColumns.results.map((column) => column.name));
   if (!names.has("parse_attempts")) await db.prepare("ALTER TABLE announcement ADD COLUMN parse_attempts INTEGER NOT NULL DEFAULT 0").run();

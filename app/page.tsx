@@ -12,10 +12,10 @@ type Health = { stats?: { announcements?: number; events?: number; pending_revie
 
 const statusText: Record<string, string> = { queued: "待归档", archived: "待解析", parsed: "已解析", pending: "待处理", review: "待审核", rejected: "已驳回" };
 
-function ReviewPanel({ reviews, onOpen }: { reviews: ReviewRow[]; onOpen: (review: ReviewRow) => void }) {
+function ReviewPanel({ reviews, onOpen, onReprocess, reprocessing }: { reviews: ReviewRow[]; onOpen: (review: ReviewRow) => void; onReprocess: () => void; reprocessing: boolean }) {
   const pending = reviews.filter((row) => row.status === "pending");
   return <section className="panel reviewPanel">
-    <div className="panelHead"><div><h2>人工审核工作台</h2><span>自动解析缺失关键字段的公告将在这里等待补全</span></div><span className="tag extra">{pending.length} 条待处理</span></div>
+    <div className="panelHead"><div><h2>人工审核工作台</h2><span>自动解析缺失关键字段的公告将在这里等待补全</span></div><div className="panelHeadActions"><button className="secondary" disabled={reprocessing || pending.length === 0} onClick={onReprocess}>{reprocessing ? "重跑中…" : "↻ 重跑 OCR"}</button><span className="tag extra">{pending.length} 条待处理</span></div></div>
     <div className="resultMeta">审核通过后写入结构化事件库；驳回记录保留完整审计轨迹</div>
     <div className="tableWrap"><table><thead><tr><th>公告日期</th><th>股票</th><th>公告标题</th><th>异常原因</th><th>状态</th><th></th></tr></thead><tbody>
       {reviews.map((row) => <tr key={row.id}><td className="mono">{row.announceDate}</td><td><b>{row.stockName}</b><small>{row.stockCode}</small></td><td title={row.title}>{row.title}</td><td title={row.reason}>{row.reason}</td><td><span className={`tag ${row.status === "pending" ? "extra" : row.status === "approved" ? "release" : "new"}`}>{row.status === "pending" ? "待审核" : row.status === "approved" ? "已通过" : "已驳回"}</span></td><td>{row.status === "pending" ? <button className="detail" onClick={() => onOpen(row)}>补全字段 ↗</button> : <span className="muted">已处理</span>}</td></tr>)}
@@ -51,6 +51,7 @@ export default function Home() {
   const [notice, setNotice] = useState("");
   const [state, setState] = useState<"loading" | "online" | "error">("loading");
   const [syncing, setSyncing] = useState(false);
+  const [reprocessing, setReprocessing] = useState(false);
   const [exportFormat, setExportFormat] = useState<"xls" | "csv" | "json">("xls");
 
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 3500); };
@@ -135,6 +136,19 @@ export default function Home() {
     finally { setSyncing(false); }
   };
 
+  const reprocessReviews = async () => {
+    setReprocessing(true);
+    try {
+      const response = await fetch("/api/reprocess-reviews", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 5 }) });
+      const result = await response.json() as { processed?: number; results?: { status?: string; ocr_error?: string }[]; error?: string };
+      if (!response.ok) throw new Error(result.error || "重跑失败");
+      await loadAll();
+      const quota = result.results?.some((item) => item.ocr_error?.includes("credit_balance_exhausted"));
+      flash(quota ? "OCR 已重跑，但 OpenAI 账户余额不足；记录已保留在审核队列" : `OCR 重跑完成：${result.processed || 0} 条`);
+    } catch (error) { flash(error instanceof Error ? error.message : "OCR 重跑失败"); }
+    finally { setReprocessing(false); }
+  };
+
   const openReview = (review: ReviewRow) => {
     let payload: Partial<ReviewForm> = {};
     try { payload = JSON.parse(review.payload) as Partial<ReviewForm>; } catch { payload = {}; }
@@ -186,7 +200,7 @@ export default function Home() {
         <div className="titleRow"><div><p className="eyebrow">{pageEyebrow} · {state.toUpperCase()}</p><h1>{pageTitle}</h1><p>{pageDescription}</p></div><div className="actions"><button className="secondary" disabled={syncing} onClick={() => void sync()}>{syncing ? "处理中…" : "↻ 同步公告"}</button>{view === "announcements" && <button className="secondary" disabled={syncing} onClick={() => void backfill()}>↶ 回补 7 日</button>}{view === "announcements" && <button className="secondary" disabled={syncing || pendingCount === 0} onClick={() => void processPending()}>⚙ 处理待解析</button>}<div className="exportGroup"><select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value as "xls" | "csv" | "json")}><option value="xls">Excel</option><option value="csv">CSV</option><option value="json">JSON</option></select><button className="primary" onClick={exportData}>⇩ 导出</button></div></div></div>
         <div className="stats"><div><span className="statIcon blue">▥</span><p>已抓取公告</p><strong>{rawCount}</strong><small>官方原始披露</small></div><div><span className="statIcon violet">◇</span><p>结构化质押事件</p><strong>{eventCount}</strong><small>通过完整性校验</small></div><div><span className="statIcon amber">◷</span><p>待解析 / 审核</p><strong>{pendingCount}</strong><small><b className="warn">需处理</b></small></div><div><span className="statIcon green">✓</span><p>当前解析率</p><strong>{parsedRate}</strong><small>事件数 / 公告数</small></div></div>
         {eventCount === 0 && rawCount > 0 && <div className="dataNotice"><b>真实数据不为空：</b>已抓取 {rawCount} 条官方公告，其中 {pendingCount} 条等待 PDF 归档和字段解析。系统不会用不完整字段伪造质押事件。</div>}
-        {view === "dashboard" ? <DashboardPanel stats={statsData} runs={syncRuns} /> : view === "reviews" ? <ReviewPanel reviews={reviews} onOpen={openReview} /> : view === "logs" ? <LogsPanel runs={syncRuns} /> : <section className="panel">
+        {view === "dashboard" ? <DashboardPanel stats={statsData} runs={syncRuns} /> : view === "reviews" ? <ReviewPanel reviews={reviews} onOpen={openReview} onReprocess={() => void reprocessReviews()} reprocessing={reprocessing} /> : view === "logs" ? <LogsPanel runs={syncRuns} /> : <section className="panel">
           <div className="panelHead"><div><h2>{view === "announcements" ? "官方公告明细" : "质押事件明细"}</h2><span>{view === "announcements" ? "原始披露层 · 可追溯到官方 PDF" : "结构化事件层 · 已通过字段校验"}</span></div><div className="viewBtns"><button className={view === "announcements" ? "chosen" : ""} onClick={() => setView("announcements")}>原始公告</button><button className={view === "events" ? "chosen" : ""} onClick={() => setView("events")}>结构化事件</button></div></div>
           <div className="filters"><label><span>公告日期</span><input type="date" value={date} onChange={(e) => setDate(e.target.value)} /></label><label className="wide"><span>股票 / 公告 / 相关方</span><input placeholder="输入关键词搜索" value={query} onChange={(e) => setQuery(e.target.value)} /></label><button className="searchBtn">查询</button><button className="reset" onClick={() => { setDate(""); setQuery(""); }}>重置</button></div>
           {view === "announcements" ? <><div className="resultMeta">共找到 <b>{filteredAnnouncements.length}</b> 条真实公告<span>来源：巨潮资讯官方披露</span></div><div className="tableWrap"><table className="announcementTable"><thead><tr><th>公告日期</th><th>股票</th><th>公告标题</th><th>状态</th><th>来源</th><th>哈希</th><th></th></tr></thead><tbody>{filteredAnnouncements.map((row) => <tr key={row.announcementId}><td className="mono">{row.announceDate}</td><td><b>{row.stockName}</b><small>{row.stockCode}</small></td><td title={row.title}>{row.title}</td><td><span className={`tag ${row.parseStatus === "parsed" ? "release" : row.parseStatus === "archived" ? "extra" : "new"}`}>{statusText[row.parseStatus] || row.parseStatus}</span></td><td><span className="sourceDot"></span>{row.source}</td><td className="mono">{row.sha256 ? `${row.sha256.slice(0, 10)}…` : "待归档"}</td><td><button className="detail" onClick={() => row.parseStatus === "queued" ? void archive(row) : window.open(row.pdfUrl, "_blank", "noopener,noreferrer")}>{row.parseStatus === "queued" ? "归档 PDF" : "查看原文"} ↗</button></td></tr>)}{!filteredAnnouncements.length && <tr><td colSpan={7} className="empty">该日期暂无已抓取公告；点击“同步公告”从巨潮资讯获取。</td></tr>}</tbody></table></div></> : <><div className="resultMeta">共找到 <b>{filteredEvents.length}</b> 条结构化事件<span>仅包含字段校验通过的数据</span></div><div className="tableWrap"><table><thead><tr><th>公告日期</th><th>股票</th><th>股东名称</th><th>质权人</th><th>质押数量</th><th>占其持股</th><th>占总股本</th><th>事件类型</th><th>来源</th></tr></thead><tbody>{filteredEvents.map((row) => <tr key={row.announcementId || row.id}><td>{row.date}</td><td><b>{row.name}</b><small>{row.code}</small></td><td>{row.shareholder}</td><td>{row.pledgee}</td><td>{row.amount}</td><td>{row.ratio}</td><td>{row.total}</td><td><span className="tag new">{row.type}</span></td><td>{row.source}</td></tr>)}{!filteredEvents.length && <tr><td colSpan={9} className="empty">已有真实公告，但尚未产生字段完整的质押事件。请先在公告中心归档 PDF。</td></tr>}</tbody></table></div></>}
