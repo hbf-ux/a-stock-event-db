@@ -10,6 +10,7 @@ type SyncRun = { id: number; source: string; startedAt: string; finishedAt?: str
 type StatsData = { daily: { date: string; announcements: number; parsed: number }[]; eventTypes: { name: string; value: number }[]; pledgees: { name: string; value: number; amount: number }[]; statuses: { name: string; value: number }[] };
 type Health = { stats?: { announcements?: number; events?: number; pending_reviews?: number } };
 type ProfileData = { stock: string; summary?: { name?: string; events?: number; pledged_amount?: number; latest_date?: string } | null; types: { type: string; count: number }[]; shareholders: { shareholder: string; events: number; amount: number; latest_date: string }[]; history: { date: string; type: string; amount: string; ratio?: string; total?: string; shareholder: string; pledgee: string; announcementId: string }[] };
+type ShareholderProfile = { stockCode: string; shareholder: string; identityType: string; isController: boolean; isControllingShareholder: boolean; holdingShares?: number | null; holdingRatio?: string | null; sourceTitle?: string | null; sourceUrl?: string | null; sourceDate?: string | null; confidence: number; updatedAt: string };
 
 const statusText: Record<string, string> = { queued: "待归档", archived: "待解析", parsed: "已解析", pending: "待处理", review: "待审核", rejected: "已驳回" };
 
@@ -54,6 +55,19 @@ function RiskBrief({ events, feedEvents, announcements, runs }: { events: EventR
 
 function PositioningStrip() {
   return <section className="positioningStrip"><div><p className="eyebrow">SHAREHOLDER FINANCE RISK</p><h2>股东融资风险，先看变化</h2><p>从官方质押公告出发，追踪融资行为、控制权线索和授信尽调风险。</p></div><div className="positioningPills"><span>质押行为</span><span>股东历史</span><span>授信线索</span></div></section>;
+}
+
+function ShareholderProfilePanel({ stock, profiles, onSaved }: { stock: string; profiles: ShareholderProfile[]; onSaved: (profile: ShareholderProfile) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({ shareholder: "", identityType: "股东", holdingShares: "", holdingRatio: "", sourceTitle: "", sourceUrl: "", sourceDate: "" });
+  const save = async () => {
+    if (!form.shareholder.trim()) return;
+    const response = await fetch("/api/shareholder-profiles", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ stockCode: stock, ...form, holdingShares: form.holdingShares ? Number(form.holdingShares) : null }) });
+    const result = await response.json() as { data?: ShareholderProfile; error?: string };
+    if (!response.ok || !result.data) { window.alert(result.error || "需要登录后保存股东资料"); return; }
+    onSaved(result.data); setEditing(false); setForm({ shareholder: "", identityType: "股东", holdingShares: "", holdingRatio: "", sourceTitle: "", sourceUrl: "", sourceDate: "" });
+  };
+  return <section className="shareholderProfilePanel"><div className="shareholderProfileHead"><div><p className="eyebrow">SHAREHOLDER MASTER DATA</p><h3>股东基础资料</h3></div><button className="secondary" onClick={() => setEditing(!editing)}>{editing ? "取消" : "新增 / 更新"}</button></div>{profiles.length ? <div className="shareholderProfileRows">{profiles.map((row) => <div key={row.shareholder}><div><b>{row.shareholder}</b><small>{row.identityType} · {row.isController ? "实控人" : row.isControllingShareholder ? "控股股东" : "身份待确认"}</small></div><span>{row.holdingRatio || "持股比例待补充"}</span><em>{row.sourceTitle || "来源待补充"}</em></div>)}</div> : <p className="empty">暂无已录入的股东基础资料。可从年报、权益变动公告或其他官方披露补充。</p>}{editing && <div className="shareholderProfileForm"><label>股东名称<input value={form.shareholder} onChange={(e) => setForm({ ...form, shareholder: e.target.value })} /></label><label>身份类型<select value={form.identityType} onChange={(e) => setForm({ ...form, identityType: e.target.value })}><option>股东</option><option>控股股东</option><option>实际控制人</option><option>一致行动人</option><option>机构股东</option></select></label><div className="reviewGrid"><label>持股数量<input type="number" min="0" value={form.holdingShares} onChange={(e) => setForm({ ...form, holdingShares: e.target.value })} /></label><label>持股比例<input placeholder="例如 18.25%" value={form.holdingRatio} onChange={(e) => setForm({ ...form, holdingRatio: e.target.value })} /></label></div><label>来源标题<input value={form.sourceTitle} onChange={(e) => setForm({ ...form, sourceTitle: e.target.value })} /></label><label>来源链接<input value={form.sourceUrl} onChange={(e) => setForm({ ...form, sourceUrl: e.target.value })} /></label><label>披露日期<input type="date" value={form.sourceDate} onChange={(e) => setForm({ ...form, sourceDate: e.target.value })} /></label><button className="primary full" disabled={!form.shareholder.trim()} onClick={() => void save()}>保存股东资料</button></div>}<p className="researchDisclaimer">资料仅接受有来源的人工维护，保存后记录操作者与更新时间；不会自动把身份标签推断为授信结论。</p></section>;
 }
 
 function ControlRiskPanel() {
@@ -142,6 +156,7 @@ export default function Home() {
   const [events, setEvents] = useState<EventRow[]>([]);
   const [feedEvents, setFeedEvents] = useState<EventRow[]>([]);
   const [profile, setProfile] = useState<ProfileData | null>(null);
+  const [shareholderProfiles, setShareholderProfiles] = useState<ShareholderProfile[]>([]);
   const [watchlist, setWatchlist] = useState<string[]>([]);
   const [watchlistSource, setWatchlistSource] = useState<"device" | "cloud">("device");
   const [announcements, setAnnouncements] = useState<AnnouncementRow[]>([]);
@@ -288,6 +303,7 @@ export default function Home() {
   const openProfile = async (stock: string) => {
     try { const response = await fetch(`/api/profile?stock=${encodeURIComponent(stock)}`, { cache: "no-store" }); if (!response.ok) throw new Error("画像暂不可用"); setProfile(await response.json() as ProfileData); } catch (error) { flash(error instanceof Error ? error.message : "画像加载失败"); }
   };
+  useEffect(() => { if (!profile) { setShareholderProfiles([]); return; } void fetch(`/api/shareholder-profiles?stock=${encodeURIComponent(profile.stock)}`, { cache: "no-store" }).then(async (response) => { if (!response.ok) return; const result = await response.json() as { data?: ShareholderProfile[] }; setShareholderProfiles(result.data || []); }); }, [profile]);
   const downloadResearchReport = (report: ProfileData) => {
     const escape = (value: unknown) => String(value ?? "—").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char] || char));
     const rows = report.history.slice(0, 20).map((row) => `<tr><td>${escape(row.date)}</td><td>${escape(row.type)}</td><td>${escape(row.shareholder)}</td><td>${escape(row.pledgee)}</td><td>${escape(row.amount)}</td><td>${escape(row.ratio || row.total || "待核验")}</td></tr>`).join("");
@@ -341,6 +357,7 @@ export default function Home() {
     {profile && <div className="overlay" onClick={() => setProfile(null)}><aside className="drawer profileDrawer" onClick={(event) => event.stopPropagation()}><button className="close" onClick={() => setProfile(null)}>×</button><p className="eyebrow">COMPANY PROFILE · {profile.stock}</p><h2>{profile.summary?.name || profile.stock}</h2><div className="profileStats"><div><span>质押事件</span><strong>{profile.summary?.events || 0}</strong></div><div><span>最新日期</span><strong>{profile.summary?.latest_date || "—"}</strong></div></div><h3>风险趋势</h3><ProfileTrend history={profile.history} /><h3>股东与质押轨迹</h3><div className="profileShareholders">{profile.shareholders.map((row) => <div key={row.shareholder}><b>{row.shareholder}</b><span>{row.events} 次 · {row.amount} 股</span></div>)}{!profile.shareholders.length && <p className="empty">暂无结构化历史</p>}</div><h3>最近事件</h3><div className="profileHistory">{profile.history.slice(0, 8).map((row) => <div key={row.announcementId + row.date}><span>{row.date}</span><b>{row.type}</b><small>{row.amount} · {row.pledgee}</small></div>)}</div><p className="planNote">数据来自官方公告，支持原文追溯。专业版将提供更长历史和自选股提醒。</p></aside></div>}
     {showPlans && <div className="overlay" onClick={() => setShowPlans(false)}><aside className="drawer plansDrawer" onClick={(event) => event.stopPropagation()}><button className="close" onClick={() => setShowPlans(false)}>×</button><p className="eyebrow">RESEARCH PLANS</p><h2>情报工作台</h2><p className="planIntro">免费查看官方公告与结构化事件；专业版面向研究团队提供更高效的筛选与导出。</p><div className="pricingGrid"><div className="priceCard"><span>免费研究版</span><strong>¥0</strong><small>公告浏览 · CSV 导出 · 原文追溯</small><button className="secondary" onClick={() => setShowPlans(false)}>当前方案</button></div><div className="priceCard featured"><span>专业版</span><strong>¥99<small>/月</small></strong><small>Excel/JSON 导出 · 高级筛选 · 历史数据与团队席位</small><input className="interestInput" aria-label="联系邮箱" placeholder="留下邮箱，预约专业版" value={interestEmail} onChange={(event) => setInterestEmail(event.target.value)} /><button className="primary" disabled={!interestEmail.trim()} onClick={() => void submitInterest()}>预约开通</button></div></div><p className="planNote">当前为产品内测阶段，不会产生任何扣费。</p></aside></div>}
     {notice && <div className="toast">✓ {notice}</div>}
+    {profile && <ShareholderProfilePanel stock={profile.stock} profiles={shareholderProfiles} onSaved={(saved) => setShareholderProfiles((current) => [saved, ...current.filter((row) => row.shareholder !== saved.shareholder)])} />}
     {profile && <ControlRiskPanel />}
     {profile && <button className="floatingReport" onClick={() => downloadResearchReport(profile)}>下载资方研究摘要</button>}
   </main>;

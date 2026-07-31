@@ -27,6 +27,8 @@ async function ensureSchema(db: D1Database) {
     `CREATE TABLE IF NOT EXISTS subscription_interest (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, plan TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'pricing-modal', created_at TEXT NOT NULL, UNIQUE(email, plan))`,
     `CREATE TABLE IF NOT EXISTS user_watchlist (user_id TEXT NOT NULL, stock_code TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (user_id, stock_code))`,
     `CREATE INDEX IF NOT EXISTS user_watchlist_user_idx ON user_watchlist (user_id)`,
+    `CREATE TABLE IF NOT EXISTS shareholder_profile (stock_code TEXT NOT NULL, shareholder TEXT NOT NULL, identity_type TEXT NOT NULL DEFAULT '股东', is_controller INTEGER NOT NULL DEFAULT 0, is_controlling_shareholder INTEGER NOT NULL DEFAULT 0, holding_shares REAL, holding_ratio TEXT, source_title TEXT, source_url TEXT, source_date TEXT, confidence REAL NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY (stock_code, shareholder))`,
+    `CREATE INDEX IF NOT EXISTS shareholder_profile_stock_idx ON shareholder_profile (stock_code)`,
     `CREATE INDEX IF NOT EXISTS pledge_date_idx ON pledge (announce_date)`,
     `CREATE INDEX IF NOT EXISTS pledge_stock_idx ON pledge (stock_code)`,
     `CREATE INDEX IF NOT EXISTS pledge_shareholder_idx ON pledge (shareholder)`,
@@ -433,6 +435,27 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       env.DB.prepare("SELECT announce_date AS date,type,pledge_amount_text AS amount,pledge_ratio AS ratio,total_ratio AS total,shareholder,pledgee,announcement_id AS announcementId FROM pledge WHERE stock_code=? ORDER BY announce_date DESC,id DESC LIMIT 100").bind(stock).all(),
     ]);
     return json({ stock, summary: summary || null, types: types.results, shareholders: shareholders.results, history: history.results, generatedAt: new Date().toISOString(), traceable: true });
+  }
+  if (url.pathname === "/api/shareholder-profiles" && (request.method === "GET" || request.method === "PUT")) {
+    const stock = (url.searchParams.get("stock") || "").trim();
+    if (!/^\d{6}$/.test(stock)) return json({ error: "invalid-stock" }, { status: 400 });
+    if (request.method === "GET") {
+      const rows = await env.DB.prepare("SELECT stock_code AS stockCode,shareholder,identity_type AS identityType,is_controller AS isController,is_controlling_shareholder AS isControllingShareholder,holding_shares AS holdingShares,holding_ratio AS holdingRatio,source_title AS sourceTitle,source_url AS sourceUrl,source_date AS sourceDate,confidence,updated_at AS updatedAt,updated_by AS updatedBy FROM shareholder_profile WHERE stock_code=? ORDER BY is_controller DESC,is_controlling_shareholder DESC,updated_at DESC").bind(stock).all();
+      return json({ data: rows.results, stock, traceable: true });
+    }
+    const userId = viewerId(request);
+    if (!userId) return json({ error: "sign-in-required" }, { status: 401 });
+    const input = await request.json<{shareholder?:string;identityType?:string;holdingShares?:number|null;holdingRatio?:string;sourceTitle?:string;sourceUrl?:string;sourceDate?:string}>().catch(() => ({}));
+    const shareholder = String(input.shareholder || "").trim();
+    if (!shareholder || shareholder.length > 120) return json({ error: "invalid-shareholder" }, { status: 400 });
+    const identityType = String(input.identityType || "股东").trim();
+    const isController = identityType === "实际控制人" ? 1 : 0;
+    const isControllingShareholder = identityType === "控股股东" ? 1 : 0;
+    const now = new Date().toISOString();
+    await env.DB.prepare("INSERT INTO shareholder_profile (stock_code,shareholder,identity_type,is_controller,is_controlling_shareholder,holding_shares,holding_ratio,source_title,source_url,source_date,confidence,updated_at,updated_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(stock_code,shareholder) DO UPDATE SET identity_type=excluded.identity_type,is_controller=excluded.is_controller,is_controlling_shareholder=excluded.is_controlling_shareholder,holding_shares=excluded.holding_shares,holding_ratio=excluded.holding_ratio,source_title=excluded.source_title,source_url=excluded.source_url,source_date=excluded.source_date,updated_at=excluded.updated_at,updated_by=excluded.updated_by").bind(stock,shareholder,identityType,isController,isControllingShareholder,input.holdingShares == null ? null : Number(input.holdingShares),String(input.holdingRatio || "").trim() || null,String(input.sourceTitle || "").trim() || null,String(input.sourceUrl || "").trim() || null,String(input.sourceDate || "").trim() || null,1,now,userId).run();
+    const row = await env.DB.prepare("SELECT stock_code AS stockCode,shareholder,identity_type AS identityType,is_controller AS isController,is_controlling_shareholder AS isControllingShareholder,holding_shares AS holdingShares,holding_ratio AS holdingRatio,source_title AS sourceTitle,source_url AS sourceUrl,source_date AS sourceDate,confidence,updated_at AS updatedAt,updated_by AS updatedBy FROM shareholder_profile WHERE stock_code=? AND shareholder=?").bind(stock,shareholder).first();
+    await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("shareholder_profile",`${stock}:${shareholder}`,"upsert",JSON.stringify(row),userId,now).run();
+    return json({ data: row, stock, traceable: true });
   }
   if (url.pathname === "/api/watchlist" && (request.method === "GET" || request.method === "PUT" || request.method === "DELETE")) {
     const userId = viewerId(request);

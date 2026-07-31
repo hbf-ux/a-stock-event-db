@@ -89,3 +89,19 @@ export const userWatchlist = sqliteTable("user_watchlist", {
   stockCode: text("stock_code").notNull(),
   createdAt: text("created_at").notNull(),
 }, (table) => [primaryKey({ columns: [table.userId, table.stockCode] })]);
+
+export const shareholderProfiles = sqliteTable("shareholder_profile", {
+  stockCode: text("stock_code").notNull(),
+  shareholder: text("shareholder").notNull(),
+  identityType: text("identity_type").notNull().default("股东"),
+  isController: integer("is_controller", { mode: "boolean" }).notNull().default(false),
+  isControllingShareholder: integer("is_controlling_shareholder", { mode: "boolean" }).notNull().default(false),
+  holdingShares: real("holding_shares"),
+  holdingRatio: text("holding_ratio"),
+  sourceTitle: text("source_title"),
+  sourceUrl: text("source_url"),
+  sourceDate: text("source_date"),
+  confidence: real("confidence").notNull().default(1),
+  updatedAt: text("updated_at").notNull(),
+  updatedBy: text("updated_by").notNull(),
+}, (table) => [primaryKey({ columns: [table.stockCode, table.shareholder] })]);
