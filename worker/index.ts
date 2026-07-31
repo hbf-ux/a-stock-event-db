@@ -412,6 +412,13 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,10,env));
     return json({ok:true,run_id:run?.id,days,end_date:endDate,announcements_found:found,announcements_inserted:inserted,failures,dates,auto_processing:true});
   }
+  if (url.pathname === "/api/feed" && request.method === "GET") {
+    const hours = Math.min(Math.max(Number(url.searchParams.get("hours")) || 24, 1), 168);
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);
+    const since = new Date(Date.now() - hours * 3600000).toISOString();
+    const result = await env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,a.crawl_time AS crawledAt,a.title,a.source,a.pdf_url AS pdfUrl,p.confidence,p.parser_version AS parserVersion FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.crawl_time >= ? ORDER BY a.crawl_time DESC,p.id DESC LIMIT ?").bind(since, limit).all();
+    return json({ data: result.results, hours, limit, since, generatedAt: new Date().toISOString(), freshness: "official-announcement-crawl" });
+  }
   if (url.pathname === "/api/events" && request.method === "GET") {
     const conditions: string[] = []; const values: string[] = [];
     const add = (sql: string, value: string | null) => { if (value) { conditions.push(sql); values.push(value); } };
