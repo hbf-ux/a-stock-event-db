@@ -419,6 +419,17 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const result = await env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,a.crawl_time AS crawledAt,a.title,a.source,a.pdf_url AS pdfUrl,p.confidence,p.parser_version AS parserVersion FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.crawl_time >= ? ORDER BY a.crawl_time DESC,p.id DESC LIMIT ?").bind(since, limit).all();
     return json({ data: result.results, hours, limit, since, generatedAt: new Date().toISOString(), freshness: "official-announcement-crawl" });
   }
+  if (url.pathname === "/api/profile" && request.method === "GET") {
+    const stock = (url.searchParams.get("stock") || "").trim();
+    if (!stock) return json({ error: "stock is required" }, { status: 400 });
+    const [summary, types, shareholders, history] = await Promise.all([
+      env.DB.prepare("SELECT p.stock_code AS stock,p.stock_name AS name,COUNT(*) AS events,COALESCE(SUM(CASE WHEN p.type LIKE '%解除%' THEN 0 ELSE p.pledge_amount END),0) AS pledged_amount,MAX(p.announce_date) AS latest_date FROM pledge p WHERE p.stock_code=? GROUP BY p.stock_code,p.stock_name").bind(stock).first(),
+      env.DB.prepare("SELECT type,COUNT(*) AS count FROM pledge WHERE stock_code=? GROUP BY type ORDER BY count DESC").bind(stock).all(),
+      env.DB.prepare("SELECT shareholder,COUNT(*) AS events,COALESCE(SUM(pledge_amount),0) AS amount,MAX(announce_date) AS latest_date FROM pledge WHERE stock_code=? GROUP BY shareholder ORDER BY amount DESC LIMIT 20").bind(stock).all(),
+      env.DB.prepare("SELECT announce_date AS date,type,pledge_amount_text AS amount,pledge_ratio AS ratio,total_ratio AS total,shareholder,pledgee,announcement_id AS announcementId FROM pledge WHERE stock_code=? ORDER BY announce_date DESC,id DESC LIMIT 100").bind(stock).all(),
+    ]);
+    return json({ stock, summary: summary || null, types: types.results, shareholders: shareholders.results, history: history.results, generatedAt: new Date().toISOString(), traceable: true });
+  }
   if (url.pathname === "/api/events" && request.method === "GET") {
     const conditions: string[] = []; const values: string[] = [];
     const add = (sql: string, value: string | null) => { if (value) { conditions.push(sql); values.push(value); } };
