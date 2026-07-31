@@ -3,8 +3,8 @@ import "./globals.css";
 import "./extra.css";
 
 export const metadata: Metadata = {
-  title: "A股事件库｜公开披露事件数据库",
-  description: "基于官方公告的 A 股事件结构化数据平台，支持查询、溯源与导出。",
+  title: "股东融资风控情报｜A股质押风险监测",
+  description: "基于官方公告的 A 股股东融资行为监测与质押风控情报平台。",
   icons: { icon: "/favicon.svg", shortcut: "/favicon.svg" },
 };
 
