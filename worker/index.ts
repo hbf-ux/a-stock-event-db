@@ -6,9 +6,10 @@ interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
   DOCUMENTS: R2Bucket;
+  IMAGES: { input(stream: ReadableStream): { transform(options: Record<string, unknown>): { output(options: { format: string; quality: number }): Promise<{ response(): Response }> } } };
+  /** Legacy fields retained for schema compatibility; V1-Lite never reads them. */
   OPENAI_API_KEY?: string;
   OPENAI_OCR_MODEL?: string;
-  IMAGES: { input(stream: ReadableStream): { transform(options: Record<string, unknown>): { output(options: { format: string; quality: number }): Promise<{ response(): Response }> } } };
 }
 interface ExecutionContext { waitUntil(promise: Promise<unknown>): void; passThroughOnException(): void; }
 
@@ -281,27 +282,21 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
     bytes = await response.arrayBuffer(); sha256 = hex(await crypto.subtle.digest("SHA-256",bytes)); r2Key = `announcements/${id}.pdf`;
     await documents.put(r2Key,bytes,{httpMetadata:{contentType:"application/pdf"},customMetadata:{announcementId:id,sha256}});
   }
-  const pdfBase64 = env?.OPENAI_API_KEY ? arrayBufferToBase64(bytes) : "";
   const pdf = await getDocumentProxy(new Uint8Array(bytes)); const extracted = await extractText(pdf,{mergePages:true});
   const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
-  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.1"; let confidence = rows.length > 1 ? 0.88 : 0.82; let ocrError = "";
-  if (!rows.some((row) => !row.missing.length) && env?.OPENAI_API_KEY) {
-    try {
-      const visionRows = await parseWithOpenAI(pdfBase64,item.title,env);
-      await documents.put(`announcements/${id}.ocr.json`,JSON.stringify({parser:"openai-responses",rows:visionRows}),{httpMetadata:{contentType:"application/json; charset=utf-8"}});
-      if (visionRows.length) { rows = validateParsedRows(visionRows); parserVersion = `openai-vision-v1:${env.OPENAI_OCR_MODEL || "gpt-5.6-luna"}`; confidence = 0.9; }
-    } catch (error) { ocrError = error instanceof Error ? error.message : "OCR failed"; }
-  }
+  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.1-lite"; let confidence = rows.length > 1 ? 0.88 : 0.82;
+  // V1-Lite is local-only: PDFs that do not yield complete deterministic rows
+  // stay in the manual review queue; no OCR/LLM request is ever made.
   const completeRows = rows.filter((row) => !row.missing.length); const parsed = rows[0]; const now = new Date().toISOString();
   if (!completeRows.length) {
     const missing = parsed?.missing || ["股东","质权人","质押数量"];
     await db.batch([
       db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review',last_error=NULL WHERE announcement_id=?").bind(r2Key,sha256,id),
-      db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(`自动解析缺少字段：${missing.join("、")}${ocrError ? `；OCR 失败：${ocrError}` : env?.OPENAI_API_KEY ? "；OCR 未识别出完整记录" : "；OCR 尚未配置"}`,JSON.stringify({...parsed,candidates:rows,textKey:`announcements/${id}.txt`,ocrConfigured:Boolean(env?.OPENAI_API_KEY),ocrError}),id),
-      db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"parse_review",JSON.stringify({missing,parserVersion,ocrConfigured:Boolean(env?.OPENAI_API_KEY)}),"worker",now),
+      db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(`本地规则解析缺少字段：${missing.join("、")}；V1-Lite 未启用 OCR，请人工审核`,JSON.stringify({...parsed,candidates:rows,textKey:`announcements/${id}.txt`,ocrConfigured:false}),id),
+      db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"parse_review",JSON.stringify({missing,parserVersion,ocrConfigured:false}),"worker",now),
     ]);
-    return {id,status:"review",missing,ocr_attempted:Boolean(env?.OPENAI_API_KEY),ocr_error:ocrError || undefined};
+    return {id,status:"review",missing,ocr_attempted:false};
   }
   const statements: D1PreparedStatement[] = [];
   for (let index = 0; index < completeRows.length; index++) {
@@ -375,7 +370,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   const url = new URL(request.url);
   if (url.pathname === "/api/health") {
     const stats = await env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews").first();
-    return json({ status: "ok", storage: { d1: true, r2: true }, ocr: { configured: Boolean(env.OPENAI_API_KEY), model: env.OPENAI_OCR_MODEL || "gpt-5.6-luna" }, stats, timestamp: new Date().toISOString() });
+    return json({ status: "ok", storage: { d1: true, r2: true }, ocr: { configured: false, mode: "disabled-v1-lite" }, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
