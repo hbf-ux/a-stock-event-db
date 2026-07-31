@@ -23,6 +23,7 @@ async function ensureSchema(db: D1Database) {
     `CREATE TABLE IF NOT EXISTS review_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, announcement_id TEXT NOT NULL, event_type TEXT NOT NULL, reason TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, reviewed_at TEXT, reviewer TEXT, resolution TEXT)`,
     `CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, before_json TEXT, after_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS sync_run (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, announcements_found INTEGER NOT NULL DEFAULT 0, events_created INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, message TEXT)`,
+    `CREATE TABLE IF NOT EXISTS subscription_interest (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, plan TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'pricing-modal', created_at TEXT NOT NULL, UNIQUE(email, plan))`,
     `CREATE INDEX IF NOT EXISTS pledge_date_idx ON pledge (announce_date)`,
     `CREATE INDEX IF NOT EXISTS pledge_stock_idx ON pledge (stock_code)`,
     `CREATE INDEX IF NOT EXISTS pledge_shareholder_idx ON pledge (shareholder)`,
@@ -429,6 +430,14 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       env.DB.prepare("SELECT announce_date AS date,type,pledge_amount_text AS amount,pledge_ratio AS ratio,total_ratio AS total,shareholder,pledgee,announcement_id AS announcementId FROM pledge WHERE stock_code=? ORDER BY announce_date DESC,id DESC LIMIT 100").bind(stock).all(),
     ]);
     return json({ stock, summary: summary || null, types: types.results, shareholders: shareholders.results, history: history.results, generatedAt: new Date().toISOString(), traceable: true });
+  }
+  if (url.pathname === "/api/subscribe-interest" && request.method === "POST") {
+    const input = await request.json<{email?: string; plan?: string}>().catch(() => ({}));
+    const email = String(input.email || "").trim().toLowerCase(); const plan = String(input.plan || "pro").trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ error: "请输入有效邮箱" }, { status: 400 });
+    if (!["pro", "enterprise"].includes(plan)) return json({ error: "无效套餐" }, { status: 400 });
+    await env.DB.prepare("INSERT OR IGNORE INTO subscription_interest (email,plan,source,created_at) VALUES (?,?,?,?)").bind(email,plan,"pricing-modal",new Date().toISOString()).run();
+    return json({ ok: true, message: "已登记，我们会在产品开放订阅后联系你" });
   }
   if (url.pathname === "/api/events" && request.method === "GET") {
     const conditions: string[] = []; const values: string[] = [];
