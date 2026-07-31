@@ -103,6 +103,7 @@ export default function Home() {
   const [feedEvents, setFeedEvents] = useState<EventRow[]>([]);
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [watchlist, setWatchlist] = useState<string[]>([]);
+  const [watchlistSource, setWatchlistSource] = useState<"device" | "cloud">("device");
   const [announcements, setAnnouncements] = useState<AnnouncementRow[]>([]);
   const [reviews, setReviews] = useState<ReviewRow[]>([]);
   const [syncRuns, setSyncRuns] = useState<SyncRun[]>([]);
@@ -147,7 +148,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => { void loadAll(); }, [loadAll]);
-  useEffect(() => { try { const saved = window.localStorage.getItem("stock-event-watchlist"); if (saved) setWatchlist(JSON.parse(saved) as string[]); } catch {} }, []);
+  useEffect(() => { void (async () => { try { const saved = window.localStorage.getItem("stock-event-watchlist"); if (saved) setWatchlist(JSON.parse(saved) as string[]); } catch {} try { const response = await fetch("/api/watchlist", { cache: "no-store" }); if (response.ok) { const payload = await response.json() as { data?: string[] }; setWatchlist(payload.data || []); setWatchlistSource("cloud"); } } catch {} })(); }, []);
 
   const filteredAnnouncements = useMemo(() => announcements.filter((row) => {
     const text = `${row.stockCode}${row.stockName}${row.title}`.toLowerCase();
@@ -247,7 +248,7 @@ export default function Home() {
   const openProfile = async (stock: string) => {
     try { const response = await fetch(`/api/profile?stock=${encodeURIComponent(stock)}`, { cache: "no-store" }); if (!response.ok) throw new Error("画像暂不可用"); setProfile(await response.json() as ProfileData); } catch (error) { flash(error instanceof Error ? error.message : "画像加载失败"); }
   };
-  const toggleWatch = (stock: string) => { const next = watchlist.includes(stock) ? watchlist.filter((item) => item !== stock) : [...watchlist, stock]; setWatchlist(next); try { window.localStorage.setItem("stock-event-watchlist", JSON.stringify(next)); } catch {} flash(next.includes(stock) ? `已关注 ${stock}` : `已取消关注 ${stock}`); };
+  const toggleWatch = async (stock: string) => { const adding = !watchlist.includes(stock); const next = adding ? [...watchlist, stock] : watchlist.filter((item) => item !== stock); setWatchlist(next); try { window.localStorage.setItem("stock-event-watchlist", JSON.stringify(next)); } catch {} if (watchlistSource === "cloud") { const response = await fetch("/api/watchlist", { method: adding ? "PUT" : "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ stock }) }); if (!response.ok) { setWatchlistSource("device"); flash("云端同步暂不可用，已保存在本设备"); return; } } flash(adding ? `已关注 ${stock}` : `已取消关注 ${stock}`); };
   const submitInterest = async () => { const response = await fetch("/api/subscribe-interest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: interestEmail, plan: "pro" }) }); const result = await response.json() as { ok?: boolean; error?: string; message?: string }; if (!response.ok) { flash(result.error || "提交失败"); return; } setInterestEmail(""); flash(result.message || "已登记"); };
 
   const rawCount = health.stats?.announcements ?? announcements.length;

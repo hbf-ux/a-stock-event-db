@@ -14,6 +14,7 @@ interface Env {
 interface ExecutionContext { waitUntil(promise: Promise<unknown>): void; passThroughOnException(): void; }
 
 const json = (data: unknown, init: ResponseInit = {}) => new Response(JSON.stringify(data), { ...init, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...(init.headers || {}) } });
+const viewerId = (request: Request) => request.headers.get("oai-authenticated-user-id")?.trim() || null;
 
 async function ensureSchema(db: D1Database) {
   const statements = [
@@ -24,6 +25,8 @@ async function ensureSchema(db: D1Database) {
     `CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, before_json TEXT, after_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS sync_run (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, announcements_found INTEGER NOT NULL DEFAULT 0, events_created INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, message TEXT)`,
     `CREATE TABLE IF NOT EXISTS subscription_interest (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, plan TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'pricing-modal', created_at TEXT NOT NULL, UNIQUE(email, plan))`,
+    `CREATE TABLE IF NOT EXISTS user_watchlist (user_id TEXT NOT NULL, stock_code TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (user_id, stock_code))`,
+    `CREATE INDEX IF NOT EXISTS user_watchlist_user_idx ON user_watchlist (user_id)`,
     `CREATE INDEX IF NOT EXISTS pledge_date_idx ON pledge (announce_date)`,
     `CREATE INDEX IF NOT EXISTS pledge_stock_idx ON pledge (stock_code)`,
     `CREATE INDEX IF NOT EXISTS pledge_shareholder_idx ON pledge (shareholder)`,
@@ -430,6 +433,21 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       env.DB.prepare("SELECT announce_date AS date,type,pledge_amount_text AS amount,pledge_ratio AS ratio,total_ratio AS total,shareholder,pledgee,announcement_id AS announcementId FROM pledge WHERE stock_code=? ORDER BY announce_date DESC,id DESC LIMIT 100").bind(stock).all(),
     ]);
     return json({ stock, summary: summary || null, types: types.results, shareholders: shareholders.results, history: history.results, generatedAt: new Date().toISOString(), traceable: true });
+  }
+  if (url.pathname === "/api/watchlist" && (request.method === "GET" || request.method === "PUT" || request.method === "DELETE")) {
+    const userId = viewerId(request);
+    if (!userId) return json({ error: "sign-in-required", source: "device" }, { status: 401 });
+    if (request.method === "GET") {
+      const rows = await env.DB.prepare("SELECT stock_code AS stockCode FROM user_watchlist WHERE user_id=? ORDER BY created_at DESC").bind(userId).all<{stockCode:string}>();
+      return json({ data: rows.results.map((row) => row.stockCode), source: "cloud" });
+    }
+    const input = await request.json<{stock?:string}>().catch(() => ({}));
+    const stock = String(input.stock || "").trim();
+    if (!/^\d{6}$/.test(stock)) return json({ error: "invalid-stock" }, { status: 400 });
+    if (request.method === "PUT") await env.DB.prepare("INSERT OR IGNORE INTO user_watchlist (user_id,stock_code,created_at) VALUES (?,?,?)").bind(userId,stock,new Date().toISOString()).run();
+    else await env.DB.prepare("DELETE FROM user_watchlist WHERE user_id=? AND stock_code=?").bind(userId,stock).run();
+    const rows = await env.DB.prepare("SELECT stock_code AS stockCode FROM user_watchlist WHERE user_id=? ORDER BY created_at DESC").bind(userId).all<{stockCode:string}>();
+    return json({ data: rows.results.map((row) => row.stockCode), source: "cloud" });
   }
   if (url.pathname === "/api/subscribe-interest" && request.method === "POST") {
     const input = await request.json<{email?: string; plan?: string}>().catch(() => ({}));

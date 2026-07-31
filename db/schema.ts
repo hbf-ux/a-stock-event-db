@@ -1,4 +1,4 @@
-import { integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const stockInfo = sqliteTable("stock_info", {
   code: text("code").primaryKey(),
@@ -83,3 +83,9 @@ export const syncRuns = sqliteTable("sync_run", {
   failures: integer("failures").notNull().default(0),
   message: text("message"),
 });
+
+export const userWatchlist = sqliteTable("user_watchlist", {
+  userId: text("user_id").notNull(),
+  stockCode: text("stock_code").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [primaryKey({ columns: [table.userId, table.stockCode] })]);

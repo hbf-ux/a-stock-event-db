@@ -15,6 +15,13 @@
       "when": 1785214108243,
       "tag": "0001_overrated_wolf_cub",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1785506340198,
+      "tag": "0002_panoramic_jamie_braddock",
+      "breakpoints": true
     }
   ]
 }
