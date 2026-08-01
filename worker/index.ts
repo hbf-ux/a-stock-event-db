@@ -31,7 +31,7 @@ async function ensureSchema(db: D1Database) {
   const statements = [
     `CREATE TABLE IF NOT EXISTS stock_info (code TEXT PRIMARY KEY, name TEXT NOT NULL, exchange TEXT NOT NULL, industry TEXT, list_date TEXT, status TEXT NOT NULL DEFAULT '上市')`,
     `CREATE TABLE IF NOT EXISTS announcement (announcement_id TEXT PRIMARY KEY, stock_code TEXT NOT NULL, stock_name TEXT NOT NULL, title TEXT NOT NULL, announce_date TEXT NOT NULL, pdf_url TEXT, r2_key TEXT, source TEXT NOT NULL, crawl_time TEXT NOT NULL, md5 TEXT NOT NULL UNIQUE, sha256 TEXT, parse_status TEXT NOT NULL DEFAULT 'pending', parse_attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT)`,
-    `CREATE TABLE IF NOT EXISTS pledge (id INTEGER PRIMARY KEY AUTOINCREMENT, announcement_id TEXT NOT NULL, stock_code TEXT NOT NULL, stock_name TEXT NOT NULL, shareholder TEXT NOT NULL, pledgee TEXT NOT NULL, pledge_amount REAL NOT NULL, pledge_amount_text TEXT NOT NULL, pledge_ratio TEXT, total_ratio TEXT, start_date TEXT, end_date TEXT, purpose TEXT, type TEXT NOT NULL, announce_date TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0, parser_version TEXT NOT NULL, parsed_at TEXT NOT NULL, UNIQUE(announcement_id, shareholder, type))`,
+    `CREATE TABLE IF NOT EXISTS pledge (id INTEGER PRIMARY KEY AUTOINCREMENT, announcement_id TEXT NOT NULL, stock_code TEXT NOT NULL, stock_name TEXT NOT NULL, shareholder TEXT NOT NULL, pledgee TEXT NOT NULL, pledge_amount REAL NOT NULL, pledge_amount_text TEXT NOT NULL, pledge_ratio TEXT, total_ratio TEXT, start_date TEXT, end_date TEXT, purpose TEXT, type TEXT NOT NULL, announce_date TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0, parser_version TEXT NOT NULL, parsed_at TEXT NOT NULL, event_fingerprint TEXT UNIQUE, verification_status TEXT NOT NULL DEFAULT 'rules_validated', verified_at TEXT, verified_by TEXT, evidence_json TEXT NOT NULL DEFAULT '{}')`,
     `CREATE TABLE IF NOT EXISTS review_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, announcement_id TEXT NOT NULL, event_type TEXT NOT NULL, reason TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, reviewed_at TEXT, reviewer TEXT, resolution TEXT)`,
     `CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, before_json TEXT, after_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS sync_run (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, announcements_found INTEGER NOT NULL DEFAULT 0, events_created INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, message TEXT)`,
@@ -90,6 +90,13 @@ async function ensureSchema(db: D1Database) {
       db.prepare("CREATE INDEX pledge_pledgee_idx ON pledge (pledgee)"),
     ]);
   }
+  const verificationColumns = await db.prepare("PRAGMA table_info(pledge)").all<{name:string}>();
+  const verificationNames = new Set(verificationColumns.results.map((column) => column.name));
+  if (!verificationNames.has("verification_status")) await db.prepare("ALTER TABLE pledge ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'rules_validated'").run();
+  if (!verificationNames.has("verified_at")) await db.prepare("ALTER TABLE pledge ADD COLUMN verified_at TEXT").run();
+  if (!verificationNames.has("verified_by")) await db.prepare("ALTER TABLE pledge ADD COLUMN verified_by TEXT").run();
+  if (!verificationNames.has("evidence_json")) await db.prepare("ALTER TABLE pledge ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'").run();
+  await db.prepare("UPDATE pledge SET verification_status=CASE WHEN parser_version LIKE 'manual-%' THEN 'human_verified' WHEN parser_version LIKE 'openai-%' THEN 'ai_reviewed' ELSE 'rules_validated' END,verified_at=CASE WHEN parser_version LIKE 'manual-%' OR parser_version LIKE 'openai-%' THEN COALESCE(verified_at,parsed_at) ELSE verified_at END,verified_by=CASE WHEN parser_version LIKE 'manual-%' THEN COALESCE(verified_by,'legacy-reviewer') WHEN parser_version LIKE 'openai-%' THEN COALESCE(verified_by,'openai') ELSE COALESCE(verified_by,'rules-engine') END WHERE verified_by IS NULL OR (parser_version LIKE 'manual-%' AND verification_status!='human_verified') OR (parser_version LIKE 'openai-%' AND verification_status!='ai_reviewed')").run();
   await db.batch([
     db.prepare("UPDATE pledge SET shareholder=REPLACE(REPLACE(shareholder,' ',''),'　',''),pledgee=REPLACE(REPLACE(pledgee,' ',''),'　','') WHERE shareholder LIKE '% %' OR shareholder LIKE '%　%' OR pledgee LIKE '% %' OR pledgee LIKE '%　%'"),
     db.prepare("UPDATE pledge SET pledgee=SUBSTR(pledgee,2) WHERE pledgee LIKE '日%' AND (pledgee LIKE '%有限公司' OR pledgee LIKE '%支行')"),
@@ -348,6 +355,24 @@ async function fingerprint(id: string, row: ParsedPledge, index: number) {
   return hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode([id,row.shareholder,row.pledgee,row.amountText,row.startDate,row.type,index].join("|"))));
 }
 
+function eventEvidence(id:string,pages:string[],row:ParsedPledge,method:"rules"|"openai"|"human") {
+  const normalize=(value:string)=>String(value||"").replace(/\s+/g,"").toLowerCase();
+  const fields=[
+    ["shareholder",row.shareholder],
+    ["pledgee",row.pledgee],
+    ["pledgeAmount",row.amountText],
+    ["pledgeRatio",row.pledgeRatio],
+    ["totalRatio",row.totalRatio],
+  ].filter((entry)=>normalize(String(entry[1])).length>=2) as string[][];
+  let bestPage=-1;let bestMatches:string[]=[];
+  pages.forEach((page,index)=>{
+    const normalizedPage=normalize(page);
+    const matches=fields.filter(([,value])=>normalizedPage.includes(normalize(value))).map(([name])=>name);
+    if(matches.length>bestMatches.length){bestPage=index;bestMatches=matches;}
+  });
+  return JSON.stringify({version:"pdf-page-match-v1",method,textKey:`announcements/${id}.txt`,pageNumber:bestPage>=0?bestPage+1:null,matchedFields:bestMatches});
+}
+
 async function legacyProcessAnnouncement(db: D1Database, documents: R2Bucket, id: string) {
   const item = await db.prepare("SELECT announcement_id AS id,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,r2_key AS r2Key,sha256 FROM announcement WHERE announcement_id=?").bind(id).first<{id:string;stockCode:string;stockName:string;title:string;announceDate:string;pdfUrl:string;r2Key?:string;sha256?:string}>();
   if (!item) throw new Error("announcement not found");
@@ -402,8 +427,9 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   }
   // PDF.js may transfer/detach the supplied buffer. Parse a copy so the
   // archived bytes remain available for the OpenAI fallback below.
-  const pdf = await getDocumentProxy(new Uint8Array(bytes.slice(0))); const extracted = await extractText(pdf,{mergePages:true});
-  const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
+  const pdf = await getDocumentProxy(new Uint8Array(bytes.slice(0))); const extracted = await extractText(pdf,{mergePages:false});
+  const pages = Array.isArray(extracted.text) ? extracted.text.map((page)=>String(page)) : [String(extracted.text||"")];
+  const text = pages.join("\n\f\n");
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
   let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.3"; let confidence = rows.length > 1 ? 0.9 : 0.86;
   const localIncomplete = !rows.length || rows.some((row) => row.missing.length > 0);
@@ -434,6 +460,10 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
     }
   }
   const completeRows = rows.filter((row) => !row.missing.length); const parsed = rows[0]; const now = new Date().toISOString();
+  const verificationStatus = openaiMeta ? "ai_reviewed" : "rules_validated";
+  const verifiedAt = openaiMeta ? now : null;
+  const verifiedBy = openaiMeta ? "openai" : "rules-engine";
+  const evidenceMethod = openaiMeta ? "openai" : "rules";
   if (!completeRows.length || rows.some((row) => row.missing.length > 0)) {
     const missing = parsed?.missing || ["股东","质权人","质押数量"];
     const reviewReason = openaiAttempted
@@ -446,7 +476,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
     const reviewStatements: D1PreparedStatement[] = [];
     for (let index = 0; index < completeRows.length; index++) {
       const row = completeRows[index]; const eventFingerprint = await fingerprint(id,row,index);
-      reviewStatements.push(db.prepare("INSERT OR IGNORE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id,item.stockCode,item.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,item.announceDate,confidence,parserVersion,now,eventFingerprint));
+      reviewStatements.push(db.prepare("INSERT OR IGNORE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint,verification_status,verified_at,verified_by,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id,item.stockCode,item.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,item.announceDate,confidence,parserVersion,now,eventFingerprint,verificationStatus,verifiedAt,verifiedBy,eventEvidence(id,pages,row,evidenceMethod)));
     }
     reviewStatements.push(
       db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review',last_error=?,parse_attempts=parse_attempts+? WHERE announcement_id=?").bind(r2Key,sha256,openaiError || null,openaiAttempted ? 1 : 0,id),
@@ -459,7 +489,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   const statements: D1PreparedStatement[] = [];
   for (let index = 0; index < completeRows.length; index++) {
     const row = completeRows[index]; const eventFingerprint = await fingerprint(id,row,index);
-    statements.push(db.prepare("INSERT OR IGNORE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id,item.stockCode,item.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,item.announceDate,confidence,parserVersion,now,eventFingerprint));
+    statements.push(db.prepare("INSERT OR IGNORE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint,verification_status,verified_at,verified_by,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id,item.stockCode,item.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,item.announceDate,confidence,parserVersion,now,eventFingerprint,verificationStatus,verifiedAt,verifiedBy,eventEvidence(id,pages,row,evidenceMethod)));
   }
   statements.push(
     db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='parsed',last_error=NULL,parse_attempts=0 WHERE announcement_id=?").bind(r2Key,sha256,id),
@@ -1053,7 +1083,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const since = addDays(shanghaiDate(),-45);
     const [announcements,events,latency,daily,sources,parsers,failures,runs,exchangeSources] = await Promise.all([
       env.DB.prepare("SELECT COUNT(*) AS total,SUM(CASE WHEN parse_status='parsed' THEN 1 ELSE 0 END) AS parsed,SUM(CASE WHEN parse_status='review' THEN 1 ELSE 0 END) AS review,SUM(CASE WHEN parse_status IN ('queued','archived','pending') THEN 1 ELSE 0 END) AS waiting,SUM(CASE WHEN parse_status='ignored' THEN 1 ELSE 0 END) AS ignored,SUM(CASE WHEN pdf_url IS NOT NULL AND TRIM(pdf_url)!='' AND md5 IS NOT NULL AND TRIM(md5)!='' THEN 1 ELSE 0 END) AS traceable,SUM(CASE WHEN r2_key IS NOT NULL AND TRIM(r2_key)!='' THEN 1 ELSE 0 END) AS archived,COUNT(DISTINCT stock_code) AS stocks,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate,MAX(crawl_time) AS latestCrawlAt FROM announcement").first<Record<string,number|string|null>>(),
-      env.DB.prepare("SELECT COUNT(*) AS total,COUNT(DISTINCT announcement_id) AS announcements,COUNT(DISTINCT stock_code) AS stocks,SUM(CASE WHEN TRIM(stock_code)!='' AND TRIM(stock_name)!='' AND TRIM(shareholder)!='' AND TRIM(pledgee)!='' AND pledge_amount>0 AND TRIM(type)!='' AND TRIM(announce_date)!='' THEN 1 ELSE 0 END) AS requiredComplete,SUM(CASE WHEN pledge_ratio IS NOT NULL AND TRIM(pledge_ratio)!='' THEN 1 ELSE 0 END) AS withPledgeRatio,SUM(CASE WHEN total_ratio IS NOT NULL AND TRIM(total_ratio)!='' THEN 1 ELSE 0 END) AS withTotalRatio,SUM(CASE WHEN start_date IS NOT NULL AND TRIM(start_date)!='' THEN 1 ELSE 0 END) AS withStartDate,SUM(CASE WHEN end_date IS NOT NULL AND TRIM(end_date)!='' THEN 1 ELSE 0 END) AS withEndDate,SUM(CASE WHEN purpose IS NOT NULL AND TRIM(purpose)!='' THEN 1 ELSE 0 END) AS withPurpose,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate,MAX(parsed_at) AS latestParsedAt FROM pledge").first<Record<string,number|string|null>>(),
+      env.DB.prepare("SELECT COUNT(*) AS total,COUNT(DISTINCT announcement_id) AS announcements,COUNT(DISTINCT stock_code) AS stocks,SUM(CASE WHEN TRIM(stock_code)!='' AND TRIM(stock_name)!='' AND TRIM(shareholder)!='' AND TRIM(pledgee)!='' AND pledge_amount>0 AND TRIM(type)!='' AND TRIM(announce_date)!='' THEN 1 ELSE 0 END) AS requiredComplete,SUM(CASE WHEN pledge_ratio IS NOT NULL AND TRIM(pledge_ratio)!='' THEN 1 ELSE 0 END) AS withPledgeRatio,SUM(CASE WHEN total_ratio IS NOT NULL AND TRIM(total_ratio)!='' THEN 1 ELSE 0 END) AS withTotalRatio,SUM(CASE WHEN start_date IS NOT NULL AND TRIM(start_date)!='' THEN 1 ELSE 0 END) AS withStartDate,SUM(CASE WHEN end_date IS NOT NULL AND TRIM(end_date)!='' THEN 1 ELSE 0 END) AS withEndDate,SUM(CASE WHEN purpose IS NOT NULL AND TRIM(purpose)!='' THEN 1 ELSE 0 END) AS withPurpose,SUM(CASE WHEN verification_status='human_verified' THEN 1 ELSE 0 END) AS humanVerified,SUM(CASE WHEN verification_status='ai_reviewed' THEN 1 ELSE 0 END) AS aiReviewed,SUM(CASE WHEN verification_status='rules_validated' THEN 1 ELSE 0 END) AS rulesValidated,SUM(CASE WHEN json_extract(evidence_json,'$.pageNumber') IS NOT NULL THEN 1 ELSE 0 END) AS withEvidence,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate,MAX(parsed_at) AS latestParsedAt FROM pledge").first<Record<string,number|string|null>>(),
       env.DB.prepare("SELECT AVG((julianday(p.parsedAt)-julianday(a.crawl_time))*1440.0) AS averageMinutes,MAX((julianday(p.parsedAt)-julianday(a.crawl_time))*1440.0) AS maximumMinutes,COUNT(*) AS samples FROM announcement a JOIN (SELECT announcement_id,MIN(parsed_at) AS parsedAt FROM pledge GROUP BY announcement_id) p ON p.announcement_id=a.announcement_id WHERE julianday(p.parsedAt)>=julianday(a.crawl_time)").first<Record<string,number|null>>(),
       env.DB.prepare("SELECT a.date,a.announcements,a.parsed,a.review,a.ignored,COALESCE(p.events,0) AS events FROM (SELECT announce_date AS date,COUNT(*) AS announcements,SUM(CASE WHEN parse_status='parsed' THEN 1 ELSE 0 END) AS parsed,SUM(CASE WHEN parse_status='review' THEN 1 ELSE 0 END) AS review,SUM(CASE WHEN parse_status='ignored' THEN 1 ELSE 0 END) AS ignored FROM announcement WHERE announce_date>=? GROUP BY announce_date) a LEFT JOIN (SELECT announce_date AS date,COUNT(*) AS events FROM pledge WHERE announce_date>=? GROUP BY announce_date) p ON p.date=a.date ORDER BY a.date DESC").bind(since,since).all(),
       env.DB.prepare("SELECT source,COUNT(*) AS announcements,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate,SUM(CASE WHEN parse_status='parsed' THEN 1 ELSE 0 END) AS parsed FROM announcement GROUP BY source ORDER BY announcements DESC").all(),
@@ -1089,7 +1119,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const hours = Math.min(Math.max(Number(url.searchParams.get("hours")) || 24, 1), 168);
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);
     const since = new Date(Date.now() - hours * 3600000).toISOString();
-    const result = await env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,a.crawl_time AS crawledAt,a.title,a.source,a.pdf_url AS pdfUrl,p.confidence,p.parser_version AS parserVersion FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.crawl_time >= ? ORDER BY a.crawl_time DESC,p.id DESC LIMIT ?").bind(since, limit).all();
+    const result = await env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,a.crawl_time AS crawledAt,a.title,a.source,a.pdf_url AS pdfUrl,p.confidence,p.parser_version AS parserVersion,p.verification_status AS verificationStatus,p.verified_at AS verifiedAt,p.verified_by AS verifiedBy,p.evidence_json AS evidenceJson FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.crawl_time >= ? ORDER BY a.crawl_time DESC,p.id DESC LIMIT ?").bind(since, limit).all();
     return json({ data: result.results, hours, limit, since, generatedAt: new Date().toISOString(), freshness: "official-announcement-crawl" });
   }
   if (url.pathname === "/api/capital-signals" && request.method === "GET") {
@@ -1337,7 +1367,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const q = url.searchParams.get("q"); if (q) { conditions.push("(p.stock_code LIKE ? OR p.stock_name LIKE ? OR p.shareholder LIKE ? OR p.pledgee LIKE ?)"); values.push(...Array(4).fill(`%${q}%`)); }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 100, 1), 500); const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
-    const sql = `SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,p.confidence,p.parser_version AS parserVersion,a.source,a.pdf_url AS pdfUrl,a.md5,a.sha256 FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id ${where} ORDER BY p.announce_date DESC,p.id DESC LIMIT ? OFFSET ?`;
+    const sql = `SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,p.confidence,p.parser_version AS parserVersion,p.verification_status AS verificationStatus,p.verified_at AS verifiedAt,p.verified_by AS verifiedBy,p.evidence_json AS evidenceJson,a.source,a.pdf_url AS pdfUrl,a.md5,a.sha256 FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id ${where} ORDER BY p.announce_date DESC,p.id DESC LIMIT ? OFFSET ?`;
     const [result,count] = await Promise.all([env.DB.prepare(sql).bind(...values,limit,offset).all(),env.DB.prepare(`SELECT COUNT(*) AS total FROM pledge p ${where}`).bind(...values).first<{total:number}>()]);
     return json({ data: result.results, total: count?.total || 0, limit, offset, traceable: true });
   }
@@ -1391,7 +1421,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const id = Number(url.pathname.split("/").pop());
     const body = await request.json<{status?:string;resolution?:string;shareholder?:string;pledgee?:string;amount?:number;amountText?:string;pledgeRatio?:string;totalRatio?:string;type?:string}>();
     if (!id || !["approved","rejected"].includes(body.status || "")) return json({ error: "invalid review update" }, { status: 400 });
-    const before = await env.DB.prepare("SELECT * FROM review_queue WHERE id=?").bind(id).first<{announcement_id:string;status:string}>();
+    const before = await env.DB.prepare("SELECT * FROM review_queue WHERE id=?").bind(id).first<{announcement_id:string;status:string;payload:string}>();
     if (!before) return json({ error: "review not found" }, { status: 404 });
     if (before.status !== "pending") return json({ error: "review already completed" }, { status: 409 });
     const now = new Date().toISOString();
@@ -1402,8 +1432,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     if (body.status === "approved") {
       const announcement = await env.DB.prepare("SELECT stock_code AS stockCode,stock_name AS stockName,announce_date AS announceDate FROM announcement WHERE announcement_id=?").bind(before.announcement_id).first<{stockCode:string;stockName:string;announceDate:string}>();
       if (!announcement || !body.shareholder?.trim() || !body.pledgee?.trim() || !Number(body.amount)) return json({ error: "股东、质权人和质押数量为必填项" }, { status: 400 });
+      const manualRow=validateAndNormalizePledgeRow({shareholder:body.shareholder.trim(),pledgee:body.pledgee.trim(),amount:Number(body.amount),amountText:body.amountText||String(body.amount),pledgeRatio:body.pledgeRatio||"",totalRatio:body.totalRatio||"",startDate:"",endDate:"",purpose:"",type:body.type||"新增质押",missing:[]}) as ParsedPledge;
+      if(manualRow.missing.length)return json({error:`人工审核数据未通过严格校验：${manualRow.missing.join("、")}`},{status:400});
+      const eventFingerprint=await fingerprint(before.announcement_id,manualRow,0);
       statements.push(
-        env.DB.prepare("INSERT OR REPLACE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,type,announce_date,confidence,parser_version,parsed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(before.announcement_id,announcement.stockCode,announcement.stockName,body.shareholder.trim(),body.pledgee.trim(),Number(body.amount),body.amountText || String(body.amount),body.pledgeRatio || null,body.totalRatio || null,body.type || "新增质押",announcement.announceDate,1,"manual-review-v1",now),
+        env.DB.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(before.announcement_id),
+        env.DB.prepare("INSERT INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint,verification_status,verified_at,verified_by,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(before.announcement_id,announcement.stockCode,announcement.stockName,manualRow.shareholder,manualRow.pledgee,manualRow.amount,manualRow.amountText,manualRow.pledgeRatio||null,manualRow.totalRatio||null,manualRow.type,announcement.announceDate,1,"manual-review-v2",now,eventFingerprint,"human_verified",now,viewer,eventEvidence(before.announcement_id,[],manualRow,"human")),
         env.DB.prepare("UPDATE announcement SET parse_status='parsed' WHERE announcement_id=?").bind(before.announcement_id),
       );
     } else {
@@ -1419,12 +1453,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       const account=await env.DB.prepare("SELECT plan,status FROM billing_account WHERE user_id=?").bind(viewer).first<{plan:string;status:string}>();
       if(!account||!entitlementsFor(account.plan,account.status).advancedExport)return json({error:"Excel 与 JSON 导出属于专业版权益",upgrade:"/pricing",requiredEntitlement:"advancedExport"},{status:402});
     }
-    const result = await env.DB.prepare("SELECT announce_date,stock_code,stock_name,shareholder,pledgee,pledge_amount_text,pledge_ratio,total_ratio,type FROM pledge ORDER BY announce_date DESC").all<Record<string, unknown>>();
+    const result = await env.DB.prepare("SELECT announce_date,stock_code,stock_name,shareholder,pledgee,pledge_amount_text,pledge_ratio,total_ratio,type,verification_status FROM pledge ORDER BY announce_date DESC").all<Record<string, unknown>>();
     if (format === "json") return json(result.results, { headers: { "content-disposition": "attachment; filename=pledge-events.json" } });
-    const cols = ["announce_date","stock_code","stock_name","shareholder","pledgee","pledge_amount_text","pledge_ratio","total_ratio","type"];
+    const cols = ["announce_date","stock_code","stock_name","shareholder","pledgee","pledge_amount_text","pledge_ratio","total_ratio","type","verification_status"];
     if (format === "xls") {
       const escapeXml = (value: unknown) => String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
-      const labels = ["公告日期","股票代码","股票名称","股东名称","质权人","质押数量","占其持股","占总股本","事件类型"];
+      const labels = ["公告日期","股票代码","股票名称","股东名称","质权人","质押数量","占其持股","占总股本","事件类型","核验层级"];
       const rowXml = (cells: unknown[]) => `<Row>${cells.map((cell) => `<Cell><Data ss:Type="String">${escapeXml(cell)}</Data></Cell>`).join("")}</Row>`;
       const xml = `<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="股权质押"><Table>${rowXml(labels)}${result.results.map((row) => rowXml(cols.map((col) => row[col]))).join("")}</Table></Worksheet></Workbook>`;
       return new Response(xml,{headers:{"content-type":"application/vnd.ms-excel; charset=utf-8","content-disposition":"attachment; filename=pledge-events.xls"}});

@@ -46,6 +46,10 @@ export const pledges = sqliteTable("pledge", {
   parserVersion: text("parser_version").notNull(),
   parsedAt: text("parsed_at").notNull(),
   eventFingerprint: text("event_fingerprint").notNull(),
+  verificationStatus: text("verification_status").notNull().default("rules_validated"),
+  verifiedAt: text("verified_at"),
+  verifiedBy: text("verified_by"),
+  evidenceJson: text("evidence_json").notNull().default("{}"),
 }, (table) => [uniqueIndex("pledge_event_fingerprint_uq").on(table.eventFingerprint)]);
 
 export const reviewQueue = sqliteTable("review_queue", {

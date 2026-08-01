@@ -85,6 +85,13 @@
       "when": 1785574165871,
       "tag": "0011_burly_shinko_yamashiro",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1785580083733,
+      "tag": "0012_curvy_cardiac",
+      "breakpoints": true
     }
   ]
 }
