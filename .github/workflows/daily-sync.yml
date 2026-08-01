@@ -38,7 +38,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d "{\"date\":\"$sync_date\"}" \
             "$SITE_URL/api/sync"
-          for batch in 1 2 3 4; do
+          for batch in 1 2 3 4 5 6 7 8 9 10; do
             response=$(curl --fail-with-body --retry 3 --retry-all-errors \
               -H "OAI-Sites-Authorization: Bearer $SITES_BYPASS_TOKEN" \
               -H "Content-Type: application/json" \
@@ -48,3 +48,9 @@ jobs:
             processed=$(printf '%s' "$response" | jq -r '.processed // 0')
             if [ "$processed" -eq 0 ]; then break; fi
           done
+          retry_response=$(curl --fail-with-body --retry 3 --retry-all-errors \
+            -H "OAI-Sites-Authorization: Bearer $SITES_BYPASS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"limit":20}' \
+            "$SITE_URL/api/reprocess-reviews")
+          echo "$retry_response"

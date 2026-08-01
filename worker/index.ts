@@ -345,12 +345,19 @@ async function processPendingQueue(db: D1Database, documents: R2Bucket, requeste
 
 async function fetchCninfo(date: string) {
   const all: CninfoAnnouncement[] = [];
-  for (const column of ["szse", "sse"]) {
-    const body = new URLSearchParams({ pageNum: "1", pageSize: "100", column, tabName: "fulltext", plate: "", stock: "", searchkey: "质押", secid: "", category: "", trade: "", seDate: `${date}~${date}`, sortName: "", sortType: "", isHLtitle: "true" });
-    const response = await fetchWithRetry("https://www.cninfo.com.cn/new/hisAnnouncement/query", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded; charset=UTF-8", accept: "application/json, text/plain, */*", referer: "https://www.cninfo.com.cn/new/disclosure", "user-agent": "Mozilla/5.0 (compatible; StockEventDB/1.0; public-disclosure-research)" }, body });
-    if (!response.ok) throw new Error(`巨潮资讯 ${column} 返回 ${response.status}`);
-    const data = await response.json<CninfoResult>();
-    all.push(...(data.announcements || []));
+  const keywords = ["质押", "股份质押", "股票质押", "补充质押", "解除质押"];
+  for (const column of ["szse", "sse", "bjse"]) {
+    for (const searchkey of keywords) {
+      for (let pageNum = 1; pageNum <= 10; pageNum++) {
+        const body = new URLSearchParams({ pageNum: String(pageNum), pageSize: "100", column, tabName: "fulltext", plate: "", stock: "", searchkey, secid: "", category: "", trade: "", seDate: `${date}~${date}`, sortName: "", sortType: "", isHLtitle: "true" });
+        const response = await fetchWithRetry("https://www.cninfo.com.cn/new/hisAnnouncement/query", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded; charset=UTF-8", accept: "application/json, text/plain, */*", referer: "https://www.cninfo.com.cn/new/disclosure", "user-agent": "Mozilla/5.0 (compatible; StockEventDB/1.0; public-disclosure-research)" }, body });
+        if (!response.ok) throw new Error(`巨潮资讯 ${column}/${searchkey} 返回 ${response.status}`);
+        const data = await response.json<CninfoResult>();
+        const rows = data.announcements || [];
+        all.push(...rows);
+        if (rows.length < 100 || rows.length === 0) break;
+      }
+    }
   }
   return [...new Map(all.map((item) => [item.announcementId, item])).values()];
 }

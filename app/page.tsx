@@ -403,7 +403,6 @@ export default function Home() {
   };
 
   const exportData = () => {
-    if (plan === "free" && exportFormat !== "csv") { setShowPlans(true); flash("专业版支持 Excel 与 JSON 导出"); return; }
     window.location.href = `/api/export?format=${exportFormat}`;
     flash(`正在导出 ${exportFormat === "xls" ? "Excel" : exportFormat.toUpperCase()} 文件`);
   };
@@ -465,7 +464,7 @@ export default function Home() {
       <div className="sideBottom"><button className={view === "logs" ? "active" : ""} onClick={() => setView("logs")}><i>≡</i>系统日志</button><div className="system"><span></span><div><b>{state === "online" ? "数据库在线" : state === "loading" ? "正在连接" : "连接异常"}</b><small>D1 · R2 · Worker API</small></div></div></div>
     </aside>
     <section className="content">
-      <header><div className="crumb">{view === "announcements" ? "公告中心 / 官方披露" : "事件中心 / 股权质押"}</div><div className="headerRight"><div className="globalSearch">⌕<input aria-label="全局搜索" placeholder="搜索股票、股东或公告…" value={query} onChange={(e) => setQuery(e.target.value)} /></div><button className="planBadge" onClick={() => setShowPlans(true)}>{plan === "free" ? "免费研究版" : "专业版"}</button><div className="avatar">研</div></div></header>
+      <header><div className="crumb">{view === "announcements" ? "公告中心 / 官方披露" : "事件中心 / 股权质押"}</div><div className="headerRight"><div className="globalSearch">⌕<input aria-label="全局搜索" placeholder="搜索股票、股东或公告…" value={query} onChange={(e) => setQuery(e.target.value)} /></div><span className="dataModeBadge">真实数据内测版</span><div className="avatar">研</div></div></header>
       <div className="page">
         <div className="titleRow"><div><p className="eyebrow">{pageEyebrow} · {state.toUpperCase()}</p><h1>{pageTitle}</h1><p>{pageDescription}</p></div><div className="actions"><button className="secondary" disabled={syncing} onClick={() => void sync()}>{syncing ? "处理中…" : "↻ 同步公告"}</button>{view === "announcements" && <button className="secondary" disabled={syncing} onClick={() => void backfill()}>↶ 回补 7 日</button>}{view === "announcements" && <button className="secondary" disabled={syncing || pendingCount === 0} onClick={() => void processPending()}>⚙ 处理待解析</button>}<div className="exportGroup"><select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value as "xls" | "csv" | "json")}><option value="xls">Excel</option><option value="csv">CSV</option><option value="json">JSON</option></select><button className="primary" onClick={exportData}>⇩ 导出</button></div></div></div>
         <div className="stats"><div><span className="statIcon blue">▥</span><p>已抓取公告</p><strong>{rawCount}</strong><small>官方原始披露</small></div><div><span className="statIcon violet">◇</span><p>结构化质押事件</p><strong>{eventCount}</strong><small>通过完整性校验</small></div><div><span className="statIcon amber">◷</span><p>待解析 / 审核</p><strong>{pendingCount}</strong><small><b className="warn">需处理</b></small></div><div><span className="statIcon green">✓</span><p>当前解析率</p><strong>{parsedRate}</strong><small>事件数 / 公告数</small></div></div>
@@ -477,7 +476,7 @@ export default function Home() {
           <div className="pagination"><span>当前显示 {view === "announcements" ? filteredAnnouncements.length : filteredEvents.length} 条</span></div>
         </section>}
         <footer><span>数据仅供研究参考，不构成投资建议</span><span>公开披露 · 原文可溯 · D1 持久化</span></footer>
-        {view === "dashboard" && <><CoverageOverview coverage={coverage} /><DataQualityPanel announcements={announcements} events={events} reviews={reviews} runs={syncRuns} onProcess={() => void processPending()} onReprocess={() => void reprocessReviews()} onReviews={() => setView("reviews")} /><InvestorWorkflowPanel events={events} announcements={announcements} onExport={exportWorkflowChecklist} /><BackfillPlanPanel /><StockCoveragePanel onProfile={(stock) => void openProfile(stock)} /><WorkspacePanel /></>}
+        {view === "dashboard" && <><CoverageOverview coverage={coverage} /><DataQualityPanel announcements={announcements} events={events} reviews={reviews} runs={syncRuns} onProcess={() => void processPending()} onReprocess={() => void reprocessReviews()} onReviews={() => setView("reviews")} /><InvestorWorkflowPanel events={events} announcements={announcements} onExport={exportWorkflowChecklist} /><BackfillPlanPanel /><StockCoveragePanel onProfile={(stock) => void openProfile(stock)} /></>}
         {(view === "dashboard" || view === "research") && <RiskLeaderboardPanel events={events} onProfile={(stock) => void openProfile(stock)} />}
       </div>
     </section>
