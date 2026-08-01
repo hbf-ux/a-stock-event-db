@@ -92,7 +92,9 @@ async function seed(db: D1Database) {
 type CninfoAnnouncement = { secCode: string; secName: string; announcementId: string; announcementTitle: string; announcementTime: number; adjunctUrl: string };
 type CninfoResult = { announcements?: CninfoAnnouncement[]; totalRecordNum?: number };
 const stripHtml = (value: string) => value.replace(/<[^>]+>/g, "").replaceAll("&amp;", "&").trim();
-const toDate = (timestamp: number) => new Date(timestamp).toISOString().slice(0, 10);
+const shanghaiDate = (offsetDays = 0) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(Date.now() + offsetDays * 86400000));
+const toDate = (timestamp: number) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(timestamp));
+const isTradingDate = (date: string) => { const day = new Date(`${date}T00:00:00Z`).getUTCDay(); return day !== 0 && day !== 6; };
 const hex = (buffer: ArrayBuffer) => [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
 const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve,milliseconds));
 async function fetchWithRetry(input: RequestInfo | URL, init?: RequestInit, attempts = 3) {
@@ -395,7 +397,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ daily:daily.results.reverse(),eventTypes:eventTypes.results,pledgees:pledgees.results,statuses:statuses.results });
   }
   if (url.pathname === "/api/sync" && request.method === "POST") {
-    const input = await request.json<{date?:string}>().catch(() => ({})); const date = input.date && /^\d{4}-\d{2}-\d{2}$/.test(input.date) ? input.date : new Date(Date.now() - 86400000).toISOString().slice(0,10);
+    const input = await request.json<{date?:string}>().catch(() => ({})); const date = input.date && /^\d{4}-\d{2}-\d{2}$/.test(input.date) ? input.date : shanghaiDate(-1);
     const startedAt = new Date().toISOString();
     const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("official-adapters",startedAt,"running","V1 适配器初始化").first<{id:number}>();
     try {
@@ -411,12 +413,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   }
   if (url.pathname === "/api/backfill-plan" && request.method === "POST") {
     const input = await request.json<{start?:string;end?:string}>().catch(() => ({}));
-    const end = input.end || new Date().toISOString().slice(0,10); const start = input.start || new Date(Date.now() - 6 * 86400000).toISOString().slice(0,10);
+    const end = input.end || shanghaiDate(); const start = input.start || shanghaiDate(-6);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || start > end) return json({ error: "invalid-date-range" }, { status: 400 });
     const startDate = new Date(`${start}T00:00:00Z`); const endDate = new Date(`${end}T00:00:00Z`); const days = Math.floor((endDate.getTime() - startDate.getTime()) / 86400000) + 1;
     if (days > 31) return json({ error: "date-range-too-large", maxDays: 31 }, { status: 400 });
     const existing = await env.DB.prepare("SELECT DISTINCT announce_date AS date FROM announcement WHERE announce_date BETWEEN ? AND ?").bind(start,end).all<{date:string}>(); const present = new Set(existing.results.map((row) => row.date)); const dates: string[] = [];
-    for (let index = 0; index < days; index++) { const date = new Date(startDate); date.setUTCDate(startDate.getUTCDate() + index); const key = date.toISOString().slice(0,10); if (!present.has(key)) dates.push(key); }
+    for (let index = 0; index < days; index++) { const date = new Date(startDate); date.setUTCDate(startDate.getUTCDate() + index); const key = date.toISOString().slice(0,10); if (isTradingDate(key) && !present.has(key)) dates.push(key); }
     if (!dates.length) return json({ ok:true,run_id:null,dates:[],found:0,inserted:0,failures:0,message:"没有待回补日期" });
     const startedAt = new Date().toISOString(); const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("historical-backfill-gap",startedAt,"running",`回补缺口 ${dates.length} 日`).first<{id:number}>();
     let found = 0; let inserted = 0; let failures = 0; const results: {date:string;found:number;inserted:number;error?:string}[] = [];
@@ -425,25 +427,25 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ ok:true,run_id:run?.id,dates:results,found,inserted,failures,auto_processing:true });
   }
   if (url.pathname === "/api/backfill-plan" && request.method === "GET") {
-    const end = url.searchParams.get("end") || new Date().toISOString().slice(0,10);
-    const start = url.searchParams.get("start") || new Date(Date.now() - 6 * 86400000).toISOString().slice(0,10);
+    const end = url.searchParams.get("end") || shanghaiDate();
+    const start = url.searchParams.get("start") || shanghaiDate(-6);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || start > end) return json({ error: "invalid-date-range" }, { status: 400 });
     const startDate = new Date(`${start}T00:00:00Z`); const endDate = new Date(`${end}T00:00:00Z`); const days = Math.floor((endDate.getTime() - startDate.getTime()) / 86400000) + 1;
     if (days > 31) return json({ error: "date-range-too-large", maxDays: 31 }, { status: 400 });
     const rows = await env.DB.prepare("SELECT announce_date AS date,COUNT(*) AS announcements FROM announcement WHERE announce_date BETWEEN ? AND ? GROUP BY announce_date ORDER BY announce_date").bind(start,end).all<{date:string;announcements:number}>();
     const present = new Map(rows.results.map((row) => [row.date, row.announcements])); const missingDates: string[] = []; const calendar: {date:string;announcements:number}[] = [];
-    for (let index = 0; index < days; index++) { const date = new Date(startDate); date.setUTCDate(startDate.getUTCDate() + index); const key = date.toISOString().slice(0,10); const count = present.get(key) || 0; calendar.push({ date: key, announcements: count }); if (!count) missingDates.push(key); }
+    for (let index = 0; index < days; index++) { const date = new Date(startDate); date.setUTCDate(startDate.getUTCDate() + index); const key = date.toISOString().slice(0,10); const count = present.get(key) || 0; calendar.push({ date: key, announcements: count }); if (isTradingDate(key) && !count) missingDates.push(key); }
     return json({ start, end, days, calendar, missingDates, scope: "公告日期缺口提示；空白日期可能是周末、节假日或尚未抓取，需回补后确认" });
   }
   if (url.pathname === "/api/backfill" && request.method === "POST") {
     const input = await request.json<{days?:number;endDate?:string}>().catch(() => ({}));
     const days = Math.min(Math.max(Number(input.days) || 7,1),7);
-    const endDate = input.endDate && /^\d{4}-\d{2}-\d{2}$/.test(input.endDate) ? input.endDate : new Date().toISOString().slice(0,10);
+    const endDate = input.endDate && /^\d{4}-\d{2}-\d{2}$/.test(input.endDate) ? input.endDate : shanghaiDate();
     const end = new Date(`${endDate}T00:00:00Z`); const startedAt = new Date().toISOString();
     const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("historical-backfill",startedAt,"running",`回补 ${days} 日公告`).first<{id:number}>();
     let found = 0; let inserted = 0; let failures = 0; const dates: {date:string;found:number;inserted:number;error?:string}[] = [];
     for (let index = days - 1; index >= 0; index--) {
-      const current = new Date(end); current.setUTCDate(end.getUTCDate() - index); const date = current.toISOString().slice(0,10);
+      const current = new Date(end); current.setUTCDate(end.getUTCDate() - index); const date = current.toISOString().slice(0,10); if (!isTradingDate(date)) continue;
       try { const result = await ingestCninfo(env.DB,date); found += result.found; inserted += result.inserted; dates.push({date,...result}); }
       catch (error) { failures++; dates.push({date,found:0,inserted:0,error:error instanceof Error ? error.message : "sync failed"}); }
     }
