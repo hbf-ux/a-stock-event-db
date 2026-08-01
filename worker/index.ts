@@ -444,6 +444,10 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,10,env));
     return json({ok:true,run_id:run?.id,days,end_date:endDate,announcements_found:found,announcements_inserted:inserted,failures,dates,auto_processing:true});
   }
+  if (url.pathname === "/api/stock-coverage" && request.method === "GET") {
+    const result = await env.DB.prepare("SELECT a.stock_code AS stockCode,MAX(a.stock_name) AS stockName,COUNT(*) AS announcements,MIN(a.announce_date) AS firstDate,MAX(a.announce_date) AS latestDate,SUM(CASE WHEN a.parse_status='parsed' THEN 1 ELSE 0 END) AS parsedAnnouncements,COALESCE(p.events,0) AS events,COALESCE(p.firstDate,'') AS eventFirstDate,COALESCE(p.latestDate,'') AS eventLatestDate FROM announcement a LEFT JOIN (SELECT stock_code,COUNT(*) AS events,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate FROM pledge GROUP BY stock_code) p ON p.stock_code=a.stock_code GROUP BY a.stock_code ORDER BY announcements ASC,latestDate DESC LIMIT 200").all();
+    return json({ data: result.results, generatedAt: new Date().toISOString(), scope: "公司级已抓取范围" });
+  }
   if (url.pathname === "/api/coverage" && request.method === "GET") {
     const [announcement, events, stocks, pending, latestRun] = await Promise.all([
       env.DB.prepare("SELECT COUNT(*) AS total,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate,COUNT(DISTINCT stock_code) AS stockCount FROM announcement").first(),
