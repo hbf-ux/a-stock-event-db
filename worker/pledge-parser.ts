@@ -12,6 +12,58 @@ export type SectionPledgeRow = {
   missing: string[];
 };
 
+type ValidatablePledgeRow = {
+  shareholder: string;
+  pledgee: string;
+  amount: number;
+  amountText: string;
+  pledgeRatio?: string;
+  totalRatio?: string;
+  type: string;
+  missing: string[];
+};
+
+const institutionSuffix = /(?:银行股份有限公司(?:[^公司]{0,20}支行)?|证券股份有限公司|信托有限公司|融资租赁有限公司|资产管理有限公司|有限责任公司|有限公司)$/;
+const genericInstitutions = new Set(["有限公司","有限责任公司","股份有限公司","银行股份有限公司","证券股份有限公司","信托有限公司","科技有限公司","投资有限公司"]);
+
+export function normalizePledgeEntity(value: string, kind: "shareholder" | "pledgee") {
+  let normalized = String(value || "").replace(/[\s\u00a0]+/g, "").replace(/^[，。；;：:、]+|[，。；;：:、]+$/g, "");
+  if (kind === "pledgee" && /^日[\u4e00-\u9fff（）()·]{4,}/.test(normalized) && institutionSuffix.test(normalized.slice(1))) normalized = normalized.slice(1);
+  return normalized;
+}
+
+export function validateAndNormalizePledgeRow<T extends ValidatablePledgeRow>(input: T): T {
+  const row = {
+    ...input,
+    shareholder: normalizePledgeEntity(input.shareholder,"shareholder"),
+    pledgee: normalizePledgeEntity(input.pledgee,"pledgee"),
+    amountText: String(input.amountText || "").replace(/[\s\u00a0]+/g," ").trim(),
+    pledgeRatio: String(input.pledgeRatio || "").replace(/[\s\u00a0]+/g,""),
+    totalRatio: String(input.totalRatio || "").replace(/[\s\u00a0]+/g,""),
+  } as T;
+  const invalidShareholder = row.shareholder.length < 2
+    || /^(股东|名称|合计|本次|质押|融资|借款)$/.test(row.shareholder)
+    || /(补充流动资金|融资资金用途|偿还借款|质押用途)/.test(row.shareholder)
+    || /^(?:科技|投资|资产管理|控股)?(?:有限责任|股份)?公司$/.test(row.shareholder);
+  const invalidPledgee = row.pledgee.length < 3
+    || /^(占其|占公司|质押数量|比例|本次|股东|名称|合计|上表|本表|根据)/.test(row.pledgee)
+    || /证券登记结算/.test(row.pledgee)
+    || genericInstitutions.has(row.pledgee)
+    || !institutionSuffix.test(row.pledgee);
+  const compactAmount = row.amountText.replace(/\s+/g,"");
+  const invalidAmountText = !/^(?:\d+(?:\.\d+)?(?:万|亿)?股?|\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:万|亿)?股?)$/.test(compactAmount);
+  const invalidRatio = [row.pledgeRatio,row.totalRatio].some((value) => value && (!/^\d{1,3}(?:\.\d+)?%$/.test(value) || Number(value.slice(0,-1)) > 100 || /^0\d/.test(value)));
+  const invalidType = !["新增质押","补充质押","解除质押","解除后再质押"].includes(row.type);
+  row.missing = [
+    (!row.shareholder || invalidShareholder) && "股东",
+    (!row.pledgee || invalidPledgee) && "质权人",
+    (!row.amount || !Number.isFinite(row.amount) || row.amount <= 0 || invalidAmountText) && "质押数量",
+    invalidRatio && "质押比例",
+    invalidType && "事件类型",
+  ].filter(Boolean) as string[];
+  return row;
+}
+
 const compact = (value: string) => value.replace(/\s+/g, "").trim();
 const amountNumber = (value: string) => {
   const numeric = Number(value.replace(/,/g, "").match(/[\d.]+/)?.[0] || 0);

@@ -1,7 +1,7 @@
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
 import { extractText, getDocumentProxy } from "unpdf";
-import { isRelevantSharePledgeTitle, parseSectionPledgeRows } from "./pledge-parser";
+import { isRelevantSharePledgeTitle, parseSectionPledgeRows, validateAndNormalizePledgeRow } from "./pledge-parser";
 
 interface Env {
   ASSETS: Fetcher;
@@ -87,13 +87,17 @@ async function ensureSchema(db: D1Database) {
       db.prepare("CREATE INDEX pledge_pledgee_idx ON pledge (pledgee)"),
     ]);
   }
-  const invalidEvents = await db.prepare("SELECT DISTINCT announcement_id FROM pledge WHERE pledgee LIKE '占其%' OR pledgee LIKE '占公司%' OR pledgee LIKE '质押数量%' OR pledgee LIKE '上表%' OR pledgee LIKE '本表%' OR pledgee LIKE '%证券登记结算%' OR pledgee LIKE '%有限公司补充%' OR shareholder IN ('借款','质押','补充质押','偿还借款') OR (parser_version LIKE 'unpdf-table-rules%' AND (shareholder LIKE '%质押%' OR shareholder LIKE '%融资%'))").all<{announcement_id:string}>();
-  if (invalidEvents.results.length) {
-    const ids = invalidEvents.results.map((row) => row.announcement_id);
+  await db.batch([
+    db.prepare("UPDATE pledge SET shareholder=REPLACE(REPLACE(shareholder,' ',''),'　',''),pledgee=REPLACE(REPLACE(pledgee,' ',''),'　','') WHERE shareholder LIKE '% %' OR shareholder LIKE '%　%' OR pledgee LIKE '% %' OR pledgee LIKE '%　%'"),
+    db.prepare("UPDATE pledge SET pledgee=SUBSTR(pledgee,2) WHERE pledgee LIKE '日%' AND (pledgee LIKE '%有限公司' OR pledgee LIKE '%支行')"),
+  ]);
+  const existingEvents = await db.prepare("SELECT announcement_id,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,type FROM pledge").all<{announcement_id:string;shareholder:string;pledgee:string;pledge_amount:number;pledge_amount_text:string;pledge_ratio:string;total_ratio:string;type:string}>();
+  const ids = [...new Set(existingEvents.results.filter((event) => validateAndNormalizePledgeRow({shareholder:event.shareholder,pledgee:event.pledgee,amount:Number(event.pledge_amount),amountText:event.pledge_amount_text,pledgeRatio:event.pledge_ratio || "",totalRatio:event.total_ratio || "",type:event.type,missing:[]}).missing.length).map((event) => event.announcement_id))];
+  if (ids.length) {
     for (const id of ids) await db.batch([
       db.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(id),
-      db.prepare("UPDATE announcement SET parse_status='review',last_error='entity validation rejected parser output' WHERE announcement_id=?").bind(id),
-      db.prepare("UPDATE review_queue SET status='pending',reviewed_at=NULL,reviewer=NULL,reason='实体校验未通过：质权人疑似表头文本' WHERE announcement_id=?").bind(id),
+      db.prepare("UPDATE announcement SET parse_status='review',last_error='strict data quality validation rejected parser output' WHERE announcement_id=?").bind(id),
+      db.prepare("UPDATE review_queue SET status='pending',reviewed_at=NULL,reviewer=NULL,reason='严格数据校验未通过：实体、数量或比例需要复核' WHERE announcement_id=?").bind(id),
     ]);
   }
   const excludedTitleWhere = "title LIKE '%债券%质押式回购%' OR title LIKE '%质押式回购%债券%' OR title LIKE '%抵质押担保%' OR title LIKE '%知识产权质押%' OR title LIKE '%应收账款质押%' OR title LIKE '%拟签署%质押合同%'";
@@ -286,13 +290,7 @@ function normalizeVisionRows(value: unknown, title: string): ParsedPledge[] {
   });
 }
 
-const validateParsedRows = (rows: ParsedPledge[]) => rows.map((row) => {
-  const invalidShareholder = row.shareholder.length < 2 || /^(股东|名称|合计|本次|质押|融资|借款)$/.test(row.shareholder);
-  const invalidPledgee = row.pledgee.length < 3 || /^(占其|占公司|质押数量|比例|本次|股东|名称|合计|上表|本表|根据)/.test(row.pledgee) || /证券登记结算/.test(row.pledgee);
-  const invalidType = !["新增质押","补充质押","解除质押","解除后再质押"].includes(row.type);
-  const missing = [(!row.shareholder || invalidShareholder) && "股东", (!row.pledgee || invalidPledgee) && "质权人", (!row.amount || !Number.isFinite(row.amount) || row.amount <= 0) && "质押数量", invalidType && "事件类型"].filter(Boolean);
-  return {...row,missing} as ParsedPledge;
-});
+const validateParsedRows = (rows: ParsedPledge[]) => rows.map((row) => validateAndNormalizePledgeRow(row));
 
 type OpenAIParseResult = { rows: ParsedPledge[]; model: string; responseId: string; usage: unknown };
 

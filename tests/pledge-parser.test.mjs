@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isRelevantSharePledgeTitle, parseSectionPledgeRows } from "../worker/pledge-parser.ts";
+import { isRelevantSharePledgeTitle, parseSectionPledgeRows, validateAndNormalizePledgeRow } from "../worker/pledge-parser.ts";
 
 test("parses wrapped pledge tables and multiple rows", () => {
   const text = `一、本次股份质押情况
@@ -40,4 +40,19 @@ test("rejects non-shareholder pledge announcements", () => {
   assert.equal(isRelevantSharePledgeTitle("关于使用闲置资金购买债券通用质押式回购的公告"),false);
   assert.equal(isRelevantSharePledgeTitle("关于向银行申请融资提供抵质押担保的公告"),false);
   assert.equal(isRelevantSharePledgeTitle("关于拟签署证券质押合同暨关联交易的公告"),false);
+});
+
+test("normalizes safe OCR residue and rejects generic or contaminated entities", () => {
+  const clean = validateAndNormalizePledgeRow({shareholder:"兰州银行股 份有限公司",pledgee:"日广州凯得融资租赁有限公司",amount:10000000,amountText:"10,000,000 股",pledgeRatio:"5.19%",totalRatio:"1.20%",type:"新增质押",missing:[]});
+  assert.equal(clean.shareholder,"兰州银行股份有限公司");
+  assert.equal(clean.pledgee,"广州凯得融资租赁有限公司");
+  assert.deepEqual(clean.missing,[]);
+
+  const generic = validateAndNormalizePledgeRow({shareholder:"补充流动资金东大针织",pledgee:"信托有限公司",amount:1000,amountText:"1,000 股",pledgeRatio:"00%",totalRatio:"",type:"新增质押",missing:[]});
+  assert.deepEqual(generic.missing,["股东","质权人","质押比例"]);
+});
+
+test("rejects malformed grouped share amounts", () => {
+  const row = validateAndNormalizePledgeRow({shareholder:"张三",pledgee:"天津滨海正信资产管理有限公司",amount:10000,amountText:"1,000,0 股",pledgeRatio:"1.00%",totalRatio:"0.10%",type:"新增质押",missing:[]});
+  assert.deepEqual(row.missing,["质押数量"]);
 });
