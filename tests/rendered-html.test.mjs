@@ -39,6 +39,8 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /https:\/\/api\.openai\.com\/v1\/responses/);
   assert.match(worker, /rules-then-openai/);
   assert.match(worker, /maxAutomaticAttempts: 2/);
+  assert.match(worker, /parseSectionPledgeRows/);
+  assert.match(worker, /openai_quota_blocked_until/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
   assert.match(layout, /A股质押风险监测/);
 });

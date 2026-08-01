@@ -1,6 +1,7 @@
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
 import { extractText, getDocumentProxy } from "unpdf";
+import { isRelevantSharePledgeTitle, parseSectionPledgeRows } from "./pledge-parser";
 
 interface Env {
   ASSETS: Fetcher;
@@ -66,6 +67,13 @@ async function ensureSchema(db: D1Database) {
       db.prepare("UPDATE review_queue SET status='pending',reviewed_at=NULL,reviewer=NULL,reason='实体校验未通过：质权人疑似表头文本' WHERE announcement_id=?").bind(id),
     ]);
   }
+  const excludedTitleWhere = "title LIKE '%债券%质押式回购%' OR title LIKE '%质押式回购%债券%' OR title LIKE '%抵质押担保%' OR title LIKE '%知识产权质押%' OR title LIKE '%应收账款质押%' OR title LIKE '%拟签署%质押合同%'";
+  const ignoredAt = new Date().toISOString();
+  await db.batch([
+    db.prepare(`DELETE FROM pledge WHERE announcement_id IN (SELECT announcement_id FROM announcement WHERE ${excludedTitleWhere})`),
+    db.prepare(`UPDATE review_queue SET status='rejected',reason='非股东股份质押事件，已由标题语义过滤',reviewed_at=?,reviewer='worker',resolution='excluded-non-share-pledge' WHERE status='pending' AND announcement_id IN (SELECT announcement_id FROM announcement WHERE ${excludedTitleWhere})`).bind(ignoredAt),
+    db.prepare(`UPDATE announcement SET parse_status='ignored',last_error='excluded non-share pledge announcement' WHERE ${excludedTitleWhere}`),
+  ]);
 }
 
 const demo = [
@@ -174,6 +182,8 @@ function parseFlattenedTableRows(text: string, title: string): ParsedPledge[] {
 }
 
 function parsePledgeRows(text: string, title: string): ParsedPledge[] {
+  const sectionRows = parseSectionPledgeRows(text,title) as ParsedPledge[];
+  if (sectionRows.length) return sectionRows;
   const fallback = parsePledgeText(text, title);
   const flattenedRows = parseFlattenedTableRows(text,title);
   if (flattenedRows.some((row) => !row.missing.length)) return flattenedRows;
@@ -331,11 +341,15 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   const pdf = await getDocumentProxy(new Uint8Array(bytes.slice(0))); const extracted = await extractText(pdf,{mergePages:true});
   const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
-  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.2"; let confidence = rows.length > 1 ? 0.88 : 0.82;
+  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.3"; let confidence = rows.length > 1 ? 0.9 : 0.86;
   const localIncomplete = !rows.length || rows.some((row) => row.missing.length > 0);
   let openaiMeta: {model:string;responseId:string;usage:unknown} | null = null;
   let openaiError = "";
-  const openaiAllowed = Boolean(env?.OPENAI_API_KEY) && ((item.parseAttempts || 0) < 2 || options.forceOpenAI === true);
+  const quotaState = localIncomplete && env?.OPENAI_API_KEY && options.forceOpenAI !== true
+    ? await db.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>()
+    : null;
+  const quotaBlocked = Boolean(quotaState?.value && Date.parse(quotaState.value) > Date.now());
+  const openaiAllowed = Boolean(env?.OPENAI_API_KEY) && !quotaBlocked && ((item.parseAttempts || 0) < 2 || options.forceOpenAI === true);
   let openaiAttempted = false;
   if (localIncomplete && openaiAllowed && env) {
     openaiAttempted = true;
@@ -349,6 +363,10 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
       }
     } catch (error) {
       openaiError = error instanceof Error ? error.message : "OpenAI review failed";
+      if (/credit_balance_exhausted|insufficient_quota|no credits remaining/i.test(openaiError)) {
+        const blockedUntil = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        await db.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('openai_quota_blocked_until',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(blockedUntil,new Date().toISOString()).run();
+      }
     }
   }
   const completeRows = rows.filter((row) => !row.missing.length); const parsed = rows[0]; const now = new Date().toISOString();
@@ -356,15 +374,23 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
     const missing = parsed?.missing || ["股东","质权人","质押数量"];
     const reviewReason = openaiAttempted
       ? `OpenAI 自动复核后仍缺少字段：${missing.join("、")}${openaiError ? `；${openaiError.slice(0,180)}` : ""}`
-      : env?.OPENAI_API_KEY
+      : quotaBlocked
+        ? `OpenAI 额度暂不可用，已暂停自动调用；仍缺少字段：${missing.join("、")}`
+        : env?.OPENAI_API_KEY
         ? `自动复核已达到重试上限；仍缺少字段：${missing.join("、")}，请人工审核`
         : `本地规则解析缺少字段：${missing.join("、")}；OpenAI 未配置，请人工审核`;
-    await db.batch([
+    const reviewStatements: D1PreparedStatement[] = [];
+    for (let index = 0; index < completeRows.length; index++) {
+      const row = completeRows[index]; const eventFingerprint = await fingerprint(id,row,index);
+      reviewStatements.push(db.prepare("INSERT OR IGNORE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id,item.stockCode,item.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,item.announceDate,confidence,parserVersion,now,eventFingerprint));
+    }
+    reviewStatements.push(
       db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review',last_error=?,parse_attempts=parse_attempts+? WHERE announcement_id=?").bind(r2Key,sha256,openaiError || null,openaiAttempted ? 1 : 0,id),
       db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(reviewReason,JSON.stringify({...parsed,candidates:rows,textKey:`announcements/${id}.txt`,openaiConfigured:Boolean(env?.OPENAI_API_KEY),openaiAttempted,openaiMeta,openaiError:openaiError || null}),id),
-      db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"parse_review",JSON.stringify({missing,parserVersion,openaiConfigured:Boolean(env?.OPENAI_API_KEY),openaiAttempted,openaiMeta,openaiError:openaiError || null}),openaiMeta ? "openai" : "worker",now),
-    ]);
-    return {id,status:"review",missing,openai_attempted:openaiAttempted,openai_error:openaiError || undefined};
+      db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"parse_review",JSON.stringify({missing,confirmedEvents:completeRows.length,parserVersion,openaiConfigured:Boolean(env?.OPENAI_API_KEY),openaiAttempted,openaiMeta,openaiError:openaiError || null}),openaiMeta ? "openai" : "worker",now),
+    );
+    await db.batch(reviewStatements);
+    return {id,status:"review",missing,events_created:completeRows.length,openai_attempted:openaiAttempted,openai_error:openaiError || undefined};
   }
   const statements: D1PreparedStatement[] = [];
   for (let index = 0; index < completeRows.length; index++) {
@@ -387,7 +413,7 @@ async function processPendingQueue(db: D1Database, documents: R2Bucket, requeste
   const pending = await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
   const results: unknown[] = []; let parsed = 0; let failures = 0;
   for (const row of pending.results) {
-    try { const result = await processAnnouncement(db,documents,row.id,env); results.push(result); if (result.status === "parsed") parsed += result.event_count || 1; }
+    try { const result = await processAnnouncement(db,documents,row.id,env); results.push(result); parsed += result.event_count || result.events_created || 0; }
     catch (error) {
       failures++; const message = error instanceof Error ? error.message : "parse failed";
       await db.prepare("UPDATE announcement SET parse_attempts=parse_attempts+1,last_error=? WHERE announcement_id=?").bind(message,row.id).run();
@@ -425,7 +451,7 @@ async function fetchCninfo(date: string) {
 }
 
 async function ingestCninfo(db: D1Database, date: string) {
-  const announcements = await fetchCninfo(date); const now = new Date().toISOString(); let inserted = 0;
+  const fetched = await fetchCninfo(date); const announcements = fetched.filter((item) => isRelevantSharePledgeTitle(stripHtml(item.announcementTitle))); const now = new Date().toISOString(); let inserted = 0;
   for (const item of announcements) {
     const title = stripHtml(item.announcementTitle); const pdfUrl = `https://static.cninfo.com.cn/${item.adjunctUrl}`;
     const existing = await db.prepare("SELECT announcement_id FROM announcement WHERE announcement_id=?").bind(item.announcementId).first();
@@ -444,8 +470,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   await ensureSchema(env.DB);
   const url = new URL(request.url);
   if (url.pathname === "/api/health") {
-    const stats = await env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews").first();
-    return json({ status: "ok", storage: { d1: true, r2: true }, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, maxAutomaticAttempts: 2 }, stats, timestamp: new Date().toISOString() });
+    const [stats,quotaState] = await Promise.all([
+      env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews, (SELECT COUNT(*) FROM announcement WHERE parse_status='ignored') ignored_announcements").first(),
+      env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
+    ]);
+    const quotaBlocked = Boolean(quotaState?.value && Date.parse(quotaState.value) > Date.now());
+    return json({ status: "ok", storage: { d1: true, r2: true }, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
