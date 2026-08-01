@@ -464,6 +464,8 @@ export default function Home() {
       <div className="brand"><div className="brandMark">质</div><div><strong>质押雷达</strong><span>A股股东融资风险情报</span></div></div>
       <nav><p className="navLabel">工作台</p>
         <button className={view === "dashboard" ? "active" : ""} onClick={() => setView("dashboard")}><i>●</i>即时情报</button>
+        <button onClick={() => { window.location.href = "/brief"; }}><i>▦</i>每日简报</button>
+        <button onClick={() => { window.location.href = "/capital"; }}><i>◆</i>资方机会</button>
         <button className={view === "watchlist" ? "active" : ""} onClick={() => setView("watchlist")}><i>★</i>我的关注<em>{watchlist.length}</em></button>
         <button className={view === "alerts" ? "active" : ""} onClick={() => setView("alerts")}><i>●</i>提醒中心<em>{feedEvents.filter((row) => watchlist.includes(row.code)).length}</em></button>
         <button className={view === "research" ? "active" : ""} onClick={() => setView("research")}><i>⌁</i>风险研究</button>

@@ -595,6 +595,50 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const result = await env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,a.crawl_time AS crawledAt,a.title,a.source,a.pdf_url AS pdfUrl,p.confidence,p.parser_version AS parserVersion FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.crawl_time >= ? ORDER BY a.crawl_time DESC,p.id DESC LIMIT ?").bind(since, limit).all();
     return json({ data: result.results, hours, limit, since, generatedAt: new Date().toISOString(), freshness: "official-announcement-crawl" });
   }
+  if (url.pathname === "/api/capital-signals" && request.method === "GET") {
+    type CapitalEvent = { id:number;announcementId:string;code:string;name:string;shareholder:string;pledgee:string;amount:number;amountText:string;ratio:string;total:string;type:string;date:string;pdfUrl:string;source:string };
+    const days = Math.min(Math.max(Number(url.searchParams.get("days")) || 365, 30), 3650);
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 100, 10), 300);
+    const since = addDays(shanghaiDate(), -days);
+    const result = await env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount AS amount,p.pledge_amount_text AS amountText,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,a.pdf_url AS pdfUrl,a.source FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE p.announce_date>=? ORDER BY p.announce_date DESC,p.id DESC LIMIT 5000").bind(since).all<CapitalEvent>();
+    const rows = result.results;
+    const pct = (value:string) => Number(String(value || "").replace(/[^0-9.]/g,"")) || 0;
+    const actorMap = new Map<string,{code:string;name:string;shareholder:string;events:CapitalEvent[]}>();
+    const relationMap = new Map<string,{shareholder:string;pledgee:string;events:CapitalEvent[];companies:Set<string>}>();
+    for (const row of rows) {
+      const actorKey = `${row.code}\u0000${row.shareholder}`;
+      const actor = actorMap.get(actorKey) || { code:row.code,name:row.name,shareholder:row.shareholder,events:[] };
+      actor.events.push(row); actorMap.set(actorKey,actor);
+      const relationKey = `${row.shareholder}\u0000${row.pledgee}`;
+      const relation = relationMap.get(relationKey) || { shareholder:row.shareholder,pledgee:row.pledgee,events:[],companies:new Set<string>() };
+      relation.events.push(row); relation.companies.add(row.code); relationMap.set(relationKey,relation);
+    }
+    const recent30Cutoff = addDays(shanghaiDate(),-30);
+    const actors = [...actorMap.values()].map((actor) => {
+      const pledgeEvents = actor.events.filter((row) => !row.type.includes("解除"));
+      const releases = actor.events.filter((row) => row.type.includes("解除")).length;
+      const supplemental = actor.events.filter((row) => row.type.includes("补充")).length;
+      const recent30 = actor.events.filter((row) => row.date >= recent30Cutoff).length;
+      const highRatio = actor.events.filter((row) => Math.max(pct(row.ratio),pct(row.total)) >= 50).length;
+      const pledgeeCounts = new Map<string,number>();
+      for (const row of pledgeEvents) pledgeeCounts.set(row.pledgee,(pledgeeCounts.get(row.pledgee) || 0) + 1);
+      const rankedPledgees = [...pledgeeCounts.entries()].sort((a,b) => b[1]-a[1]);
+      const topPledgee = rankedPledgees[0]?.[0] || "—";
+      const topPledgeeEvents = rankedPledgees[0]?.[1] || 0;
+      const concentration = pledgeEvents.length ? Math.round(topPledgeeEvents / pledgeEvents.length * 100) : 0;
+      const eventGap = Math.max(0,pledgeEvents.length-releases);
+      const activityScore = Math.min(100,supplemental*20+recent30*6+eventGap*3+highRatio*8+(topPledgeeEvents>=3?10:0));
+      const signals:string[] = [];
+      if (supplemental) signals.push(`补充质押 ${supplemental} 次`);
+      if (recent30 >= 2) signals.push(`近30日发生 ${recent30} 次`);
+      if (eventGap >= 2) signals.push(`质押事件较解除事件多 ${eventGap} 条`);
+      if (topPledgeeEvents >= 3) signals.push(`同一质权人重复出现 ${topPledgeeEvents} 次`);
+      if (highRatio) signals.push(`高比例披露 ${highRatio} 条`);
+      return { ...actor,events:actor.events.length,pledgeEvents:pledgeEvents.length,releases,supplemental,recent30,highRatio,eventGap,pledgeeCount:pledgeeCounts.size,topPledgee,topPledgeeEvents,concentration,totalAmount:pledgeEvents.reduce((sum,row)=>sum+(Number(row.amount)||0),0),latestDate:actor.events[0]?.date,firstDate:actor.events[actor.events.length-1]?.date,activityScore,level:activityScore>=60?"优先跟进":activityScore>=30?"持续观察":"常规",signals,evidence:actor.events.slice(0,5).map((row)=>({id:row.id,announcementId:row.announcementId,date:row.date,type:row.type,pdfUrl:row.pdfUrl})) };
+    }).sort((a,b) => b.activityScore-a.activityScore || b.recent30-a.recent30).slice(0,limit);
+    const relationships = [...relationMap.values()].map((relation) => ({ shareholder:relation.shareholder,pledgee:relation.pledgee,events:relation.events.length,companies:relation.companies.size,latestDate:relation.events[0]?.date,totalAmount:relation.events.filter((row)=>!row.type.includes("解除")).reduce((sum,row)=>sum+(Number(row.amount)||0),0),supplemental:relation.events.filter((row)=>row.type.includes("补充")).length,releases:relation.events.filter((row)=>row.type.includes("解除")).length,companyCodes:[...relation.companies] })).sort((a,b)=>b.events-a.events || b.totalAmount-a.totalAmount).slice(0,limit);
+    return json({ data:{ actors,relationships },coverage:{ since,firstDate:rows[rows.length-1]?.date || null,latestDate:rows[0]?.date || null,events:rows.length },generatedAt:new Date().toISOString(),methodology:{ activityScore:"补充质押、近30日活跃度、质押与解除事件差、高比例披露及重复质权人信号的规则评分",eventGap:"质押类事件数量减解除类事件数量；不是当前存量质押股数",limitations:"仅基于已抓取并通过校验的官方公告，不代表全市场全历史完整度或授信结论" } });
+  }
   if (url.pathname === "/api/profile" && request.method === "GET") {
     const stock = (url.searchParams.get("stock") || "").trim();
     if (!stock) return json({ error: "stock is required" }, { status: 400 });

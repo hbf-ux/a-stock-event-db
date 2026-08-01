@@ -46,7 +46,7 @@ export default function IntelligenceDetail({ kind, entityKey }: { kind: Kind; en
   };
 
   return <main className="publicIntelPage">
-    <header className="publicHeader"><a className="publicBrand" href="/"><span>质</span><b>质押雷达<small>A股股东融资风险情报</small></b></a><nav><a href="/">即时情报</a><a href="/#events">质押事件</a><button onClick={() => setShowReport(true)}>获取完整报告</button></nav></header>
+    <header className="publicHeader"><a className="publicBrand" href="/"><span>质</span><b>质押雷达<small>A股股东融资风险情报</small></b></a><nav><a href="/">即时情报</a><a href="/brief">每日简报</a><a href="/capital">资方机会</a><button onClick={() => setShowReport(true)}>获取完整报告</button></nav></header>
     <div className="publicWrap">
       <div className="publicBreadcrumb"><a href="/">首页</a><span>/</span><span>{kindLabel[kind]}</span><span>/</span><b>{title}</b></div>
       <section className="entityHero"><div><p className="eyebrow">VERIFIABLE PLEDGE INTELLIGENCE</p><div className="entityTitle"><h1>{title}</h1><span>{kindLabel[kind]}</span></div><p>基于官方公开披露整理。每条事件均保留公告来源、原文链接和解析审计信息。</p><div className="entityMeta"><span><i></i>数据已核验</span><span>最新披露 {latest}</span><span>历史覆盖 {first} 至 {latest}</span></div></div><div className={`publicScore ${riskScore >= 65 ? "high" : riskScore >= 35 ? "watch" : "normal"}`}><small>风险筛选评分</small><strong>{riskScore}</strong><b>{riskLabel}</b><em>用于尽调排序，不代表信用结论</em></div></section>
