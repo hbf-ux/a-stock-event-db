@@ -386,7 +386,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
     }
     reviewStatements.push(
       db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review',last_error=?,parse_attempts=parse_attempts+? WHERE announcement_id=?").bind(r2Key,sha256,openaiError || null,openaiAttempted ? 1 : 0,id),
-      db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(reviewReason,JSON.stringify({...parsed,candidates:rows,textKey:`announcements/${id}.txt`,openaiConfigured:Boolean(env?.OPENAI_API_KEY),openaiAttempted,openaiMeta,openaiError:openaiError || null}),id),
+      db.prepare("UPDATE review_queue SET reason=?,payload=?,reviewed_at=?,reviewer=? WHERE announcement_id=? AND status='pending'").bind(reviewReason,JSON.stringify({...parsed,candidates:rows,textKey:`announcements/${id}.txt`,openaiConfigured:Boolean(env?.OPENAI_API_KEY),openaiAttempted,openaiMeta,openaiError:openaiError || null}),now,openaiMeta ? "openai" : "worker",id),
       db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"parse_review",JSON.stringify({missing,confirmedEvents:completeRows.length,parserVersion,openaiConfigured:Boolean(env?.OPENAI_API_KEY),openaiAttempted,openaiMeta,openaiError:openaiError || null}),openaiMeta ? "openai" : "worker",now),
     );
     await db.batch(reviewStatements);
@@ -680,7 +680,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (url.pathname === "/api/reprocess-reviews" && request.method === "POST") {
     const input = await request.json<{limit?:number;force?:boolean}>().catch(() => ({}));
     const limit = Math.min(Math.max(Number(input.limit) || 3,1),5);
-    const pending = await env.DB.prepare("SELECT DISTINCT announcement_id AS id FROM review_queue WHERE status='pending' ORDER BY created_at ASC LIMIT ?").bind(limit).all<{id:string}>();
+    const pending = await env.DB.prepare("SELECT announcement_id AS id FROM review_queue WHERE status='pending' ORDER BY CASE WHEN reviewed_at IS NULL THEN 0 ELSE 1 END,COALESCE(reviewed_at,created_at) ASC LIMIT ?").bind(limit).all<{id:string}>();
     const results: unknown[] = [];
     for (const row of pending.results) {
       try { results.push(await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env,{forceOpenAI:input.force === true})); }
