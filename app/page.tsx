@@ -89,6 +89,12 @@ function RiskSummaryPanel({ history, profiles }: { history: ProfileData["history
   return <section className="riskSummaryPanel"><div className="riskSummaryHead"><div><p className="eyebrow">CREDIT RESEARCH SIGNALS</p><h3>授信风险摘要</h3></div><span className={`tag ${score >= 65 ? "new" : score >= 35 ? "extra" : "release"}`}>{scoreLabel}</span></div><div className="scoreCard"><strong>{score}</strong><span>/ 100</span><b>{scoreLabel}</b><small>基于已解析行为与资料完整度</small></div><div className="riskSummaryGrid">{signals.map(([label, value, note]) => <div key={label}><span>{label}</span><b className={label === "补充质押" && supplemental ? "riskValue" : label === "高比例信号" && highRatio ? "warnValue" : ""}>{value}</b><small>{note}</small></div>)}</div><p className="researchDisclaimer">评分用于尽调排序，不等同于违约、信用或授信结论；存量质押仍需结合持股基数、解除记录和最新披露逐笔核对。</p></section>;
 }
 
+function CoveragePanel({ history }: { history: ProfileData["history"] }) {
+  const dates = history.map((row) => row.date).filter(Boolean).sort();
+  const truncated = history.length >= 100;
+  return <div className="coveragePanel"><b>历史覆盖范围</b><span>{dates.length ? `${dates[0]} 至 ${dates[dates.length - 1]}` : "暂无已解析历史"}</span><small>{truncated ? "当前展示最近 100 条，可能仍有更早记录未加载" : "当前公司画像未达到 100 条展示上限"}</small></div>;
+}
+
 function ControlRiskPanel() {
   const rows = [
     ["控股股东 / 实控人", "待补充", "需要股东基础资料或最新年报确认"],
@@ -399,6 +405,7 @@ export default function Home() {
     {showPlans && <div className="overlay" onClick={() => setShowPlans(false)}><aside className="drawer plansDrawer" onClick={(event) => event.stopPropagation()}><button className="close" onClick={() => setShowPlans(false)}>×</button><p className="eyebrow">RESEARCH PLANS</p><h2>情报工作台</h2><p className="planIntro">免费查看官方公告与结构化事件；专业版面向研究团队提供更高效的筛选与导出。</p><div className="pricingGrid"><div className="priceCard"><span>免费研究版</span><strong>¥0</strong><small>公告浏览 · CSV 导出 · 原文追溯</small><button className="secondary" onClick={() => setShowPlans(false)}>当前方案</button></div><div className="priceCard featured"><span>专业版</span><strong>¥99<small>/月</small></strong><small>Excel/JSON 导出 · 高级筛选 · 历史数据与团队席位</small><input className="interestInput" aria-label="联系邮箱" placeholder="留下邮箱，预约专业版" value={interestEmail} onChange={(event) => setInterestEmail(event.target.value)} /><button className="primary" disabled={!interestEmail.trim()} onClick={() => void submitInterest()}>预约开通</button></div></div><p className="planNote">当前为产品内测阶段，不会产生任何扣费。</p></aside></div>}
     {notice && <div className="toast">✓ {notice}</div>}
     {(view === "dashboard" || view === "research") && <RiskLeaderboardPanel events={events} onProfile={(stock) => void openProfile(stock)} />}
+    {profile && <CoveragePanel history={profile.history} />}
     {profile && <RiskSummaryPanel history={profile.history} profiles={shareholderProfiles} />}
     {profile && <ShareholderProfilePanel stock={profile.stock} profiles={shareholderProfiles} onSaved={(saved) => setShareholderProfiles((current) => [saved, ...current.filter((row) => row.shareholder !== saved.shareholder)])} />}
     {profile && <ControlRiskPanel />}
