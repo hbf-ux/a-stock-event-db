@@ -66,3 +66,41 @@ test("rejects likely lost units and removes table-tail prefixes", () => {
   assert.equal(validateAndNormalizePledgeRow({...institution,shareholder:"申请人等盛屯汇泽"}).shareholder,"盛屯汇泽");
   assert.deepEqual(institution.missing,[]);
 });
+
+test("infers 万股 from a table header and accepts common capital providers", () => {
+  const text=`一、本次股份质押情况
+股东名称 是否为控股股东 本次质押数量（万股） 是否为限售股 是否补充质押 质押起始日 质押到期日 质权人 占其所持股份比例 占公司总股本比例
+华远控股 是 380.50 否 否 2026年7月31日 2027年7月30日 国新证券有限公司 12.50 2.15`;
+  const rows=parseSectionPledgeRows(text,"关于控股股东部分股份质押的公告");
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].amount,3805000);
+  assert.equal(rows[0].amountText,"380.50万 股");
+  assert.deepEqual(validateAndNormalizePledgeRow(rows[0]).missing,[]);
+});
+
+test("parses multiple release rows with header units", () => {
+  const text=`一、本次股份解除质押情况
+股东名称 本次解除质押股份（万股） 占其所持股份比例 占公司总股本比例 解除质押日期 质权人
+王海山 120.00 6.20% 1.10% 2026年7月30日 中信证券股份有限公司
+李明远 80.50 4.10% 0.72% 2026年7月31日 北京银行股份有限公司上海分行
+合计 200.50`;
+  const rows=parseSectionPledgeRows(text,"关于股东部分股份解除质押的公告");
+  assert.equal(rows.length,2);
+  assert.deepEqual(rows.map((row)=>[row.shareholder,row.amount,row.pledgee,row.type]),[
+    ["王海山",1200000,"中信证券股份有限公司","解除质押"],
+    ["李明远",805000,"北京银行股份有限公司上海分行","解除质押"],
+  ]);
+});
+
+test("marks a new pledge in a release-and-repledge announcement", () => {
+  const text=`一、本次股份质押情况
+股东名称 是否为控股股东 本次质押股数（股） 是否为限售股 是否补充质押 质押起始日 质押到期日 质权人 占其所持股份比例 占公司总股本比例
+赵文华 是 5,000,000 否 否 2026年7月31日 2027年7月31日 国民信托有限公司 10.00% 2.00%`;
+  const rows=parseSectionPledgeRows(text,"关于控股股东股份解除质押及再质押的公告");
+  assert.equal(rows[0].type,"解除后再质押");
+});
+
+test("accepts limited-partnership pledgees", () => {
+  const row=validateAndNormalizePledgeRow({shareholder:"通运投资",pledgee:"烟台华周投资中心（有限合伙）",amount:2000000,amountText:"2,000,000 股",pledgeRatio:"0.95%",totalRatio:"0.28%",type:"补充质押",missing:[]});
+  assert.deepEqual(row.missing,[]);
+});

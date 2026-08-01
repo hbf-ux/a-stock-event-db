@@ -79,6 +79,7 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /rules-then-openai/);
   assert.match(worker, /maxAutomaticAttempts: 2/);
   assert.match(worker, /parseSectionPledgeRows/);
+  assert.match(worker, /unpdf-table-rules-v2\.4/);
   assert.match(worker, /const nextCursor=failures\?cursor:dates\[dates\.length-1\]/);
   assert.match(worker, /successfulQueries/);
   assert.match(worker, /sourceWarnings/);
@@ -91,6 +92,8 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /backfillAnnouncementEvidence/);
   assert.match(worker, /evidence_backfill_attempt/);
   assert.match(worker, /runHistoricalBackfillBatch/);
+  assert.match(worker, /runParserUpgradeRetry/);
+  assert.match(worker, /parser_upgrade_v2_4_attempt/);
   assert.match(worker, /maybeStartAutomaticMaintenance/);
   assert.match(worker, /\/api\/maintenance/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
@@ -149,7 +152,8 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(detail, /verificationStatus/);
   assert.match(quality, /VERIFICATION LADDER/);
   assert.match(quality, /AUTOMATIC DATA MAINTENANCE/);
-  assert.match(quality, /证据回填只更新页码与字段定位/);
+  assert.match(quality, /新版解析候选/);
+  assert.match(quality, /证据回填不会覆盖原有事件字段/);
   assert.match(await readFile(new URL("drizzle/0012_curvy_cardiac.sql",root),"utf8"),/verification_status/);
   assert.match(capital, /融资活跃度，不是信用评分/);
   assert.match(capital, /事件差，不是存量质押/);

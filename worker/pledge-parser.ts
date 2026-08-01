@@ -23,7 +23,7 @@ type ValidatablePledgeRow = {
   missing: string[];
 };
 
-const institutionSuffix = /(?:银行股份有限公司(?:[^公司]{0,20}支行)?|证券股份有限公司|信托有限公司|融资租赁有限公司|资产管理有限公司|有限责任公司|有限公司)$/;
+const institutionSuffix = /(?:银行股份有限公司(?:[^公司]{0,20}[分支]行)?|证券(?:股份)?有限公司|信托有限公司|融资租赁有限公司|资产管理有限公司|财务有限公司|小额贷款有限公司|投资中心[（(]有限合伙[）)]|合伙企业[（(]有限合伙[）)]|有限责任公司|有限公司)$/;
 const genericInstitutions = new Set(["有限公司","有限责任公司","股份有限公司","银行股份有限公司","证券股份有限公司","信托有限公司","科技有限公司","投资有限公司"]);
 
 export function normalizePledgeEntity(value: string, kind: "shareholder" | "pledgee") {
@@ -78,11 +78,24 @@ const amountNumber = (value: string) => {
   return numeric;
 };
 
+const amountUnitFromHeader = (value:string,kind:"pledge"|"release") => {
+  const label=kind==="pledge"?/(?:本次)?质押(?:股数|数量|股份数量)?[（(]?\s*(万|亿)?\s*股/:/(?:本次)?(?:解除质押|解质)(?:股份|股数|数量|股份数量)?[（(]?\s*(万|亿)?\s*股/;
+  return value.match(label)?.[1] || "";
+};
+
+const normalizedAmount = (raw:string,headerUnit:string) => {
+  const compactValue=compact(raw).replace(/股$/,"");
+  const unit=/(万|亿)/.test(compactValue)?compactValue.match(/万|亿/)?.[0]||"":headerUnit;
+  const numeric=compactValue.replace(/万|亿/g,"");
+  const amountText=`${numeric}${unit} 股`;
+  return {amountText,amount:amountNumber(amountText)};
+};
+
 const normalizeDate = (value: string) => value.replace(/\s+/g, "").replace(/年|\//g, "-").replace(/月/g, "-").replace(/日/g, "").replace(/\./g, "-");
 
 function cleanShareholder(raw: string) {
   let value = compact(raw);
-  value = value.replace(/^.*(?:质押融资资金用途|融资资金用途|资金用途|是否补充质押|股东名称)/, "");
+  value = value.replace(/^.*(?:占公司总股本比例|占总股本比例|占其所持股份比例|占所持股份比例|质押融资资金用途|融资资金用途|资金用途|质押起始日|质押到期日|解除质押日期|质权人|是否补充质押|是否为限售股|本次质押(?:股数|数量|股份数量)|股东名称)/, "");
   value = value.replace(/^(?:情况|如下|合计|名称|补充质押|偿还债务|置换前期融资)+/, "");
   value = value.replace(/^.*(?:融资提供担保|提供担保|担保)/, "");
   if (/(融资|担保|用途)/.test(value)) value = value.match(/([\u4e00-\u9fff·]{2,4})$/)?.[1] || value;
@@ -93,8 +106,8 @@ function cleanShareholder(raw: string) {
 function findPledgee(tail: string) {
   const value = compact(tail);
   const patterns = [
-    /[\u4e00-\u9fff（）()]{2,70}银行股份有限公司[\u4e00-\u9fff]{0,20}支行/,
-    /[\u4e00-\u9fff（）()]{2,70}(?:证券股份有限公司|银行股份有限公司|信托有限公司|投资中心（有限合伙）|有限责任公司|有限公司)/,
+    /[\u4e00-\u9fff（）()]{2,70}银行股份有限公司[\u4e00-\u9fff]{0,20}[分支]行/,
+    /[\u4e00-\u9fff（）()]{2,70}(?:证券(?:股份)?有限公司|银行股份有限公司|信托有限公司|财务有限公司|小额贷款有限公司|投资中心[（(]有限合伙[）)]|合伙企业[（(]有限合伙[）)]|有限责任公司|有限公司)/,
   ];
   let result = "";
   for (const pattern of patterns) {
@@ -107,7 +120,7 @@ function findPledgee(tail: string) {
 function ratiosAfterPledgee(tail: string, pledgee: string) {
   const value = compact(tail);
   const after = pledgee && value.includes(pledgee) ? value.slice(value.indexOf(pledgee) + pledgee.length) : value;
-  const joinedDecimals = after.match(/^(\d{1,3}\.\d{2})(\d{1,3}\.\d{2})%/);
+  const joinedDecimals = after.match(/^(\d{1,3}\.\d{2})(\d{1,3}\.\d{2})%?/);
   if (joinedDecimals) return [`${joinedDecimals[1]}%`,`${joinedDecimals[2]}%`];
   return [...after.matchAll(/\d+(?:\.\d+)?%?/g)]
     .map((match) => match[0])
@@ -122,19 +135,32 @@ function parsePledgeTable(text: string, title: string): SectionPledgeRow[] {
   const source = text.slice(start);
   const endMatch = source.slice(8).search(/\n(?:二、|三、|2[.、]|3[.、])(?:本次股份解除质押|本次被质押|股东累计|控股股东|上市公司|其他)/);
   const section = (endMatch >= 0 ? source.slice(0, endMatch + 8) : source.slice(0, 5000)).replace(/\s+/g, " ");
+  const headerUnit=amountUnitFromHeader(section.slice(0,500),"pledge");
   const rowPattern = /(.{2,180}?)\s+(是|否)\s+([\d,.]+\s*(?:万|亿)?\s*股?)\s+(是|否)\s+(是|否)\s+(.{20,700}?)(?=(?:[\u4e00-\u9fff（）()·]\s*){2,45}\s+(?:是|否)\s+[\d,.]+\s*(?:万|亿)?\s*股?\s+(?:是|否)\s+(?:是|否)|\s+合计\s|\s+注[：:]|$)/g;
   const rows: SectionPledgeRow[] = [];
   for (const match of section.matchAll(rowPattern)) {
     const shareholder = cleanShareholder(match[1]);
-    const amountText = `${compact(match[3]).replace(/股$/, "")} 股`;
+    const {amountText,amount}=normalizedAmount(match[3],headerUnit);
     const pledgee = findPledgee(match[6]);
     const ratios = ratiosAfterPledgee(match[6], pledgee);
     const dates = [...match[6].matchAll(/\d{4}\s*(?:年|[-/.])\s*\d{1,2}\s*(?:月|[-/.])\s*\d{1,2}\s*日?/g)].map((item) => normalizeDate(item[0]));
-    const amount = amountNumber(amountText);
-    const type = match[5] === "是" || (title.includes("补充质押") && !title.includes("解除")) ? "补充质押" : "新增质押";
+    const type = match[5] === "是" || (title.includes("补充质押") && !title.includes("解除")) ? "补充质押" : /解除.*(?:再|及).*质押|解除后再质押/.test(title) ? "解除后再质押" : "新增质押";
     const missing = [!shareholder && "股东", !pledgee && "质权人", !amount && "质押数量"].filter(Boolean) as string[];
     if (amount && shareholder !== "股东名称" && shareholder !== "合计") rows.push({shareholder,pledgee,amount,amountText,pledgeRatio:ratios[0] || "",totalRatio:ratios[1] || "",startDate:dates[0] || "",endDate:dates[1] || (/办理.*解除.*登记/.test(match[6]) ? "办理解除质押登记之日" : ""),purpose:"",type,missing});
   }
+  return rows;
+}
+
+function parseReleaseTable(text:string):SectionPledgeRow[] {
+  const start=text.search(/(?:本次)?股份解除质押(?:的基本情况|基本情况|情况)?/);if(start<0)return [];
+  const source=text.slice(start);const endMatch=source.slice(8).search(/\n(?:二、|三、|2[.、]|3[.、])(?:股东累计|控股股东|上市公司|其他|本次股份质押)/);
+  const rawSection=endMatch>=0?source.slice(0,endMatch+8):source.slice(0,4000);const section=rawSection.replace(/\s+/g," ");const headerUnit=amountUnitFromHeader(section.slice(0,500),"release");
+  const lineRows:SectionPledgeRow[]=[];
+  for(const rawLine of rawSection.split(/\r?\n/)){const line=rawLine.replace(/[\t\u00a0]+/g," ").replace(/\s+/g," ").trim();if(!line||/股东名称.*解除质押/.test(line)||/^合计/.test(line))continue;const match=line.match(/^(.{2,80}?)\s+([\d,.]+\s*(?:万|亿)?\s*股?)\s+([\d.]+)%?\s+([\d.]+)%?\s+(.+)$/);if(!match)continue;const shareholder=cleanShareholder(match[1]);const {amountText,amount}=normalizedAmount(match[2],headerUnit);const pledgee=findPledgee(match[5]);const date=normalizeDate(match[5].match(/\d{4}\s*(?:年|[-/.])\s*\d{1,2}\s*(?:月|[-/.])\s*\d{1,2}\s*日?/)?.[0]||"");const missing=[!shareholder&&"股东",!pledgee&&"质权人",!amount&&"质押数量"].filter(Boolean) as string[];if(amount)lineRows.push({shareholder,pledgee,amount,amountText,pledgeRatio:`${match[3]}%`,totalRatio:`${match[4]}%`,startDate:"",endDate:date,purpose:"",type:"解除质押",missing});}
+  if(lineRows.length)return lineRows;
+  const rowPattern=/([\u4e00-\u9fff（）()·](?:\s*[\u4e00-\u9fff（）()·]){1,44})\s+([\d,.]+\s*(?:万|亿)?\s*股?)\s+([\d.]+)%?\s+([\d.]+)%?\s+(.{0,350}?)(?=(?:[\u4e00-\u9fff（）()·](?:\s*[\u4e00-\u9fff（）()·]){1,44}\s+[\d,.]+\s*(?:万|亿)?\s*股?\s+[\d.]+%?\s+[\d.]+%?)|\s+合计\s|\s+注[：:]|$)/g;
+  const rows:SectionPledgeRow[]=[];
+  for(const match of section.matchAll(rowPattern)){const shareholder=cleanShareholder(match[1]);const {amountText,amount}=normalizedAmount(match[2],headerUnit);const pledgee=findPledgee(match[5]);const dates=[...match[5].matchAll(/\d{4}\s*(?:年|[-/.])\s*\d{1,2}\s*(?:月|[-/.])\s*\d{1,2}\s*日?/g)].map((item)=>normalizeDate(item[0]));const missing=[!shareholder&&"股东",!pledgee&&"质权人",!amount&&"质押数量"].filter(Boolean) as string[];if(amount&&shareholder!=="股东名称"&&shareholder!=="合计")rows.push({shareholder,pledgee,amount,amountText,pledgeRatio:`${match[3]}%`,totalRatio:`${match[4]}%`,startDate:"",endDate:dates[0]||"",purpose:"",type:"解除质押",missing});}
   return rows;
 }
 
@@ -155,7 +181,7 @@ function parseReleaseSection(text: string): SectionPledgeRow[] {
 }
 
 export function parseSectionPledgeRows(text: string, title: string) {
-  const rows = [...parsePledgeTable(text,title),...parseReleaseSection(text)];
+  const rows = [...parsePledgeTable(text,title),...parseReleaseTable(text),...parseReleaseSection(text)];
   return rows.filter((row,index,all) => index === all.findIndex((other) => `${other.type}|${other.shareholder}|${other.pledgee}|${other.amount}` === `${row.type}|${row.shareholder}|${row.pledgee}|${row.amount}`));
 }
 

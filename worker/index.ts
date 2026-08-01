@@ -431,7 +431,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   const pages = Array.isArray(extracted.text) ? extracted.text.map((page)=>String(page)) : [String(extracted.text||"")];
   const text = pages.join("\n\f\n");
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
-  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.3"; let confidence = rows.length > 1 ? 0.9 : 0.86;
+  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.4"; let confidence = rows.length > 1 ? 0.9 : 0.86;
   const localIncomplete = !rows.length || rows.some((row) => row.missing.length > 0);
   let openaiMeta: {model:string;responseId:string;usage:unknown} | null = null;
   let openaiError = "";
@@ -552,6 +552,16 @@ async function runEvidenceBackfill(env:Env,requestedLimit=5) {
   return {runId:run?.id,processed:candidates.results.length,located,failures,results,finishedAt};
 }
 
+async function runParserUpgradeRetry(env:Env,requestedLimit=3) {
+  const limit=Math.min(Math.max(requestedLimit,1),5);const startedAt=new Date().toISOString();
+  const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("parser-upgrade-retry",startedAt,"running",`使用规则解析器v2.4重试最多 ${limit} 份待审核公告`).first<{id:number}>();
+  const candidates=await env.DB.prepare("SELECT a.announcement_id AS id FROM announcement a JOIN review_queue r ON r.announcement_id=a.announcement_id AND r.status='pending' WHERE a.parse_status='review' AND a.parse_attempts<2 AND NOT EXISTS (SELECT 1 FROM audit_log l WHERE l.entity_type='announcement' AND l.entity_id=a.announcement_id AND l.action='parser_upgrade_v2_4_attempt') GROUP BY a.announcement_id ORDER BY a.announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
+  const results:unknown[]=[];let eventsCreated=0;let unresolved=0;let failures=0;
+  for(const row of candidates.results){try{const result=await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env);eventsCreated+=result.event_count||result.events_created||0;if(result.status!=="parsed")unresolved++;results.push(result);await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",row.id,"parser_upgrade_v2_4_attempt",JSON.stringify(result),"parser-upgrade-worker",new Date().toISOString()).run();}catch(error){failures++;const message=error instanceof Error?error.message:"parser upgrade retry failed";await env.DB.batch([env.DB.prepare("UPDATE announcement SET parse_attempts=parse_attempts+1,last_error=? WHERE announcement_id=?").bind(message,row.id),env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",row.id,"parser_upgrade_v2_4_attempt",JSON.stringify({error:message}),"parser-upgrade-worker",new Date().toISOString())]);results.push({id:row.id,status:"failed",error:message});}}
+  const finishedAt=new Date().toISOString();await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(finishedAt,failures||unresolved?"completed_with_errors":"completed",candidates.results.length,eventsCreated,failures,`重试 ${candidates.results.length} 份，生成 ${eventsCreated} 条事件，仍待审核 ${unresolved} 份，失败 ${failures} 份`,run?.id).run();
+  return {runId:run?.id,processed:candidates.results.length,eventsCreated,unresolved,failures,results,finishedAt};
+}
+
 async function runHistoricalBackfillBatch(env:Env,requestedTradingDays=1) {
   const tradingDays=Math.min(Math.max(requestedTradingDays,1),7);
   const [state,earliest,lastHistoricalRun]=await Promise.all([
@@ -574,7 +584,7 @@ async function runHistoricalBackfillBatch(env:Env,requestedTradingDays=1) {
 
 async function runMaintenanceCycle(env:Env,reason:string) {
   const startedAt=new Date().toISOString();
-  try{const evidence=await runEvidenceBackfill(env,5);const history=await runHistoricalBackfillBatch(env,1);const processing=history.inserted?await processPendingQueue(env.DB,env.DOCUMENTS,5,env):null;const result={reason,evidence,history,processing,startedAt,finishedAt:new Date().toISOString()};await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('data_maintenance_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify(result),result.finishedAt).run();return result;}
+  try{const parserRetry=await runParserUpgradeRetry(env,3);const evidence=await runEvidenceBackfill(env,5);const history=await runHistoricalBackfillBatch(env,1);const processing=history.inserted?await processPendingQueue(env.DB,env.DOCUMENTS,5,env):null;const result={reason,parserRetry,evidence,history,processing,startedAt,finishedAt:new Date().toISOString()};await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('data_maintenance_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify(result),result.finishedAt).run();return result;}
   catch(error){const result={reason,status:"failed",message:error instanceof Error?error.message:"maintenance failed",startedAt,finishedAt:new Date().toISOString()};await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('data_maintenance_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify(result),result.finishedAt).run();throw error;}
 }
 
@@ -1124,10 +1134,10 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if(url.pathname==="/api/maintenance"&&request.method==="GET"){
     const [state,candidates,latestEvidenceRun]=await Promise.all([
       env.DB.prepare("SELECT value,updated_at AS updatedAt FROM pipeline_state WHERE key='data_maintenance_last'").first<{value:string;updatedAt:string}>(),
-      env.DB.prepare("SELECT COUNT(DISTINCT a.announcement_id) AS evidenceCandidates FROM announcement a JOIN pledge p ON p.announcement_id=a.announcement_id WHERE json_extract(p.evidence_json,'$.pageNumber') IS NULL AND (SELECT COUNT(*) FROM audit_log l WHERE l.entity_type='announcement' AND l.entity_id=a.announcement_id AND l.action='evidence_backfill_attempt')<2").first<{evidenceCandidates:number}>(),
+      env.DB.prepare("SELECT (SELECT COUNT(DISTINCT a.announcement_id) FROM announcement a JOIN pledge p ON p.announcement_id=a.announcement_id WHERE json_extract(p.evidence_json,'$.pageNumber') IS NULL AND (SELECT COUNT(*) FROM audit_log l WHERE l.entity_type='announcement' AND l.entity_id=a.announcement_id AND l.action='evidence_backfill_attempt')<2) AS evidenceCandidates,(SELECT COUNT(DISTINCT a.announcement_id) FROM announcement a JOIN review_queue r ON r.announcement_id=a.announcement_id AND r.status='pending' WHERE a.parse_status='review' AND a.parse_attempts<2 AND NOT EXISTS (SELECT 1 FROM audit_log l WHERE l.entity_type='announcement' AND l.entity_id=a.announcement_id AND l.action='parser_upgrade_v2_4_attempt')) AS parserRetryCandidates").first<{evidenceCandidates:number;parserRetryCandidates:number}>(),
       env.DB.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,announcements_found AS announcementsFound,events_created AS eventsLocated,failures,message FROM sync_run WHERE source='evidence-backfill' ORDER BY id DESC LIMIT 1").first(),
     ]);
-    return json({lastResult:state?JSON.parse(state.value):null,lastUpdatedAt:state?.updatedAt||null,candidates,latestEvidenceRun,scope:"每天最多处理5份PDF证据并向前回补1个交易日；单份证据失败最多自动尝试2次"});
+    return json({lastResult:state?JSON.parse(state.value):null,lastUpdatedAt:state?.updatedAt||null,candidates,latestEvidenceRun,scope:"每天最多用v2.4重试3份待审核公告、处理5份PDF证据并向前回补1个交易日"});
   }
   if(url.pathname==="/api/maintenance"&&request.method==="POST"){
     const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后运行数据维护"},{status:401});
