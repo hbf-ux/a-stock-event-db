@@ -91,6 +91,8 @@ GitHub Actions runs `.github/workflows/daily-sync.yml` at 18:30 China Standard T
 
 When normal PDF text/table extraction cannot produce a complete pledge row, the worker can send the archived PDF to the OpenAI Responses API for vision-based extraction. Configure `OPENAI_API_KEY` as a secret Sites runtime variable to enable this fallback. `OPENAI_OCR_MODEL` is optional and defaults to `gpt-5.6-luna`. Without a key, incomplete documents remain traceable in R2 and move to the review queue with an explicit OCR configuration reason.
 
+The production site also performs request-driven catch-up. A public health check starts the latest trading day's official ingestion, exchange reconciliation, and pending-document processing when the previous trigger is older than 60 minutes. This provides a no-extra-service fallback when a dedicated scheduler is unavailable. Set `AUTO_SYNC_ENABLED=false` to disable it or adjust `AUTO_SYNC_INTERVAL_MINUTES` (15–360). A database lock and active-run check prevent normal page traffic from starting duplicate production cycles.
+
 Table-like PDF text can produce multiple pledge events per announcement. Each event receives a SHA-256 fingerprint; the runtime migration replaces the former announcement/shareholder/type uniqueness rule while preserving existing records.
 
 ## Useful Commands

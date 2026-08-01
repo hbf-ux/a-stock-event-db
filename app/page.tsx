@@ -8,7 +8,7 @@ type ReviewRow = { id: number; announcementId: string; reason: string; payload: 
 type ReviewForm = { shareholder: string; pledgee: string; amount: string; amountText: string; pledgeRatio: string; totalRatio: string; type: string };
 type SyncRun = { id: number; source: string; startedAt: string; finishedAt?: string; status: string; announcementsFound: number; eventsCreated: number; failures: number; message?: string };
 type StatsData = { daily: { date: string; announcements: number; parsed: number }[]; eventTypes: { name: string; value: number }[]; pledgees: { name: string; value: number; amount: number }[]; statuses: { name: string; value: number }[] };
-type Health = { stats?: { announcements?: number; events?: number; pending_reviews?: number } };
+type Health = { stats?: { announcements?: number; events?: number; pending_reviews?: number }; automaticSync?: { enabled: boolean; status: "disabled" | "fresh" | "running" | "started"; targetDate: string; intervalMinutes: number; runId?: number; lastTriggeredAt?: string | null } };
 type CoverageData = { announcements?: { total?: number; firstDate?: string; latestDate?: string; stockCount?: number }; events?: { total?: number; firstDate?: string; latestDate?: string; stockCount?: number }; listedStocks?: { total?: number }; pending?: { total?: number }; latestRun?: { finishedAt?: string; status?: string }; scope?: string };
 type StockCoverage = { stockCode: string; stockName: string; announcements: number; firstDate?: string; latestDate?: string; parsedAnnouncements: number; events: number; eventFirstDate?: string; eventLatestDate?: string };
 type ProfileData = { stock: string; summary?: { name?: string; events?: number; pledged_amount?: number; latest_date?: string } | null; types: { type: string; count: number }[]; shareholders: { shareholder: string; events: number; amount: number; latest_date: string }[]; history: { date: string; type: string; amount: string; ratio?: string; total?: string; shareholder: string; pledgee: string; announcementId: string }[] };
@@ -322,7 +322,13 @@ export default function Home() {
     } catch { setState("error"); }
   }, []);
 
-  useEffect(() => { void loadAll(); }, [loadAll]);
+  useEffect(() => {
+    void loadAll();
+    const refresh = window.setInterval(() => void loadAll(), 120000);
+    const onVisible = () => { if (document.visibilityState === "visible") void loadAll(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { window.clearInterval(refresh); document.removeEventListener("visibilitychange", onVisible); };
+  }, [loadAll]);
   useEffect(() => { void (async () => { try { const saved = window.localStorage.getItem("stock-event-watchlist"); if (saved) setWatchlist(JSON.parse(saved) as string[]); } catch {} try { const response = await fetch("/api/watchlist", { cache: "no-store" }); if (response.ok) { const payload = await response.json() as { data?: string[] }; setWatchlist(payload.data || []); setWatchlistSource("cloud"); } } catch {} })(); }, []);
 
   const filteredAnnouncements = useMemo(() => announcements.filter((row) => {

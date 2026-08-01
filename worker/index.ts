@@ -11,6 +11,9 @@ interface Env {
   /** OpenAI is a targeted fallback for PDFs that deterministic rules cannot parse safely. */
   OPENAI_API_KEY?: string;
   OPENAI_OCR_MODEL?: string;
+  /** Request-driven production catch-up. Disable explicitly with "false". */
+  AUTO_SYNC_ENABLED?: string;
+  AUTO_SYNC_INTERVAL_MINUTES?: string;
   STRIPE_SECRET_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;
   STRIPE_PRICE_PRO_MONTHLY?: string;
@@ -712,6 +715,38 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
   }
 }
 
+type AutomaticSyncState = {
+  enabled: boolean;
+  status: "disabled"|"fresh"|"running"|"started";
+  targetDate: string;
+  intervalMinutes: number;
+  runId?: number;
+  lastTriggeredAt?: string | null;
+};
+
+async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext):Promise<AutomaticSyncState> {
+  const enabled=env.AUTO_SYNC_ENABLED?.trim().toLowerCase()!=="false";
+  const configuredInterval=Number(env.AUTO_SYNC_INTERVAL_MINUTES||60);
+  const intervalMinutes=Number.isFinite(configuredInterval)?Math.min(Math.max(Math.round(configuredInterval),15),360):60;
+  const targetDate=latestTradingDate();
+  if(!enabled)return {enabled:false,status:"disabled",targetDate,intervalMinutes};
+
+  const activeRun=await env.DB.prepare("SELECT id,started_at AS startedAt FROM sync_run WHERE source='daily-production-cycle' AND status='running' ORDER BY id DESC LIMIT 1").first<{id:number;startedAt:string}>();
+  if(activeRun)return {enabled:true,status:"running",targetDate,intervalMinutes,runId:activeRun.id,lastTriggeredAt:activeRun.startedAt};
+  const startedAt=new Date().toISOString();
+  const lockCutoff=new Date(Date.now()-intervalMinutes*60000).toISOString();
+  const lock=await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('automatic_production_trigger',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE pipeline_state.updated_at<=? RETURNING updated_at AS updatedAt").bind(JSON.stringify({targetDate,reason:"public-health-check",status:"starting"}),startedAt,lockCutoff).first<{updatedAt:string}>();
+  if(!lock){
+    const existing=await env.DB.prepare("SELECT updated_at AS updatedAt FROM pipeline_state WHERE key='automatic_production_trigger'").first<{updatedAt:string}>();
+    return {enabled:true,status:"fresh",targetDate,intervalMinutes,lastTriggeredAt:existing?.updatedAt||null};
+  }
+  const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("daily-production-cycle",startedAt,"running",`automatic production catch-up ${targetDate}`).first<{id:number}>();
+  if(!run?.id)return {enabled:true,status:"fresh",targetDate,intervalMinutes,lastTriggeredAt:startedAt};
+  await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('automatic_production_trigger',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify({targetDate,runId:run.id,reason:"public-health-check"}),startedAt).run();
+  ctx.waitUntil(runDailyProductionCycle(env,targetDate,run.id,"automatic-production").catch(()=>undefined));
+  return {enabled:true,status:"started",targetDate,intervalMinutes,runId:run.id,lastTriggeredAt:startedAt};
+}
+
 const stripePlanPrices=(env:Env)=>({pro:env.STRIPE_PRICE_PRO_MONTHLY,team:env.STRIPE_PRICE_TEAM_MONTHLY,global:env.STRIPE_PRICE_GLOBAL_MONTHLY});
 const stripePlanFromPrice=(env:Env,priceId:string|null|undefined)=>Object.entries(stripePlanPrices(env)).find(([,id])=>id&&id===priceId)?.[0]||"free";
 const paidBillingStatuses=new Set(["active","trialing"]);
@@ -788,12 +823,13 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const session=await stripePost(env,"billing_portal/sessions",{customer:account.stripeCustomerId,return_url:`${url.origin}${input.locale==="en"?"/en/pricing":"/pricing"}`});return json({ok:true,url:session.url});
   }
   if (url.pathname === "/api/health") {
-    const [stats,quotaState] = await Promise.all([
+    const [stats,quotaState,automaticSync] = await Promise.all([
       env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews, (SELECT COUNT(*) FROM announcement WHERE parse_status='ignored') ignored_announcements").first(),
       env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
+      maybeStartAutomaticProduction(env,ctx),
     ]);
     const quotaBlocked = Boolean(quotaState?.value && Date.parse(quotaState.value) > Date.now());
-    return json({ status: "ok", storage: { d1: true, r2: true }, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
+    return json({ status: "ok", storage: { d1: true, r2: true }, automaticSync, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
