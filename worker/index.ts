@@ -402,6 +402,21 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       return json({ ok:false,run_id:run?.id,error:message },{status:502});
     }
   }
+  if (url.pathname === "/api/backfill-plan" && request.method === "POST") {
+    const input = await request.json<{start?:string;end?:string}>().catch(() => ({}));
+    const end = input.end || new Date().toISOString().slice(0,10); const start = input.start || new Date(Date.now() - 6 * 86400000).toISOString().slice(0,10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || start > end) return json({ error: "invalid-date-range" }, { status: 400 });
+    const startDate = new Date(`${start}T00:00:00Z`); const endDate = new Date(`${end}T00:00:00Z`); const days = Math.floor((endDate.getTime() - startDate.getTime()) / 86400000) + 1;
+    if (days > 31) return json({ error: "date-range-too-large", maxDays: 31 }, { status: 400 });
+    const existing = await env.DB.prepare("SELECT DISTINCT announce_date AS date FROM announcement WHERE announce_date BETWEEN ? AND ?").bind(start,end).all<{date:string}>(); const present = new Set(existing.results.map((row) => row.date)); const dates: string[] = [];
+    for (let index = 0; index < days; index++) { const date = new Date(startDate); date.setUTCDate(startDate.getUTCDate() + index); const key = date.toISOString().slice(0,10); if (!present.has(key)) dates.push(key); }
+    if (!dates.length) return json({ ok:true,run_id:null,dates:[],found:0,inserted:0,failures:0,message:"没有待回补日期" });
+    const startedAt = new Date().toISOString(); const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("historical-backfill-gap",startedAt,"running",`回补缺口 ${dates.length} 日`).first<{id:number}>();
+    let found = 0; let inserted = 0; let failures = 0; const results: {date:string;found:number;inserted:number;error?:string}[] = [];
+    for (const date of dates) { try { const result = await ingestCninfo(env.DB,date); found += result.found; inserted += result.inserted; results.push({date,...result}); } catch (error) { failures++; results.push({date,found:0,inserted:0,error:error instanceof Error ? error.message : "sync failed"}); } }
+    await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,failures=?,message=? WHERE id=?").bind(new Date().toISOString(),failures ? "completed_with_errors" : "completed",found,failures,`缺口回补 ${dates.length} 日：发现 ${found} 条，新增 ${inserted} 条`,run?.id).run();
+    return json({ ok:true,run_id:run?.id,dates:results,found,inserted,failures,auto_processing:true });
+  }
   if (url.pathname === "/api/backfill-plan" && request.method === "GET") {
     const end = url.searchParams.get("end") || new Date().toISOString().slice(0,10);
     const start = url.searchParams.get("start") || new Date(Date.now() - 6 * 86400000).toISOString().slice(0,10);
