@@ -18,6 +18,9 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(page, /导出格式/);
   assert.match(page, /后台解析已启动/);
   assert.match(page, /近 14 日公告趋势/);
+  assert.match(page, /profileIntelligenceStack/);
+  assert.doesNotMatch(page, /\{profile && <CoveragePanel/);
+  assert.match(page, /className="headerLanguage" href="\/en"/);
   assert.match(page, /主要质权人/);
   assert.match(page, /回补 7 日/);
   assert.match(page, /\/api\/announcements\/\$\{row\.announcementId\}\/process/);
@@ -109,6 +112,7 @@ test("international intelligence and subscription surfaces use production data",
   assert.match(english,/\/api\/feed\?hours=168/);
   assert.match(english,/Shareholder financing risk/);
   assert.match(english,/OTC Filing Watch/);
+  assert.match(english,/Hong Kong listings are not yet included/);
   assert.match(pricing,/\/api\/billing\/checkout/);
   assert.match(pricing,/Global Filing Intelligence/);
   assert.match(pricing,/Payment details are collected by Stripe Checkout/);
