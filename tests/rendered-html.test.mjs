@@ -49,6 +49,12 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /requiredFieldRate/);
   assert.match(worker, /gapCandidates/);
   assert.match(worker, /交易所交叉补漏尚未形成完成性证明/);
+  assert.match(worker, /fetchSseObservations/);
+  assert.match(worker, /fetchSzseObservations/);
+  assert.match(worker, /fetchBseObservations/);
+  assert.match(worker, /\/api\/reconciliation\/run/);
+  assert.match(worker, /missing_primary/);
+  assert.match(worker, /对账结果不会自动进入正式事件库/);
   assert.match(worker, /capital_stage='due_diligence'/);
   assert.match(worker, /stage_updated/);
   assert.match(worker, /需求已关闭，相关未完成候选不再推进/);
@@ -68,7 +74,7 @@ test("deployment bundle exists", async () => {
 });
 
 test("commercial intelligence pages are wired to verified event data", async () => {
-  const [detail, company, shareholder, pledgee, event, capital, brief, match, matchDesk, quality, migration, matchMigration, funnelMigration] = await Promise.all([
+  const [detail, company, shareholder, pledgee, event, capital, brief, match, matchDesk, quality, migration, matchMigration, funnelMigration, reconciliationMigration] = await Promise.all([
     readFile(new URL("app/intelligence-detail.tsx", root), "utf8"),
     readFile(new URL("app/company/[code]/page.tsx", root), "utf8"),
     readFile(new URL("app/shareholder/[name]/page.tsx", root), "utf8"),
@@ -82,6 +88,7 @@ test("commercial intelligence pages are wired to verified event data", async () 
     readFile(new URL("drizzle/0004_past_franklin_storm.sql", root), "utf8"),
     readFile(new URL("drizzle/0007_free_guardian.sql", root), "utf8"),
     readFile(new URL("drizzle/0008_wonderful_true_believers.sql", root), "utf8"),
+    readFile(new URL("drizzle/0009_blue_mongoose.sql", root), "utf8"),
   ]);
   assert.match(detail, /质押事件时间线/);
   assert.match(detail, /完整股东融资风控报告/);
@@ -106,8 +113,13 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(quality, /不把“已抓取范围”包装成“全市场完整率”/);
   assert.match(quality, /缺口候选/);
   assert.match(quality, /解析器版本/);
+  assert.match(quality, /交易所公告对账/);
+  assert.match(quality, /运行官方对账/);
+  assert.match(quality, /差异不会自动污染正式事件/);
   assert.match(migration, /CREATE TABLE `match_request`/);
   assert.match(matchMigration, /CREATE TABLE `match_candidate`/);
   assert.match(funnelMigration, /capital_stage/);
   assert.match(funnelMigration, /financing_stage/);
+  assert.match(reconciliationMigration, /CREATE TABLE `exchange_observation`/);
+  assert.match(reconciliationMigration, /exchange_observation_date_status_idx/);
 });

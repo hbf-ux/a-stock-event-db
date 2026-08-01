@@ -112,6 +112,27 @@ export const shareholderProfiles = sqliteTable("shareholder_profile", {
   updatedBy: text("updated_by").notNull(),
 }, (table) => [primaryKey({ columns: [table.stockCode, table.shareholder] })]);
 
+export const exchangeObservations = sqliteTable("exchange_observation", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  source: text("source").notNull(),
+  sourceAnnouncementId: text("source_announcement_id").notNull(),
+  stockCode: text("stock_code").notNull(),
+  stockName: text("stock_name").notNull(),
+  title: text("title").notNull(),
+  announceDate: text("announce_date").notNull(),
+  pdfUrl: text("pdf_url"),
+  titleFingerprint: text("title_fingerprint").notNull(),
+  matchStatus: text("match_status").notNull().default("unmatched"),
+  matchMethod: text("match_method"),
+  matchedAnnouncementId: text("matched_announcement_id"),
+  rawJson: text("raw_json").notNull(),
+  observedAt: text("observed_at").notNull(),
+}, (table) => [
+  uniqueIndex("exchange_observation_source_id_uq").on(table.source, table.sourceAnnouncementId),
+  index("exchange_observation_date_status_idx").on(table.announceDate, table.matchStatus),
+  index("exchange_observation_stock_date_idx").on(table.stockCode, table.announceDate),
+]);
+
 export const matchRequests = sqliteTable("match_request", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   role: text("role").notNull(),
