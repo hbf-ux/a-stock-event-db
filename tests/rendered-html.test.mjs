@@ -29,6 +29,7 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /completed_with_errors/);
   assert.match(worker, /application\/vnd\.ms-excel/);
   assert.match(worker, /p\.shareholder LIKE/);
+  assert.match(worker, /CAST\(p\.id AS TEXT\) = \?/);
   assert.match(worker, /ctx\.waitUntil\(processPendingQueue/);
   assert.match(worker, /parse_status IN \('queued','archived'\)/);
   assert.match(worker, /fetchWithRetry/);
@@ -42,10 +43,28 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /parseSectionPledgeRows/);
   assert.match(worker, /openai_quota_blocked_until/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
-  assert.match(layout, /A股质押风险监测/);
+  assert.match(layout, /A股股东融资风险即时情报与尽调报告/);
 });
 
 test("deployment bundle exists", async () => {
   await access(new URL("dist/server/index.js", root));
   await access(new URL(".openai/hosting.json", root));
+});
+
+test("commercial intelligence pages are wired to verified event data", async () => {
+  const [detail, company, shareholder, pledgee, event] = await Promise.all([
+    readFile(new URL("app/intelligence-detail.tsx", root), "utf8"),
+    readFile(new URL("app/company/[code]/page.tsx", root), "utf8"),
+    readFile(new URL("app/shareholder/[name]/page.tsx", root), "utf8"),
+    readFile(new URL("app/pledgee/[name]/page.tsx", root), "utf8"),
+    readFile(new URL("app/event/[id]/page.tsx", root), "utf8"),
+  ]);
+  assert.match(detail, /质押事件时间线/);
+  assert.match(detail, /完整股东融资风控报告/);
+  assert.match(detail, /内测预约，不会产生扣费/);
+  assert.match(detail, /官方原文/);
+  assert.match(company, /kind="company"/);
+  assert.match(shareholder, /kind="shareholder"/);
+  assert.match(pledgee, /kind="pledgee"/);
+  assert.match(event, /kind="event"/);
 });

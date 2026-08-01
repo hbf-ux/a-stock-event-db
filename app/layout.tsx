@@ -3,8 +3,8 @@ import "./globals.css";
 import "./extra.css";
 
 export const metadata: Metadata = {
-  title: "股东融资风控情报｜A股质押风险监测",
-  description: "基于官方公告的 A 股股东融资行为监测与质押风控情报平台。",
+  title: "质押雷达｜A股股东融资风险即时情报与尽调报告",
+  description: "追踪 A 股股东质押、补充质押和解除质押，提供可回溯官方公告的公司、股东、质权人情报页与融资风控报告。",
   icons: { icon: "/favicon.svg", shortcut: "/favicon.svg" },
 };
 

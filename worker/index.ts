@@ -653,6 +653,8 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (url.pathname === "/api/events" && request.method === "GET") {
     const conditions: string[] = []; const values: string[] = [];
     const add = (sql: string, value: string | null) => { if (value) { conditions.push(sql); values.push(value); } };
+    add("CAST(p.id AS TEXT) = ?", url.searchParams.get("id"));
+    add("p.announcement_id = ?", url.searchParams.get("announcement_id"));
     add("p.announce_date = ?", url.searchParams.get("date"));
     add("p.type = ?", url.searchParams.get("event_type"));
     add("p.stock_code = ?", url.searchParams.get("stock"));
