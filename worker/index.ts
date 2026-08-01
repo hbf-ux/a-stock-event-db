@@ -58,7 +58,7 @@ async function ensureSchema(db: D1Database) {
       db.prepare("CREATE INDEX pledge_pledgee_idx ON pledge (pledgee)"),
     ]);
   }
-  const invalidEvents = await db.prepare("SELECT DISTINCT announcement_id FROM pledge WHERE pledgee LIKE '占其%' OR pledgee LIKE '占公司%' OR pledgee LIKE '质押数量%' OR pledgee LIKE '%有限公司补充%' OR shareholder IN ('借款','质押','补充质押','偿还借款') OR (parser_version LIKE 'unpdf-table-rules%' AND (shareholder LIKE '%质押%' OR shareholder LIKE '%融资%'))").all<{announcement_id:string}>();
+  const invalidEvents = await db.prepare("SELECT DISTINCT announcement_id FROM pledge WHERE pledgee LIKE '占其%' OR pledgee LIKE '占公司%' OR pledgee LIKE '质押数量%' OR pledgee LIKE '上表%' OR pledgee LIKE '本表%' OR pledgee LIKE '%证券登记结算%' OR pledgee LIKE '%有限公司补充%' OR shareholder IN ('借款','质押','补充质押','偿还借款') OR (parser_version LIKE 'unpdf-table-rules%' AND (shareholder LIKE '%质押%' OR shareholder LIKE '%融资%'))").all<{announcement_id:string}>();
   if (invalidEvents.results.length) {
     const ids = invalidEvents.results.map((row) => row.announcement_id);
     for (const id of ids) await db.batch([
@@ -229,7 +229,7 @@ function normalizeVisionRows(value: unknown, title: string): ParsedPledge[] {
 
 const validateParsedRows = (rows: ParsedPledge[]) => rows.map((row) => {
   const invalidShareholder = row.shareholder.length < 2 || /^(股东|名称|合计|本次|质押|融资|借款)$/.test(row.shareholder);
-  const invalidPledgee = row.pledgee.length < 3 || /^(占其|占公司|质押数量|比例|本次|股东|名称|合计)/.test(row.pledgee);
+  const invalidPledgee = row.pledgee.length < 3 || /^(占其|占公司|质押数量|比例|本次|股东|名称|合计|上表|本表|根据)/.test(row.pledgee) || /证券登记结算/.test(row.pledgee);
   const invalidType = !["新增质押","补充质押","解除质押","解除后再质押"].includes(row.type);
   const missing = [(!row.shareholder || invalidShareholder) && "股东", (!row.pledgee || invalidPledgee) && "质权人", (!row.amount || !Number.isFinite(row.amount) || row.amount <= 0) && "质押数量", invalidType && "事件类型"].filter(Boolean);
   return {...row,missing} as ParsedPledge;
