@@ -28,7 +28,10 @@ const genericInstitutions = new Set(["有限公司","有限责任公司","股份
 
 export function normalizePledgeEntity(value: string, kind: "shareholder" | "pledgee") {
   let normalized = String(value || "").replace(/[\s\u00a0]+/g, "").replace(/^[，。；;：:、]+|[，。；;：:、]+$/g, "");
-  if (kind === "pledgee" && /^日[\u4e00-\u9fff（）()·]{4,}/.test(normalized) && institutionSuffix.test(normalized.slice(1))) normalized = normalized.slice(1);
+  if (kind === "pledgee") {
+    normalized = normalized.replace(/^为准[）)]/,"");
+    if (/^[日止][\u4e00-\u9fff（）()·]{4,}/.test(normalized) && institutionSuffix.test(normalized.slice(1))) normalized = normalized.slice(1);
+  }
   return normalized;
 }
 
@@ -53,11 +56,13 @@ export function validateAndNormalizePledgeRow<T extends ValidatablePledgeRow>(in
   const compactAmount = row.amountText.replace(/\s+/g,"");
   const invalidAmountText = !/^(?:\d+(?:\.\d+)?(?:万|亿)?股?|\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:万|亿)?股?)$/.test(compactAmount);
   const invalidRatio = [row.pledgeRatio,row.totalRatio].some((value) => value && (!/^\d{1,3}(?:\.\d+)?%$/.test(value) || Number(value.slice(0,-1)) > 100 || /^0\d/.test(value)));
+  const disclosedRatio = Number((row.pledgeRatio || "").replace("%",""));
+  const implausibleAmountRatio = row.amount < 10000 && Number.isFinite(disclosedRatio) && disclosedRatio >= 1;
   const invalidType = !["新增质押","补充质押","解除质押","解除后再质押"].includes(row.type);
   row.missing = [
     (!row.shareholder || invalidShareholder) && "股东",
     (!row.pledgee || invalidPledgee) && "质权人",
-    (!row.amount || !Number.isFinite(row.amount) || row.amount <= 0 || invalidAmountText) && "质押数量",
+    (!row.amount || !Number.isFinite(row.amount) || row.amount <= 0 || invalidAmountText || implausibleAmountRatio) && "质押数量",
     invalidRatio && "质押比例",
     invalidType && "事件类型",
   ].filter(Boolean) as string[];

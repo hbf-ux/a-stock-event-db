@@ -91,8 +91,11 @@ async function ensureSchema(db: D1Database) {
     db.prepare("UPDATE pledge SET shareholder=REPLACE(REPLACE(shareholder,' ',''),'　',''),pledgee=REPLACE(REPLACE(pledgee,' ',''),'　','') WHERE shareholder LIKE '% %' OR shareholder LIKE '%　%' OR pledgee LIKE '% %' OR pledgee LIKE '%　%'"),
     db.prepare("UPDATE pledge SET pledgee=SUBSTR(pledgee,2) WHERE pledgee LIKE '日%' AND (pledgee LIKE '%有限公司' OR pledgee LIKE '%支行')"),
   ]);
-  const existingEvents = await db.prepare("SELECT announcement_id,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,type FROM pledge").all<{announcement_id:string;shareholder:string;pledgee:string;pledge_amount:number;pledge_amount_text:string;pledge_ratio:string;total_ratio:string;type:string}>();
-  const ids = [...new Set(existingEvents.results.filter((event) => validateAndNormalizePledgeRow({shareholder:event.shareholder,pledgee:event.pledgee,amount:Number(event.pledge_amount),amountText:event.pledge_amount_text,pledgeRatio:event.pledge_ratio || "",totalRatio:event.total_ratio || "",type:event.type,missing:[]}).missing.length).map((event) => event.announcement_id))];
+  const existingEvents = await db.prepare("SELECT id,announcement_id,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,type FROM pledge").all<{id:number;announcement_id:string;shareholder:string;pledgee:string;pledge_amount:number;pledge_amount_text:string;pledge_ratio:string;total_ratio:string;type:string}>();
+  const normalizedEvents = existingEvents.results.map((event) => ({event,normalized:validateAndNormalizePledgeRow({shareholder:event.shareholder,pledgee:event.pledgee,amount:Number(event.pledge_amount),amountText:event.pledge_amount_text,pledgeRatio:event.pledge_ratio || "",totalRatio:event.total_ratio || "",type:event.type,missing:[]})}));
+  const entityUpdates = normalizedEvents.filter(({event,normalized}) => !normalized.missing.length && (event.shareholder !== normalized.shareholder || event.pledgee !== normalized.pledgee));
+  if (entityUpdates.length) await db.batch(entityUpdates.map(({event,normalized}) => db.prepare("UPDATE pledge SET shareholder=?,pledgee=? WHERE id=?").bind(normalized.shareholder,normalized.pledgee,event.id)));
+  const ids = [...new Set(normalizedEvents.filter(({normalized}) => normalized.missing.length).map(({event}) => event.announcement_id))];
   if (ids.length) {
     for (const id of ids) await db.batch([
       db.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(id),

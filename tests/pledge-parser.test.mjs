@@ -56,3 +56,12 @@ test("rejects malformed grouped share amounts", () => {
   const row = validateAndNormalizePledgeRow({shareholder:"张三",pledgee:"天津滨海正信资产管理有限公司",amount:10000,amountText:"1,000,0 股",pledgeRatio:"1.00%",totalRatio:"0.10%",type:"新增质押",missing:[]});
   assert.deepEqual(row.missing,["质押数量"]);
 });
+
+test("rejects likely lost units and removes table-tail prefixes", () => {
+  const row = validateAndNormalizePledgeRow({shareholder:"汤秀清",pledgee:"为准）渤海国际信托股份有限公司",amount:450,amountText:"450 股",pledgeRatio:"5.19%",totalRatio:"1.10%",type:"解除质押",missing:[]});
+  assert.equal(row.pledgee,"渤海国际信托股份有限公司");
+  assert.deepEqual(row.missing,["质押数量"]);
+  const institution = validateAndNormalizePledgeRow({shareholder:"新湖智脑",pledgee:"止中信银行股份有限公司",amount:11211080,amountText:"11,211,080 股",pledgeRatio:"99.96%",totalRatio:"1.20%",type:"新增质押",missing:[]});
+  assert.equal(institution.pledgee,"中信银行股份有限公司");
+  assert.deepEqual(institution.missing,[]);
+});
