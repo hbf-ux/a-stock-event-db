@@ -9,6 +9,7 @@ type ReviewForm = { shareholder: string; pledgee: string; amount: string; amount
 type SyncRun = { id: number; source: string; startedAt: string; finishedAt?: string; status: string; announcementsFound: number; eventsCreated: number; failures: number; message?: string };
 type StatsData = { daily: { date: string; announcements: number; parsed: number }[]; eventTypes: { name: string; value: number }[]; pledgees: { name: string; value: number; amount: number }[]; statuses: { name: string; value: number }[] };
 type Health = { stats?: { announcements?: number; events?: number; pending_reviews?: number } };
+type CoverageData = { announcements?: { total?: number; firstDate?: string; latestDate?: string; stockCount?: number }; events?: { total?: number; firstDate?: string; latestDate?: string; stockCount?: number }; listedStocks?: { total?: number }; pending?: { total?: number }; latestRun?: { finishedAt?: string; status?: string }; scope?: string };
 type ProfileData = { stock: string; summary?: { name?: string; events?: number; pledged_amount?: number; latest_date?: string } | null; types: { type: string; count: number }[]; shareholders: { shareholder: string; events: number; amount: number; latest_date: string }[]; history: { date: string; type: string; amount: string; ratio?: string; total?: string; shareholder: string; pledgee: string; announcementId: string }[] };
 type ShareholderProfile = { stockCode: string; shareholder: string; identityType: string; isController: boolean; isControllingShareholder: boolean; holdingShares?: number | null; holdingRatio?: string | null; sourceTitle?: string | null; sourceUrl?: string | null; sourceDate?: string | null; confidence: number; updatedAt: string };
 
@@ -178,6 +179,12 @@ function AlertsPanel({ feedEvents, watchlist, onProfile }: { feedEvents: EventRo
   return <section className="panel alertsPanel"><div className="panelHead"><div><h2>提醒中心</h2><span>关注股票在最近24小时的质押变化</span></div><span className="tag extra">{alerts.length} 条新提醒</span></div>{alerts.length ? <div className="alertList">{alerts.map((row) => <article key={`${row.announcementId}-${row.id}`} className="alertRow"><span className="alertDot"></span><div><button className="stockLink" onClick={() => onProfile(row.code)}><b>{row.name} · {row.code}</b></button><p>{row.shareholder} {row.type}，数量 {row.amount}</p><small>{row.date} · {row.source}</small></div><span className="tag new">查看画像</span></article>)}</div> : <div className="watchEmpty"><strong>暂无新提醒</strong><p>关注股票出现新的质押、解除或补充质押公告后，会出现在这里。</p></div>}</section>;
 }
 
+function CoverageOverview({ coverage }: { coverage: CoverageData }) {
+  const announcements = coverage.announcements || {};
+  const events = coverage.events || {};
+  return <section className="coverageOverview panel"><div className="panelHead"><div><h2>数据覆盖与完整性</h2><span>实时统计已抓取范围，不代表全市场全历史覆盖</span></div><span className="tag extra">官方公告范围</span></div><div className="coverageOverviewGrid"><div><span>公告起止日期</span><b>{announcements.firstDate || "—"} <i>至</i> {announcements.latestDate || "—"}</b><small>{announcements.total || 0} 条公告</small></div><div><span>结构化事件起止日期</span><b>{events.firstDate || "—"} <i>至</i> {events.latestDate || "—"}</b><small>{events.total || 0} 条质押事件</small></div><div><span>已覆盖股票</span><b>{announcements.stockCount || 0}</b><small>公告中出现的股票数量</small></div><div><span>待解析公告</span><b className={(coverage.pending?.total || 0) > 0 ? "warnValue" : "safeValue"}>{coverage.pending?.total || 0}</b><small>未纳入正式事件</small></div></div><p className="researchDisclaimer">覆盖率只反映当前数据库已抓取与已解析范围；如需全历史结论，仍需按股票回补公告并核对缺失日期。</p></section>;
+}
+
 function DashboardPanel({ stats, runs }: { stats: StatsData; runs: SyncRun[] }) {
   const maxDaily = Math.max(...stats.daily.map((row) => row.announcements),1);
   const maxPledgee = Math.max(...stats.pledgees.map((row) => row.value),1);
@@ -202,6 +209,7 @@ export default function Home() {
   const [editingReview, setEditingReview] = useState<ReviewRow | null>(null);
   const [reviewForm, setReviewForm] = useState<ReviewForm>({ shareholder: "", pledgee: "", amount: "", amountText: "", pledgeRatio: "", totalRatio: "", type: "新增质押" });
   const [health, setHealth] = useState<Health>({});
+  const [coverage, setCoverage] = useState<CoverageData>({});
   const [notice, setNotice] = useState("");
   const [state, setState] = useState<"loading" | "online" | "error">("loading");
   const [syncing, setSyncing] = useState(false);
@@ -214,7 +222,7 @@ export default function Home() {
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 3500); };
   const loadAll = useCallback(async () => {
     try {
-      const [eventResponse, feedResponse, announcementResponse, healthResponse, reviewResponse, runResponse, statsResponse] = await Promise.all([
+      const [eventResponse, feedResponse, announcementResponse, healthResponse, reviewResponse, runResponse, statsResponse, coverageResponse] = await Promise.all([
         fetch("/api/events", { cache: "no-store" }),
         fetch("/api/feed?hours=24&limit=50", { cache: "no-store" }),
         fetch("/api/announcements", { cache: "no-store" }),
@@ -222,8 +230,9 @@ export default function Home() {
         fetch("/api/reviews", { cache: "no-store" }),
         fetch("/api/sync-runs", { cache: "no-store" }),
         fetch("/api/stats", { cache: "no-store" }),
+        fetch("/api/coverage", { cache: "no-store" }),
       ]);
-      if (!eventResponse.ok || !feedResponse.ok || !announcementResponse.ok || !healthResponse.ok || !reviewResponse.ok || !runResponse.ok || !statsResponse.ok) throw new Error("API unavailable");
+      if (!eventResponse.ok || !feedResponse.ok || !announcementResponse.ok || !healthResponse.ok || !reviewResponse.ok || !runResponse.ok || !statsResponse.ok || !coverageResponse.ok) throw new Error("API unavailable");
       const eventPayload = await eventResponse.json() as { data: EventRow[] };
       const announcementPayload = await announcementResponse.json() as { data: AnnouncementRow[] };
       setEvents(eventPayload.data);
@@ -233,6 +242,7 @@ export default function Home() {
       setSyncRuns((await runResponse.json() as { data: SyncRun[] }).data);
       setStatsData(await statsResponse.json() as StatsData);
       setHealth(await healthResponse.json() as Health);
+      setCoverage(await coverageResponse.json() as CoverageData);
       setState("online");
       if (!eventPayload.data.length && announcementPayload.data.length) setView("announcements");
     } catch { setState("error"); }
@@ -404,6 +414,7 @@ export default function Home() {
     {profile && <div className="overlay" onClick={() => setProfile(null)}><aside className="drawer profileDrawer" onClick={(event) => event.stopPropagation()}><button className="close" onClick={() => setProfile(null)}>×</button><p className="eyebrow">COMPANY PROFILE · {profile.stock}</p><h2>{profile.summary?.name || profile.stock}</h2><div className="profileStats"><div><span>质押事件</span><strong>{profile.summary?.events || 0}</strong></div><div><span>最新日期</span><strong>{profile.summary?.latest_date || "—"}</strong></div></div><h3>风险趋势</h3><ProfileTrend history={profile.history} /><h3>股东与质押轨迹</h3><div className="profileShareholders">{profile.shareholders.map((row) => <div key={row.shareholder}><b>{row.shareholder}</b><span>{row.events} 次 · {row.amount} 股</span></div>)}{!profile.shareholders.length && <p className="empty">暂无结构化历史</p>}</div><h3>最近事件</h3><div className="profileHistory">{profile.history.slice(0, 8).map((row) => <div key={row.announcementId + row.date}><span>{row.date}</span><b>{row.type}</b><small>{row.amount} · {row.pledgee}</small></div>)}</div><p className="planNote">数据来自官方公告，支持原文追溯。专业版将提供更长历史和自选股提醒。</p></aside></div>}
     {showPlans && <div className="overlay" onClick={() => setShowPlans(false)}><aside className="drawer plansDrawer" onClick={(event) => event.stopPropagation()}><button className="close" onClick={() => setShowPlans(false)}>×</button><p className="eyebrow">RESEARCH PLANS</p><h2>情报工作台</h2><p className="planIntro">免费查看官方公告与结构化事件；专业版面向研究团队提供更高效的筛选与导出。</p><div className="pricingGrid"><div className="priceCard"><span>免费研究版</span><strong>¥0</strong><small>公告浏览 · CSV 导出 · 原文追溯</small><button className="secondary" onClick={() => setShowPlans(false)}>当前方案</button></div><div className="priceCard featured"><span>专业版</span><strong>¥99<small>/月</small></strong><small>Excel/JSON 导出 · 高级筛选 · 历史数据与团队席位</small><input className="interestInput" aria-label="联系邮箱" placeholder="留下邮箱，预约专业版" value={interestEmail} onChange={(event) => setInterestEmail(event.target.value)} /><button className="primary" disabled={!interestEmail.trim()} onClick={() => void submitInterest()}>预约开通</button></div></div><p className="planNote">当前为产品内测阶段，不会产生任何扣费。</p></aside></div>}
     {notice && <div className="toast">✓ {notice}</div>}
+    {view === "dashboard" && <CoverageOverview coverage={coverage} />}
     {(view === "dashboard" || view === "research") && <RiskLeaderboardPanel events={events} onProfile={(stock) => void openProfile(stock)} />}
     {profile && <CoveragePanel history={profile.history} />}
     {profile && <RiskSummaryPanel history={profile.history} profiles={shareholderProfiles} />}

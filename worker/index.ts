@@ -418,6 +418,16 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,10,env));
     return json({ok:true,run_id:run?.id,days,end_date:endDate,announcements_found:found,announcements_inserted:inserted,failures,dates,auto_processing:true});
   }
+  if (url.pathname === "/api/coverage" && request.method === "GET") {
+    const [announcement, events, stocks, pending, latestRun] = await Promise.all([
+      env.DB.prepare("SELECT COUNT(*) AS total,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate,COUNT(DISTINCT stock_code) AS stockCount FROM announcement").first(),
+      env.DB.prepare("SELECT COUNT(*) AS total,COUNT(DISTINCT stock_code) AS stockCount,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate FROM pledge").first(),
+      env.DB.prepare("SELECT COUNT(*) AS total FROM stock_info").first(),
+      env.DB.prepare("SELECT COUNT(*) AS total FROM announcement WHERE parse_status != 'parsed'").first(),
+      env.DB.prepare("SELECT finished_at AS finishedAt,status FROM sync_run ORDER BY id DESC LIMIT 1").first(),
+    ]);
+    return json({ announcements: announcement, events, listedStocks: stocks, pending, latestRun, generatedAt: new Date().toISOString(), scope: "已抓取官方公告范围，不代表全市场全历史完整度" });
+  }
   if (url.pathname === "/api/feed" && request.method === "GET") {
     const hours = Math.min(Math.max(Number(url.searchParams.get("hours")) || 24, 1), 168);
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);
