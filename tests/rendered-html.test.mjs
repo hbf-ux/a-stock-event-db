@@ -123,6 +123,7 @@ test("commercial intelligence pages are wired to verified event data", async () 
     readFile(new URL("drizzle/0009_blue_mongoose.sql", root), "utf8"),
     readFile(new URL("drizzle/0010_lively_landau.sql", root), "utf8"),
   ]);
+  assert.match(quality, /backfill-extend/);
   assert.match(detail, /质押事件时间线/);
   assert.match(detail, /完整股东融资风控报告/);
   assert.match(detail, /内测预约，不会产生扣费/);
