@@ -525,6 +525,59 @@ async function processPendingQueue(db: D1Database, documents: R2Bucket, requeste
   return { run_id:run?.id,processed:results.length,events_created:parsed,failures,results };
 }
 
+async function backfillAnnouncementEvidence(db:D1Database,documents:R2Bucket,id:string) {
+  const announcement=await db.prepare("SELECT announcement_id AS id,pdf_url AS pdfUrl,r2_key AS r2Key,sha256 FROM announcement WHERE announcement_id=?").bind(id).first<{id:string;pdfUrl:string;r2Key?:string;sha256?:string}>();
+  if(!announcement)throw new Error("announcement not found");
+  let bytes:ArrayBuffer;
+  if(announcement.r2Key){const object=await documents.get(announcement.r2Key);if(!object)throw new Error("archived PDF not found");bytes=await object.arrayBuffer();}
+  else{const response=await fetchWithRetry(announcement.pdfUrl,{headers:{referer:"https://www.cninfo.com.cn/","user-agent":"Mozilla/5.0 (compatible; PledgeRadar/1.0; evidence-backfill)"}});if(!response.ok)throw new Error(`PDF download failed: ${response.status}`);bytes=await response.arrayBuffer();const signature=new TextDecoder("ascii").decode(new Uint8Array(bytes.slice(0,4)));if(signature!=="%PDF")throw new Error("official document is not a PDF");const sha256=hex(await crypto.subtle.digest("SHA-256",bytes));const r2Key=`announcements/${id}.pdf`;await documents.put(r2Key,bytes,{httpMetadata:{contentType:"application/pdf"},customMetadata:{announcementId:id,sha256}});await db.prepare("UPDATE announcement SET r2_key=?,sha256=? WHERE announcement_id=?").bind(r2Key,sha256,id).run();}
+  const pdf=await getDocumentProxy(new Uint8Array(bytes.slice(0)));const extracted=await extractText(pdf,{mergePages:false});
+  const pages=Array.isArray(extracted.text)?extracted.text.map((page)=>String(page)):[String(extracted.text||"")];
+  await documents.put(`announcements/${id}.txt`,pages.join("\n\f\n"),{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
+  const events=await db.prepare("SELECT id,shareholder,pledgee,pledge_amount AS amount,pledge_amount_text AS amountText,pledge_ratio AS pledgeRatio,total_ratio AS totalRatio,start_date AS startDate,end_date AS endDate,purpose,type FROM pledge WHERE announcement_id=? ORDER BY id").bind(id).all<ParsedPledge&{id:number}>();
+  let located=0;const statements:D1PreparedStatement[]=[];
+  for(const row of events.results){const evidence=eventEvidence(id,pages,row,"pdf-evidence-backfill");const parsed=JSON.parse(evidence) as {pageNumber?:number|null};if(parsed.pageNumber)located++;statements.push(db.prepare("UPDATE pledge SET evidence_json=? WHERE id=?").bind(evidence,row.id));}
+  const now=new Date().toISOString();statements.push(db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"evidence_backfill_attempt",JSON.stringify({events:events.results.length,located,pages:pages.length}),"evidence-worker",now));
+  if(statements.length)await db.batch(statements);
+  return {id,events:events.results.length,located,pages:pages.length};
+}
+
+async function runEvidenceBackfill(env:Env,requestedLimit=5) {
+  const limit=Math.min(Math.max(requestedLimit,1),10);const startedAt=new Date().toISOString();
+  const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("evidence-backfill",startedAt,"running",`补齐最多 ${limit} 份公告的PDF页码证据`).first<{id:number}>();
+  const candidates=await env.DB.prepare("SELECT a.announcement_id AS id FROM announcement a JOIN pledge p ON p.announcement_id=a.announcement_id WHERE json_extract(p.evidence_json,'$.pageNumber') IS NULL AND (SELECT COUNT(*) FROM audit_log l WHERE l.entity_type='announcement' AND l.entity_id=a.announcement_id AND l.action='evidence_backfill_attempt')<2 GROUP BY a.announcement_id ORDER BY MIN(CASE WHEN p.type='补充质押' THEN 0 ELSE 1 END),a.announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
+  const results:unknown[]=[];let located=0;let failures=0;
+  for(const row of candidates.results){try{const result=await backfillAnnouncementEvidence(env.DB,env.DOCUMENTS,row.id);located+=result.located;results.push(result);}catch(error){failures++;const message=error instanceof Error?error.message:"evidence backfill failed";const now=new Date().toISOString();await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",row.id,"evidence_backfill_attempt",JSON.stringify({error:message}),"evidence-worker",now).run();results.push({id:row.id,error:message});}}
+  const finishedAt=new Date().toISOString();await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(finishedAt,failures?"completed_with_errors":"completed",candidates.results.length,located,failures,`处理 ${candidates.results.length} 份公告，定位 ${located} 条事件，失败 ${failures} 份`,run?.id).run();
+  return {runId:run?.id,processed:candidates.results.length,located,failures,results,finishedAt};
+}
+
+async function runHistoricalBackfillBatch(env:Env,requestedTradingDays=1) {
+  const tradingDays=Math.min(Math.max(requestedTradingDays,1),7);
+  const [state,earliest,lastHistoricalRun]=await Promise.all([
+    env.DB.prepare("SELECT value FROM pipeline_state WHERE key='historical_backfill_cursor'").first<{value:string}>(),
+    env.DB.prepare("SELECT MIN(announce_date) AS date FROM announcement").first<{date:string}>(),
+    env.DB.prepare("SELECT status,failures,announcements_found AS found FROM sync_run WHERE source='historical-rolling-backfill' ORDER BY id DESC LIMIT 1").first<{status:string;failures:number;found:number}>(),
+  ]);
+  let cursor=state?.value||earliest?.date||shanghaiDate();if(earliest?.date&&cursor<earliest.date&&lastHistoricalRun?.failures&&!lastHistoricalRun.found)cursor=earliest.date;
+  const dates:string[]=[];let candidate=addDays(cursor,-1);while(dates.length<tradingDays){if(isTradingDate(candidate))dates.push(candidate);candidate=addDays(candidate,-1);}
+  const startedAt=new Date().toISOString();const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("historical-rolling-backfill",startedAt,"running",`滚动回补 ${dates[dates.length-1]} 至 ${dates[0]}`).first<{id:number}>();
+  let found=0;let inserted=0;let failures=0;let sourceWarnings=0;const results:{date:string;found:number;inserted:number;warnings?:string[];error?:string}[]=[];
+  for(const date of [...dates].reverse()){try{const result=await ingestCninfo(env.DB,date);found+=result.found;inserted+=result.inserted;sourceWarnings+=result.warnings.length;results.push({date,...result});}catch(error){failures++;results.push({date,found:0,inserted:0,error:error instanceof Error?error.message:"sync failed"});}}
+  const nextCursor=failures?cursor:dates[dates.length-1];const finishedAt=new Date().toISOString();const firstError=results.find((result)=>result.error)?.error;
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('historical_backfill_cursor',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(nextCursor,finishedAt),
+    env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,failures=?,message=? WHERE id=?").bind(finishedAt,failures||sourceWarnings?"completed_with_errors":"completed",found,failures,`滚动回补 ${dates.length} 个交易日：发现 ${found} 条，新增 ${inserted} 条，失败 ${failures} 日，来源警告 ${sourceWarnings} 条${firstError?`；${firstError.slice(0,180)}`:""}`,run?.id),
+  ]);
+  return {ok:!failures,run_id:run?.id,dates:results,found,inserted,failures,sourceWarnings,cursor:nextCursor,firstError:firstError||null};
+}
+
+async function runMaintenanceCycle(env:Env,reason:string) {
+  const startedAt=new Date().toISOString();
+  try{const evidence=await runEvidenceBackfill(env,5);const history=await runHistoricalBackfillBatch(env,1);const processing=history.inserted?await processPendingQueue(env.DB,env.DOCUMENTS,5,env):null;const result={reason,evidence,history,processing,startedAt,finishedAt:new Date().toISOString()};await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('data_maintenance_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify(result),result.finishedAt).run();return result;}
+  catch(error){const result={reason,status:"failed",message:error instanceof Error?error.message:"maintenance failed",startedAt,finishedAt:new Date().toISOString()};await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('data_maintenance_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify(result),result.finishedAt).run();throw error;}
+}
+
 async function fetchCninfo(date: string) {
   const all: CninfoAnnouncement[] = [];
   const warnings: string[] = [];
@@ -777,6 +830,16 @@ async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext):Promi
   return {enabled:true,status:"started",targetDate,intervalMinutes,runId:run.id,lastTriggeredAt:startedAt};
 }
 
+async function maybeStartAutomaticMaintenance(env:Env,ctx:ExecutionContext) {
+  const enabled=env.AUTO_SYNC_ENABLED?.trim().toLowerCase()!=="false";if(!enabled)return {enabled:false,status:"disabled"};
+  const startedAt=new Date().toISOString();const lockCutoff=new Date(Date.now()-24*60*60*1000).toISOString();
+  const lock=await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('automatic_maintenance_trigger',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE pipeline_state.updated_at<=? RETURNING updated_at AS updatedAt").bind(JSON.stringify({reason:"public-health-check",status:"starting"}),startedAt,lockCutoff).first<{updatedAt:string}>();
+  if(!lock){const existing=await env.DB.prepare("SELECT updated_at AS updatedAt FROM pipeline_state WHERE key='automatic_maintenance_trigger'").first<{updatedAt:string}>();return {enabled:true,status:"fresh",lastTriggeredAt:existing?.updatedAt||null};}
+  await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('automatic_maintenance_trigger',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify({reason:"public-health-check",status:"running"}),startedAt).run();
+  ctx.waitUntil(runMaintenanceCycle(env,"automatic-daily-maintenance").catch(()=>undefined));
+  return {enabled:true,status:"started",lastTriggeredAt:startedAt};
+}
+
 const stripePlanPrices=(env:Env)=>({pro:env.STRIPE_PRICE_PRO_MONTHLY,team:env.STRIPE_PRICE_TEAM_MONTHLY,global:env.STRIPE_PRICE_GLOBAL_MONTHLY});
 const stripePlanFromPrice=(env:Env,priceId:string|null|undefined)=>Object.entries(stripePlanPrices(env)).find(([,id])=>id&&id===priceId)?.[0]||"free";
 const paidBillingStatuses=new Set(["active","trialing"]);
@@ -853,13 +916,14 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const session=await stripePost(env,"billing_portal/sessions",{customer:account.stripeCustomerId,return_url:`${url.origin}${input.locale==="en"?"/en/pricing":"/pricing"}`});return json({ok:true,url:session.url});
   }
   if (url.pathname === "/api/health") {
-    const [stats,quotaState,automaticSync] = await Promise.all([
+    const [stats,quotaState,automaticSync,automaticMaintenance] = await Promise.all([
       env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews, (SELECT COUNT(*) FROM announcement WHERE parse_status='ignored') ignored_announcements").first(),
       env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
       maybeStartAutomaticProduction(env,ctx),
+      maybeStartAutomaticMaintenance(env,ctx),
     ]);
     const quotaBlocked = Boolean(quotaState?.value && Date.parse(quotaState.value) > Date.now());
-    return json({ status: "ok", storage: { d1: true, r2: true }, automaticSync, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
+    return json({ status: "ok", storage: { d1: true, r2: true }, automaticSync, automaticMaintenance, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
@@ -897,31 +961,9 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     if(!viewerId(request))return json({error:"请先登录后运行历史回补"},{status:401});
     const input = await request.json<{days?:number}>().catch(() => ({}));
     const tradingDays = Math.min(Math.max(Number(input.days) || 5,1),7);
-    const [state,earliest,lastHistoricalRun] = await Promise.all([
-      env.DB.prepare("SELECT value FROM pipeline_state WHERE key='historical_backfill_cursor'").first<{value:string}>(),
-      env.DB.prepare("SELECT MIN(announce_date) AS date FROM announcement").first<{date:string}>(),
-      env.DB.prepare("SELECT status,failures,announcements_found AS found FROM sync_run WHERE source='historical-rolling-backfill' ORDER BY id DESC LIMIT 1").first<{status:string;failures:number;found:number}>(),
-    ]);
-    let cursor = state?.value || earliest?.date || shanghaiDate();
-    if (earliest?.date && cursor < earliest.date && lastHistoricalRun?.failures && !lastHistoricalRun.found) cursor = earliest.date;
-    const dates: string[] = [];
-    let candidate = addDays(cursor,-1);
-    while (dates.length < tradingDays) { if (isTradingDate(candidate)) dates.push(candidate); candidate = addDays(candidate,-1); }
-    const startedAt = new Date().toISOString();
-    const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("historical-rolling-backfill",startedAt,"running",`滚动回补 ${dates[dates.length-1]} 至 ${dates[0]}`).first<{id:number}>();
-    let found = 0; let inserted = 0; let failures = 0; let sourceWarnings = 0; const results: {date:string;found:number;inserted:number;warnings?:string[];error?:string}[] = [];
-    for (const date of [...dates].reverse()) {
-      try { const result = await ingestCninfo(env.DB,date); found += result.found; inserted += result.inserted; sourceWarnings += result.warnings.length; results.push({date,...result}); }
-      catch (error) { failures++; results.push({date,found:0,inserted:0,error:error instanceof Error ? error.message : "sync failed"}); }
-    }
-    const nextCursor = failures ? cursor : dates[dates.length - 1]; const finishedAt = new Date().toISOString();
-    const firstError = results.find((result) => result.error)?.error;
-    await env.DB.batch([
-      env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('historical_backfill_cursor',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(nextCursor,finishedAt),
-      env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,failures=?,message=? WHERE id=?").bind(finishedAt,failures || sourceWarnings ? "completed_with_errors" : "completed",found,failures,`滚动回补 ${dates.length} 个交易日：发现 ${found} 条，新增 ${inserted} 条，失败 ${failures} 日，来源警告 ${sourceWarnings} 条${firstError?`；${firstError.slice(0,180)}`:""}`,run?.id),
-    ]);
-    if (inserted) ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,20,env));
-    return json({ok:!failures,run_id:run?.id,dates:results,found,inserted,failures,sourceWarnings,cursor:nextCursor,firstError:firstError || null,auto_processing:Boolean(inserted)});
+    const result=await runHistoricalBackfillBatch(env,tradingDays);
+    if(result.inserted)ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,10,env));
+    return json({...result,auto_processing:Boolean(result.inserted)});
   }
   if (url.pathname === "/api/backfill-plan" && request.method === "POST") {
     if(!viewerId(request))return json({error:"请先登录后运行缺口回补"},{status:401});
@@ -1078,6 +1120,22 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_production",date,"started",JSON.stringify({runId:run.id}),viewer,startedAt).run();
     ctx.waitUntil(runDailyProductionCycle(env,date,run.id,viewer).catch(()=>undefined));
     return json({ok:true,accepted:true,runId:run.id,date,status:"running",scope:"后台同步、三所对账与解析已启动"},{status:202});
+  }
+  if(url.pathname==="/api/maintenance"&&request.method==="GET"){
+    const [state,candidates,latestEvidenceRun]=await Promise.all([
+      env.DB.prepare("SELECT value,updated_at AS updatedAt FROM pipeline_state WHERE key='data_maintenance_last'").first<{value:string;updatedAt:string}>(),
+      env.DB.prepare("SELECT COUNT(DISTINCT a.announcement_id) AS evidenceCandidates FROM announcement a JOIN pledge p ON p.announcement_id=a.announcement_id WHERE json_extract(p.evidence_json,'$.pageNumber') IS NULL AND (SELECT COUNT(*) FROM audit_log l WHERE l.entity_type='announcement' AND l.entity_id=a.announcement_id AND l.action='evidence_backfill_attempt')<2").first<{evidenceCandidates:number}>(),
+      env.DB.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,announcements_found AS announcementsFound,events_created AS eventsLocated,failures,message FROM sync_run WHERE source='evidence-backfill' ORDER BY id DESC LIMIT 1").first(),
+    ]);
+    return json({lastResult:state?JSON.parse(state.value):null,lastUpdatedAt:state?.updatedAt||null,candidates,latestEvidenceRun,scope:"每天最多处理5份PDF证据并向前回补1个交易日；单份证据失败最多自动尝试2次"});
+  }
+  if(url.pathname==="/api/maintenance"&&request.method==="POST"){
+    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后运行数据维护"},{status:401});
+    const active=await env.DB.prepare("SELECT id,source,started_at AS startedAt FROM sync_run WHERE source IN ('evidence-backfill','historical-rolling-backfill') AND status='running' ORDER BY id DESC LIMIT 1").first();
+    if(active)return json({error:"已有数据维护任务正在运行",active},{status:409});
+    const now=new Date().toISOString();await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('automatic_maintenance_trigger',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify({reason:"manual",status:"running",viewer}),now).run();
+    ctx.waitUntil(runMaintenanceCycle(env,"manual-quality-center").catch(()=>undefined));
+    return json({ok:true,accepted:true,status:"running",scope:"正在补齐PDF页码证据并向前回补1个交易日"},{status:202});
   }
   if (url.pathname === "/api/data-quality" && request.method === "GET") {
     const since = addDays(shanghaiDate(),-45);

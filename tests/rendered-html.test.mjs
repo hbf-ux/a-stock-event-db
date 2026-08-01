@@ -79,7 +79,7 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /rules-then-openai/);
   assert.match(worker, /maxAutomaticAttempts: 2/);
   assert.match(worker, /parseSectionPledgeRows/);
-  assert.match(worker, /failures \? cursor : dates\[dates\.length - 1\]/);
+  assert.match(worker, /const nextCursor=failures\?cursor:dates\[dates\.length-1\]/);
   assert.match(worker, /successfulQueries/);
   assert.match(worker, /sourceWarnings/);
   assert.match(worker, /openai_quota_blocked_until/);
@@ -88,6 +88,11 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /ai_reviewed/);
   assert.match(worker, /eventEvidence/);
   assert.match(worker, /mergePages:false/);
+  assert.match(worker, /backfillAnnouncementEvidence/);
+  assert.match(worker, /evidence_backfill_attempt/);
+  assert.match(worker, /runHistoricalBackfillBatch/);
+  assert.match(worker, /maybeStartAutomaticMaintenance/);
+  assert.match(worker, /\/api\/maintenance/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
   assert.match(layout, /A股股东融资风险即时情报与尽调报告/);
 });
@@ -143,6 +148,8 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(detail, /FIELD-LEVEL EVIDENCE/);
   assert.match(detail, /verificationStatus/);
   assert.match(quality, /VERIFICATION LADDER/);
+  assert.match(quality, /AUTOMATIC DATA MAINTENANCE/);
+  assert.match(quality, /证据回填只更新页码与字段定位/);
   assert.match(await readFile(new URL("drizzle/0012_curvy_cardiac.sql",root),"utf8"),/verification_status/);
   assert.match(capital, /融资活跃度，不是信用评分/);
   assert.match(capital, /事件差，不是存量质押/);
