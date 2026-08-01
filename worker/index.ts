@@ -103,6 +103,7 @@ async function ensureSchema(db: D1Database) {
       db.prepare("UPDATE review_queue SET status='pending',reviewed_at=NULL,reviewer=NULL,reason='严格数据校验未通过：实体、数量或比例需要复核' WHERE announcement_id=?").bind(id),
     ]);
   }
+  await db.prepare("DELETE FROM pledge WHERE id NOT IN (SELECT MIN(id) FROM pledge GROUP BY announcement_id,shareholder,pledgee,pledge_amount_text,pledge_ratio,total_ratio,type,announce_date)").run();
   const excludedTitleWhere = "title LIKE '%债券%质押式回购%' OR title LIKE '%质押式回购%债券%' OR title LIKE '%抵质押担保%' OR title LIKE '%知识产权质押%' OR title LIKE '%应收账款质押%' OR title LIKE '%拟签署%质押合同%'";
   const ignoredAt = new Date().toISOString();
   await db.batch([

@@ -63,5 +63,6 @@ test("rejects likely lost units and removes table-tail prefixes", () => {
   assert.deepEqual(row.missing,["质押数量"]);
   const institution = validateAndNormalizePledgeRow({shareholder:"新湖智脑",pledgee:"止中信银行股份有限公司",amount:11211080,amountText:"11,211,080 股",pledgeRatio:"99.96%",totalRatio:"1.20%",type:"新增质押",missing:[]});
   assert.equal(institution.pledgee,"中信银行股份有限公司");
+  assert.equal(validateAndNormalizePledgeRow({...institution,shareholder:"申请人等盛屯汇泽"}).shareholder,"盛屯汇泽");
   assert.deepEqual(institution.missing,[]);
 });

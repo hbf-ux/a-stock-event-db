@@ -28,6 +28,7 @@ const genericInstitutions = new Set(["有限公司","有限责任公司","股份
 
 export function normalizePledgeEntity(value: string, kind: "shareholder" | "pledgee") {
   let normalized = String(value || "").replace(/[\s\u00a0]+/g, "").replace(/^[，。；;：:、]+|[，。；;：:、]+$/g, "");
+  if (kind === "shareholder") normalized = normalized.replace(/^(?:申请人等|申请人|出质人)(?=[\u4e00-\u9fff（）()·]{2,})/,"");
   if (kind === "pledgee") {
     normalized = normalized.replace(/^为准[）)]/,"");
     if (/^[日止][\u4e00-\u9fff（）()·]{4,}/.test(normalized) && institutionSuffix.test(normalized.slice(1))) normalized = normalized.slice(1);
