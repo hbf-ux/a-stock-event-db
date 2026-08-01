@@ -1,0 +1,47 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+
+type QualityPayload={
+  score:number;grade:string;generatedAt:string;scope:string;
+  metrics:{parseRate:number;traceabilityRate:number;requiredFieldRate:number;freshnessHours:number|null;latencyMinutes:{averageMinutes?:number;maximumMinutes?:number;samples?:number}};
+  announcements:{total?:number;parsed?:number;review?:number;waiting?:number;ignored?:number;traceable?:number;archived?:number;stocks?:number;firstDate?:string;latestDate?:string;latestCrawlAt?:string};
+  events:{total?:number;announcements?:number;stocks?:number;requiredComplete?:number;withPledgeRatio?:number;withTotalRatio?:number;withStartDate?:number;withEndDate?:number;withPurpose?:number;firstDate?:string;latestDate?:string;latestParsedAt?:string};
+  daily:{date:string;announcements:number;parsed:number;review:number;ignored:number;events:number}[];
+  sources:{source:string;announcements:number;parsed:number;firstDate:string;latestDate:string}[];
+  parsers:{parserVersion:string;events:number;announcements:number;averageConfidence:number}[];
+  failures:{announcementId:string;stockCode:string;stockName:string;title:string;announceDate:string;parseStatus:string;parseAttempts:number;lastError?:string;pdfUrl?:string}[];
+  runs:{id:number;source:string;startedAt:string;finishedAt?:string;status:string;announcementsFound:number;eventsCreated:number;failures:number;message?:string}[];
+  gapCandidates:string[];crossSource:{status:string;note:string};
+};
+
+const percent=(value:number|undefined)=>`${Math.round((value||0)*100)}%`;
+const minutes=(value:number|undefined)=>value==null?"—":value<1?"<1 分钟":`${Math.round(value)} 分钟`;
+const statusName:Record<string,string>={parsed:"已解析",review:"待审核",archived:"待解析",queued:"排队中",pending:"待处理",ignored:"已过滤"};
+
+export default function QualityPage(){
+  const [payload,setPayload]=useState<QualityPayload|null>(null);
+  const [error,setError]=useState("");
+  useEffect(()=>{void fetch("/api/data-quality",{cache:"no-store"}).then(async(response)=>{const body=await response.json() as QualityPayload&{error?:string};if(!response.ok)throw new Error(body.error||"质量数据暂不可用");setPayload(body);}).catch(reason=>setError(reason instanceof Error?reason.message:"加载失败"));},[]);
+  const maxDaily=useMemo(()=>Math.max(1,...(payload?.daily||[]).map(row=>row.announcements)),[payload]);
+  const optional=[
+    ["占其持股比例",payload?.events.withPledgeRatio],
+    ["占总股本比例",payload?.events.withTotalRatio],
+    ["质押开始日",payload?.events.withStartDate],
+    ["质押到期日",payload?.events.withEndDate],
+    ["融资用途",payload?.events.withPurpose],
+  ] as const;
+  return <main className="publicIntelPage qualityPage"><header className="publicHeader"><a className="publicBrand" href="/"><span>质</span><b>质押雷达<small>A股股东融资风险情报</small></b></a><nav><a href="/">即时情报</a><a href="/brief">每日简报</a><a href="/capital">资方机会</a><button>数据可信度</button></nav></header><div className="publicWrap"><div className="publicBreadcrumb"><a href="/">首页</a><span>/</span><b>数据可信度</b></div>
+    {!payload&&!error?<div className="publicState">正在核对生产链路与字段完整性…</div>:error?<div className="publicState">{error}</div>:payload&&<>
+      <section className="qualityHero"><div><p className="eyebrow">DATA TRUST CENTER</p><h1>数据可信度中心</h1><p>公开展示当前数据库真实覆盖边界、解析完成度、字段缺口和生产异常；不把“已抓取范围”包装成“全市场完整率”。</p></div><aside className={payload.score>=90?"stable":payload.score>=75?"usable":"warning"}><span>生产质量评分</span><strong>{payload.score}</strong><b>{payload.grade}</b><small>{payload.scope}</small></aside></section>
+      <section className="qualityMetricStrip"><div><span>解析完成率</span><strong>{percent(payload.metrics.parseRate)}</strong><small>{payload.announcements.parsed||0}/{Math.max((payload.announcements.total||0)-(payload.announcements.ignored||0),0)} 份有效公告</small></div><div><span>公告可追溯率</span><strong>{percent(payload.metrics.traceabilityRate)}</strong><small>原文链接 + 文件哈希</small></div><div><span>必填字段完整率</span><strong>{percent(payload.metrics.requiredFieldRate)}</strong><small>{payload.events.requiredComplete||0}/{payload.events.total||0} 条事件</small></div><div><span>平均处理耗时</span><strong>{minutes(payload.metrics.latencyMinutes.averageMinutes)}</strong><small>{payload.metrics.latencyMinutes.samples||0} 份可计算样本</small></div><div><span>最近生产任务</span><strong>{payload.metrics.freshnessHours==null?"—":payload.metrics.freshnessHours<1?"1小时内":`${Math.round(payload.metrics.freshnessHours)} 小时前`}</strong><small>{new Date(payload.generatedAt).toLocaleString("zh-CN",{hour12:false})} 核算</small></div></section>
+      <div className="qualityMainGrid"><section className="publicPanel qualityCoverage"><div className="publicPanelHead"><div><h2>真实覆盖边界</h2><p>这里是数据库已有范围，不是全市场完成性声明</p></div><span>{payload.announcements.stocks||0} 只股票</span></div><div className="qualityCoverageRows"><div><span>公告覆盖</span><b>{payload.announcements.firstDate||"—"} 至 {payload.announcements.latestDate||"—"}</b><small>{payload.announcements.total||0} 份官方公告</small></div><div><span>结构化事件覆盖</span><b>{payload.events.firstDate||"—"} 至 {payload.events.latestDate||"—"}</b><small>{payload.events.total||0} 条质押事件</small></div><div><span>待解析 / 待审核</span><b className={(Number(payload.announcements.waiting||0)+Number(payload.announcements.review||0))?"warnValue":"safeValue"}>{payload.announcements.waiting||0} / {payload.announcements.review||0}</b><small>未进入正式研究数据</small></div><div><span>PDF 已归档</span><b>{payload.announcements.archived||0}</b><small>R2对象存储可供复核</small></div></div></section>
+      <section className="publicPanel qualitySource"><div className="publicPanelHead"><div><h2>来源与交叉核验</h2><p>只统计实际已经入库的数据源</p></div><span className={`qualitySourceState ${payload.crossSource.status}`}>{payload.crossSource.status==="single-primary-source"?"单一主源":"多来源已观察"}</span></div><div className="qualitySourceRows">{payload.sources.map(row=><div key={row.source}><b>{row.source}</b><span>{row.announcements} 份公告</span><small>{row.firstDate} 至 {row.latestDate} · 解析 {row.parsed}</small></div>)}</div><p className="publicDisclaimer">{payload.crossSource.note} 当前不能据此承诺无漏抓。</p></section></div>
+      <section className="publicPanel qualityTrend"><div className="publicPanelHead"><div><h2>最近45日生产日历</h2><p>蓝色为已抓取公告，绿色为已结构化事件</p></div><span>{payload.gapCandidates.length} 个工作日缺口候选</span></div><div className="qualityBars">{[...payload.daily].reverse().map(row=><div key={row.date} title={`${row.date}：公告 ${row.announcements}，事件 ${row.events}`}><i style={{height:`${Math.max(row.announcements/maxDaily*100,3)}%`}}></i><b style={{height:`${Math.max(row.events/maxDaily*100,row.events?3:0)}%`}}></b><span>{row.date.slice(5)}</span></div>)}</div>{payload.gapCandidates.length?<div className="qualityGaps"><b>缺口候选</b>{payload.gapCandidates.slice(0,12).map(date=><span key={date}>{date}</span>)}<small>工作日无公告不一定代表漏抓，节假日和零公告日需通过官方来源回补后确认。</small></div>:<p className="publicDisclaimer">最近31个自然日暂未发现普通工作日的空白日期候选。</p>}</section>
+      <div className="qualityMainGrid"><section className="publicPanel qualityFields"><div className="publicPanelHead"><div><h2>研究字段完整度</h2><p>必填字段通过不代表授信字段齐全</p></div></div><div className="qualityFieldRows">{optional.map(([label,value])=>{const rate=(payload.events.total||0)?Number(value||0)/Number(payload.events.total):0;return <div key={label}><span>{label}</span><i><b style={{width:`${rate*100}%`}}></b></i><strong>{percent(rate)}</strong></div>})}</div><p className="publicDisclaimer">开始日、到期日和用途经常不在标准表格中，需要继续增强PDF表格解析或人工复核。</p></section>
+      <section className="publicPanel qualityParsers"><div className="publicPanelHead"><div><h2>解析器版本</h2><p>每条事件保留解析版本与置信度</p></div></div><div className="qualityParserRows">{payload.parsers.map(row=><div key={row.parserVersion}><b>{row.parserVersion}</b><span>{row.events} 条事件</span><small>覆盖 {row.announcements} 份公告 · 平均置信度 {row.averageConfidence||0}%</small></div>)}{!payload.parsers.length&&<div className="publicState">暂无已解析事件</div>}</div></section></div>
+      <section className="publicPanel qualityFailures"><div className="publicPanelHead"><div><h2>当前质量缺口</h2><p>优先处理多次失败、待人工审核和字段不足公告</p></div><span>{payload.failures.length} 条待处置样本</span></div><div className="qualityFailureRows">{payload.failures.slice(0,12).map(row=><article key={row.announcementId}><time>{row.announceDate}</time><div><b>{row.stockName}<small>{row.stockCode}</small></b><p>{row.title}</p></div><span>{statusName[row.parseStatus]||row.parseStatus}</span><em>尝试 {row.parseAttempts||0} 次</em>{row.pdfUrl?<a href={row.pdfUrl} target="_blank" rel="noreferrer">官方原文 ↗</a>:<small>缺少原文链接</small>}</article>)}{!payload.failures.length&&<div className="publicState">当前没有待处置公告。</div>}</div></section>
+      <section className="qualityBoundary"><b>当前结论</b><p>系统已经能够持续抓取、解析和追溯质押公告，但“交易所交叉补漏”和“全历史回补完成性证明”仍未完成。下一步将在这里继续增加各交易所对账结果和历史回补进度。</p></section>
+    </>}
+    <footer className="publicFooter"><span>质量评分衡量当前生产链路，不构成全市场完整率、投资建议或授信结论。</span><span>质押雷达 · 数据可信度中心</span></footer></div></main>;
+}

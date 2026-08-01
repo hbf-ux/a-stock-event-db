@@ -629,6 +629,41 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     ]);
     return json({ announcements: announcement, events, listedStocks: stocks, pending, latestRun, generatedAt: new Date().toISOString(), scope: "已抓取官方公告范围，不代表全市场全历史完整度" });
   }
+  if (url.pathname === "/api/data-quality" && request.method === "GET") {
+    const since = addDays(shanghaiDate(),-45);
+    const [announcements,events,latency,daily,sources,parsers,failures,runs] = await Promise.all([
+      env.DB.prepare("SELECT COUNT(*) AS total,SUM(CASE WHEN parse_status='parsed' THEN 1 ELSE 0 END) AS parsed,SUM(CASE WHEN parse_status='review' THEN 1 ELSE 0 END) AS review,SUM(CASE WHEN parse_status IN ('queued','archived','pending') THEN 1 ELSE 0 END) AS waiting,SUM(CASE WHEN parse_status='ignored' THEN 1 ELSE 0 END) AS ignored,SUM(CASE WHEN pdf_url IS NOT NULL AND TRIM(pdf_url)!='' AND md5 IS NOT NULL AND TRIM(md5)!='' THEN 1 ELSE 0 END) AS traceable,SUM(CASE WHEN r2_key IS NOT NULL AND TRIM(r2_key)!='' THEN 1 ELSE 0 END) AS archived,COUNT(DISTINCT stock_code) AS stocks,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate,MAX(crawl_time) AS latestCrawlAt FROM announcement").first<Record<string,number|string|null>>(),
+      env.DB.prepare("SELECT COUNT(*) AS total,COUNT(DISTINCT announcement_id) AS announcements,COUNT(DISTINCT stock_code) AS stocks,SUM(CASE WHEN TRIM(stock_code)!='' AND TRIM(stock_name)!='' AND TRIM(shareholder)!='' AND TRIM(pledgee)!='' AND pledge_amount>0 AND TRIM(type)!='' AND TRIM(announce_date)!='' THEN 1 ELSE 0 END) AS requiredComplete,SUM(CASE WHEN pledge_ratio IS NOT NULL AND TRIM(pledge_ratio)!='' THEN 1 ELSE 0 END) AS withPledgeRatio,SUM(CASE WHEN total_ratio IS NOT NULL AND TRIM(total_ratio)!='' THEN 1 ELSE 0 END) AS withTotalRatio,SUM(CASE WHEN start_date IS NOT NULL AND TRIM(start_date)!='' THEN 1 ELSE 0 END) AS withStartDate,SUM(CASE WHEN end_date IS NOT NULL AND TRIM(end_date)!='' THEN 1 ELSE 0 END) AS withEndDate,SUM(CASE WHEN purpose IS NOT NULL AND TRIM(purpose)!='' THEN 1 ELSE 0 END) AS withPurpose,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate,MAX(parsed_at) AS latestParsedAt FROM pledge").first<Record<string,number|string|null>>(),
+      env.DB.prepare("SELECT AVG((julianday(p.parsedAt)-julianday(a.crawl_time))*1440.0) AS averageMinutes,MAX((julianday(p.parsedAt)-julianday(a.crawl_time))*1440.0) AS maximumMinutes,COUNT(*) AS samples FROM announcement a JOIN (SELECT announcement_id,MIN(parsed_at) AS parsedAt FROM pledge GROUP BY announcement_id) p ON p.announcement_id=a.announcement_id WHERE julianday(p.parsedAt)>=julianday(a.crawl_time)").first<Record<string,number|null>>(),
+      env.DB.prepare("SELECT a.date,a.announcements,a.parsed,a.review,a.ignored,COALESCE(p.events,0) AS events FROM (SELECT announce_date AS date,COUNT(*) AS announcements,SUM(CASE WHEN parse_status='parsed' THEN 1 ELSE 0 END) AS parsed,SUM(CASE WHEN parse_status='review' THEN 1 ELSE 0 END) AS review,SUM(CASE WHEN parse_status='ignored' THEN 1 ELSE 0 END) AS ignored FROM announcement WHERE announce_date>=? GROUP BY announce_date) a LEFT JOIN (SELECT announce_date AS date,COUNT(*) AS events FROM pledge WHERE announce_date>=? GROUP BY announce_date) p ON p.date=a.date ORDER BY a.date DESC").bind(since,since).all(),
+      env.DB.prepare("SELECT source,COUNT(*) AS announcements,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate,SUM(CASE WHEN parse_status='parsed' THEN 1 ELSE 0 END) AS parsed FROM announcement GROUP BY source ORDER BY announcements DESC").all(),
+      env.DB.prepare("SELECT parser_version AS parserVersion,COUNT(*) AS events,COUNT(DISTINCT announcement_id) AS announcements,ROUND(AVG(confidence)*100,1) AS averageConfidence FROM pledge GROUP BY parser_version ORDER BY events DESC").all(),
+      env.DB.prepare("SELECT announcement_id AS announcementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,parse_status AS parseStatus,parse_attempts AS parseAttempts,last_error AS lastError,pdf_url AS pdfUrl FROM announcement WHERE parse_status NOT IN ('parsed','ignored') OR last_error IS NOT NULL ORDER BY parse_attempts DESC,announce_date DESC LIMIT 30").all(),
+      env.DB.prepare("SELECT id,source,started_at AS startedAt,finished_at AS finishedAt,status,announcements_found AS announcementsFound,events_created AS eventsCreated,failures,message FROM sync_run ORDER BY id DESC LIMIT 12").all(),
+    ]);
+    const announcementStats = announcements || {};
+    const eventStats = events || {};
+    const eligible = Math.max(Number(announcementStats.total||0)-Number(announcementStats.ignored||0),0);
+    const parseRate = eligible ? Number(announcementStats.parsed||0)/eligible : 0;
+    const traceabilityRate = Number(announcementStats.total||0) ? Number(announcementStats.traceable||0)/Number(announcementStats.total) : 0;
+    const requiredFieldRate = Number(eventStats.total||0) ? Number(eventStats.requiredComplete||0)/Number(eventStats.total) : 0;
+    const latestRun = runs.results[0] as {startedAt?:string;finishedAt?:string}|undefined;
+    const latestRunAt = latestRun?.finishedAt || latestRun?.startedAt || null;
+    const freshnessHours = latestRunAt ? Math.max(0,(Date.now()-Date.parse(latestRunAt))/3600000) : null;
+    const freshnessFactor = freshnessHours==null ? 0 : freshnessHours<=30 ? 1 : freshnessHours<=54 ? .7 : freshnessHours<=78 ? .3 : 0;
+    const score = Math.round((parseRate*.4+traceabilityRate*.25+requiredFieldRate*.2+freshnessFactor*.15)*100);
+    const observedDates = new Set((daily.results as {date:string}[]).map((row)=>row.date));
+    const missingTradingDateCandidates:string[]=[];
+    for(let offset=0;offset<31;offset++){const date=addDays(shanghaiDate(),-offset);if(isTradingDate(date)&&!observedDates.has(date))missingTradingDateCandidates.push(date);}
+    return json({
+      score,grade:score>=90?"稳定":score>=75?"可用，仍需补齐":score>=60?"需重点复核":"尚未达到研究标准",
+      metrics:{parseRate,traceabilityRate,requiredFieldRate,freshnessHours,latencyMinutes:latency||{}},
+      announcements:announcementStats,events:eventStats,daily:daily.results,sources:sources.results,parsers:parsers.results,failures:failures.results,runs:runs.results,
+      gapCandidates:missingTradingDateCandidates,
+      crossSource:{status:sources.results.length>=2?"observed-multiple-sources":"single-primary-source",note:"当前只统计已入库来源；交易所交叉补漏尚未形成完成性证明。"},
+      generatedAt:new Date().toISOString(),scope:"生产质量评分，不等同于全市场历史覆盖率或数据正确率承诺",
+    });
+  }
   if (url.pathname === "/api/feed" && request.method === "GET") {
     const hours = Math.min(Math.max(Number(url.searchParams.get("hours")) || 24, 1), 168);
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);
