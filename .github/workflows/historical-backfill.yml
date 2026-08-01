@@ -1,0 +1,42 @@
+name: Rolling historical pledge backfill
+
+on:
+  schedule:
+    # Once per day at 23:20 China time. Each run moves the durable cursor
+    # backward by five trading days, even when no pledge announcement exists.
+    - cron: "20 15 * * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Trading days to extend backward (1-7)"
+        required: false
+        default: "5"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-event-historical-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Extend historical coverage
+        env:
+          SITE_URL: https://a-stock-event-db.h4883758.chatgpt.site
+          SITES_BYPASS_TOKEN: ${{ secrets.SITES_BYPASS_TOKEN }}
+          REQUESTED_DAYS: ${{ inputs.days }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SITES_BYPASS_TOKEN"
+          days="${REQUESTED_DAYS:-5}"
+          curl --fail-with-body --retry 3 --retry-all-errors \
+            -H "OAI-Sites-Authorization: Bearer $SITES_BYPASS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"days\":$days}" \
+            "$SITE_URL/api/backfill-extend"

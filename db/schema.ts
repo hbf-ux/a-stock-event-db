@@ -84,6 +84,12 @@ export const syncRuns = sqliteTable("sync_run", {
   message: text("message"),
 });
 
+export const pipelineState = sqliteTable("pipeline_state", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
 export const userWatchlist = sqliteTable("user_watchlist", {
   userId: text("user_id").notNull(),
   stockCode: text("stock_code").notNull(),

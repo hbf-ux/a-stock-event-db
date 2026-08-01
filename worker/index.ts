@@ -24,6 +24,7 @@ async function ensureSchema(db: D1Database) {
     `CREATE TABLE IF NOT EXISTS review_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, announcement_id TEXT NOT NULL, event_type TEXT NOT NULL, reason TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, reviewed_at TEXT, reviewer TEXT, resolution TEXT)`,
     `CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, before_json TEXT, after_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS sync_run (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, announcements_found INTEGER NOT NULL DEFAULT 0, events_created INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, message TEXT)`,
+    `CREATE TABLE IF NOT EXISTS pipeline_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS subscription_interest (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, plan TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'pricing-modal', created_at TEXT NOT NULL, UNIQUE(email, plan))`,
     `CREATE TABLE IF NOT EXISTS user_watchlist (user_id TEXT NOT NULL, stock_code TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (user_id, stock_code))`,
     `CREATE INDEX IF NOT EXISTS user_watchlist_user_idx ON user_watchlist (user_id)`,
@@ -95,6 +96,7 @@ const stripHtml = (value: string) => value.replace(/<[^>]+>/g, "").replaceAll("&
 const shanghaiDate = (offsetDays = 0) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(Date.now() + offsetDays * 86400000));
 const toDate = (timestamp: number) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(timestamp));
 const isTradingDate = (date: string) => { const day = new Date(`${date}T00:00:00Z`).getUTCDay(); return day !== 0 && day !== 6; };
+const addDays = (date: string, days: number) => { const value = new Date(`${date}T00:00:00Z`); value.setUTCDate(value.getUTCDate() + days); return value.toISOString().slice(0,10); };
 const hex = (buffer: ArrayBuffer) => [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
 const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve,milliseconds));
 async function fetchWithRetry(input: RequestInfo | URL, init?: RequestInit, attempts = 3) {
@@ -410,6 +412,37 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,failures=1,message=? WHERE id=?").bind(new Date().toISOString(),"failed",message,run?.id).run();
       return json({ ok:false,run_id:run?.id,error:message },{status:502});
     }
+  }
+  if (url.pathname === "/api/backfill-extend" && request.method === "GET") {
+    const [cursor, coverage] = await Promise.all([
+      env.DB.prepare("SELECT value,updated_at AS updatedAt FROM pipeline_state WHERE key='historical_backfill_cursor'").first(),
+      env.DB.prepare("SELECT MIN(announce_date) AS earliestDate,MAX(announce_date) AS latestDate,COUNT(*) AS announcements FROM announcement").first(),
+    ]);
+    return json({ cursor, coverage, generatedAt:new Date().toISOString(), scope:"每日向更早日期滚动回补；游标独立于是否发现公告" });
+  }
+  if (url.pathname === "/api/backfill-extend" && request.method === "POST") {
+    const input = await request.json<{days?:number}>().catch(() => ({}));
+    const tradingDays = Math.min(Math.max(Number(input.days) || 5,1),7);
+    const state = await env.DB.prepare("SELECT value FROM pipeline_state WHERE key='historical_backfill_cursor'").first<{value:string}>();
+    const earliest = await env.DB.prepare("SELECT MIN(announce_date) AS date FROM announcement").first<{date:string}>();
+    let cursor = state?.value || earliest?.date || shanghaiDate();
+    const dates: string[] = [];
+    let candidate = addDays(cursor,-1);
+    while (dates.length < tradingDays) { if (isTradingDate(candidate)) dates.push(candidate); candidate = addDays(candidate,-1); }
+    const startedAt = new Date().toISOString();
+    const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("historical-rolling-backfill",startedAt,"running",`滚动回补 ${dates[dates.length-1]} 至 ${dates[0]}`).first<{id:number}>();
+    let found = 0; let inserted = 0; let failures = 0; const results: {date:string;found:number;inserted:number;error?:string}[] = [];
+    for (const date of [...dates].reverse()) {
+      try { const result = await ingestCninfo(env.DB,date); found += result.found; inserted += result.inserted; results.push({date,...result}); }
+      catch (error) { failures++; results.push({date,found:0,inserted:0,error:error instanceof Error ? error.message : "sync failed"}); }
+    }
+    const nextCursor = dates[dates.length - 1]; const finishedAt = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('historical_backfill_cursor',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(nextCursor,finishedAt),
+      env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,failures=?,message=? WHERE id=?").bind(finishedAt,failures ? "completed_with_errors" : "completed",found,failures,`滚动回补 ${dates.length} 个交易日：发现 ${found} 条，新增 ${inserted} 条，失败 ${failures} 日`,run?.id),
+    ]);
+    ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,20,env));
+    return json({ok:true,run_id:run?.id,dates:results,found,inserted,failures,cursor:nextCursor,auto_processing:true});
   }
   if (url.pathname === "/api/backfill-plan" && request.method === "POST") {
     const input = await request.json<{start?:string;end?:string}>().catch(() => ({}));
