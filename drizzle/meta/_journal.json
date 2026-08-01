@@ -71,6 +71,13 @@
       "when": 1785571851249,
       "tag": "0009_blue_mongoose",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1785572504451,
+      "tag": "0010_lively_landau",
+      "breakpoints": true
     }
   ]
 }

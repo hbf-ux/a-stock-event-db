@@ -32,7 +32,7 @@ async function ensureSchema(db: D1Database) {
     `CREATE INDEX IF NOT EXISTS user_watchlist_user_idx ON user_watchlist (user_id)`,
     `CREATE TABLE IF NOT EXISTS shareholder_profile (stock_code TEXT NOT NULL, shareholder TEXT NOT NULL, identity_type TEXT NOT NULL DEFAULT '股东', is_controller INTEGER NOT NULL DEFAULT 0, is_controlling_shareholder INTEGER NOT NULL DEFAULT 0, holding_shares REAL, holding_ratio TEXT, source_title TEXT, source_url TEXT, source_date TEXT, confidence REAL NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY (stock_code, shareholder))`,
     `CREATE INDEX IF NOT EXISTS shareholder_profile_stock_idx ON shareholder_profile (stock_code)`,
-    `CREATE TABLE IF NOT EXISTS exchange_observation (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_announcement_id TEXT NOT NULL, stock_code TEXT NOT NULL, stock_name TEXT NOT NULL, title TEXT NOT NULL, announce_date TEXT NOT NULL, pdf_url TEXT, title_fingerprint TEXT NOT NULL, match_status TEXT NOT NULL DEFAULT 'unmatched', match_method TEXT, matched_announcement_id TEXT, raw_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(source,source_announcement_id))`,
+    `CREATE TABLE IF NOT EXISTS exchange_observation (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_announcement_id TEXT NOT NULL, stock_code TEXT NOT NULL, stock_name TEXT NOT NULL, title TEXT NOT NULL, announce_date TEXT NOT NULL, pdf_url TEXT, title_fingerprint TEXT NOT NULL, match_status TEXT NOT NULL DEFAULT 'unmatched', match_method TEXT, matched_announcement_id TEXT, review_status TEXT NOT NULL DEFAULT 'pending', reviewed_at TEXT, reviewed_by TEXT, review_note TEXT, raw_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(source,source_announcement_id))`,
     `CREATE INDEX IF NOT EXISTS exchange_observation_date_status_idx ON exchange_observation (announce_date,match_status)`,
     `CREATE INDEX IF NOT EXISTS exchange_observation_stock_date_idx ON exchange_observation (stock_code,announce_date)`,
     `CREATE TABLE IF NOT EXISTS match_request (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, organization TEXT NOT NULL, contact_name TEXT NOT NULL, email TEXT NOT NULL, stock_code TEXT, shareholder TEXT, amount_min REAL NOT NULL, amount_max REAL NOT NULL, term_months INTEGER, preference TEXT, purpose TEXT, notes TEXT, risk_snapshot TEXT, status TEXT NOT NULL DEFAULT 'new', viewer_id TEXT, request_fingerprint TEXT NOT NULL UNIQUE, consent_at TEXT NOT NULL, created_at TEXT NOT NULL)`,
@@ -60,6 +60,12 @@ async function ensureSchema(db: D1Database) {
   const matchCandidateNames = new Set(matchCandidateColumns.results.map((column) => column.name));
   if (!matchCandidateNames.has("capital_stage")) await db.prepare("ALTER TABLE match_candidate ADD COLUMN capital_stage TEXT NOT NULL DEFAULT 'reviewing'").run();
   if (!matchCandidateNames.has("financing_stage")) await db.prepare("ALTER TABLE match_candidate ADD COLUMN financing_stage TEXT NOT NULL DEFAULT 'reviewing'").run();
+  const observationColumns = await db.prepare("PRAGMA table_info(exchange_observation)").all<{name:string}>();
+  const observationNames = new Set(observationColumns.results.map((column) => column.name));
+  if (!observationNames.has("review_status")) await db.prepare("ALTER TABLE exchange_observation ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'").run();
+  if (!observationNames.has("reviewed_at")) await db.prepare("ALTER TABLE exchange_observation ADD COLUMN reviewed_at TEXT").run();
+  if (!observationNames.has("reviewed_by")) await db.prepare("ALTER TABLE exchange_observation ADD COLUMN reviewed_by TEXT").run();
+  if (!observationNames.has("review_note")) await db.prepare("ALTER TABLE exchange_observation ADD COLUMN review_note TEXT").run();
   const pledgeColumns = await db.prepare("PRAGMA table_info(pledge)").all<{name:string}>();
   if (!pledgeColumns.results.some((column) => column.name === "event_fingerprint")) {
     await db.batch([
@@ -592,6 +598,75 @@ async function runExchangeReconciliation(db:D1Database,date:string,sources:strin
   return {runId:run?.id,date,found,failures,results};
 }
 
+type ExchangeObservationRow = {
+  id:number;source:string;sourceAnnouncementId:string;stockCode:string;stockName:string;title:string;
+  announceDate:string;pdfUrl:string|null;titleFingerprint:string;matchStatus:string;reviewStatus:string;
+  matchedAnnouncementId:string|null;
+};
+
+const officialPdfHosts:Record<string,Set<string>> = {
+  "上交所": new Set(["www.sse.com.cn","static.sse.com.cn"]),
+  "深交所": new Set(["disc.static.szse.cn","www.szse.cn"]),
+  "北交所": new Set(["www.bse.cn"]),
+};
+
+function validatedOfficialPdfUrl(source:string,value:string|null) {
+  if(!value) throw new Error("该观察记录缺少交易所 PDF 地址");
+  const url=new URL(value);
+  const allowed=officialPdfHosts[source];
+  if(url.protocol!=="https:"||!allowed?.has(url.hostname)||!/\.pdf$/i.test(url.pathname)) throw new Error("PDF 地址未通过官方域名校验");
+  return url;
+}
+
+function exchangeDownloadHeaders(source:string) {
+  const referer=source==="上交所"?"https://www.sse.com.cn/disclosure/listedinfo/announcement/":source==="深交所"?"https://www.szse.cn/disclosure/listed/notice/index.html":"https://www.bse.cn/disclosure/announcement.html";
+  return {referer,"user-agent":"Mozilla/5.0 (compatible; PledgeRadar/1.0; official-disclosure-archive)"};
+}
+
+async function promoteExchangeObservation(db:D1Database,documents:R2Bucket,id:number,viewer:string) {
+  const row=await db.prepare("SELECT id,source,source_announcement_id AS sourceAnnouncementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,title_fingerprint AS titleFingerprint,match_status AS matchStatus,review_status AS reviewStatus,matched_announcement_id AS matchedAnnouncementId FROM exchange_observation WHERE id=?").bind(id).first<ExchangeObservationRow>();
+  if(!row) throw new Error("观察记录不存在");
+  if(row.reviewStatus==="promoted"&&row.matchedAnnouncementId) return {status:"promoted",announcementId:row.matchedAnnouncementId,idempotent:true};
+  if(row.reviewStatus!=="pending"||row.matchStatus!=="missing_primary") throw new Error("只有待确认的主库疑似缺失记录可以补入");
+
+  const candidates=await db.prepare("SELECT announcement_id AS announcementId,title,stock_name AS stockName FROM announcement WHERE stock_code=? AND announce_date=?").bind(row.stockCode,row.announceDate).all<{announcementId:string;title:string;stockName:string}>();
+  const normalized=normalizeAnnouncementTitle(row.title,row.stockName);
+  const existing=candidates.results.find((candidate)=>normalizeAnnouncementTitle(candidate.title,candidate.stockName)===normalized);
+  const now=new Date().toISOString();
+  if(existing){
+    await db.batch([
+      db.prepare("UPDATE exchange_observation SET match_status='exact',match_method='manual-recheck-normalized-title',matched_announcement_id=?,review_status='linked',reviewed_at=?,reviewed_by=?,review_note='补入前复核发现主库已有同一公告' WHERE id=?").bind(existing.announcementId,now,viewer,id),
+      db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("exchange_observation",String(id),"linked_existing",JSON.stringify({announcementId:existing.announcementId}),viewer,now),
+    ]);
+    return {status:"linked",announcementId:existing.announcementId};
+  }
+
+  const pdfUrl=validatedOfficialPdfUrl(row.source,row.pdfUrl);
+  const response=await fetchWithRetry(pdfUrl.toString(),{headers:exchangeDownloadHeaders(row.source)},2);
+  if(!response.ok) throw new Error(`交易所 PDF 下载失败：HTTP ${response.status}`);
+  const declaredSize=Number(response.headers.get("content-length")||0);
+  if(declaredSize>30*1024*1024) throw new Error("交易所 PDF 超过 30MB 安全上限");
+  const bytes=await response.arrayBuffer();
+  if(!bytes.byteLength||bytes.byteLength>30*1024*1024) throw new Error("交易所 PDF 文件为空或超过 30MB 安全上限");
+  const signature=new Uint8Array(bytes,0,Math.min(5,bytes.byteLength));
+  if(signature.length<5||signature[0]!==0x25||signature[1]!==0x50||signature[2]!==0x44||signature[3]!==0x46||signature[4]!==0x2d) throw new Error("交易所地址返回的内容不是有效 PDF");
+  const sha256=hex(await crypto.subtle.digest("SHA-256",bytes));
+  const sourceCode=row.source==="上交所"?"SSE":row.source==="深交所"?"SZSE":"BSE";
+  const identityFingerprint=hex(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(`${row.source}:${row.sourceAnnouncementId}`)));
+  const announcementId=`EX-${sourceCode}-${identityFingerprint.slice(0,20)}`;
+  const r2Key=`announcements/${announcementId}.pdf`;
+  await documents.put(r2Key,bytes,{httpMetadata:{contentType:"application/pdf"},customMetadata:{announcementId,sha256,officialSource:row.source,observationId:String(id)}});
+  const payload={stockCode:row.stockCode,stockName:row.stockName,title:row.title,pdfUrl:pdfUrl.toString(),exchangeObservationId:id,sha256};
+  await db.batch([
+    db.prepare("INSERT OR IGNORE INTO stock_info (code,name,exchange,status) VALUES (?,?,?,?)").bind(row.stockCode,row.stockName,row.source,"上市"),
+    db.prepare("INSERT INTO announcement (announcement_id,stock_code,stock_name,title,announce_date,pdf_url,r2_key,source,crawl_time,md5,sha256,parse_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(announcementId,row.stockCode,row.stockName,row.title,row.announceDate,pdfUrl.toString(),r2Key,row.source,now,sha256,sha256,"archived"),
+    db.prepare("INSERT INTO review_queue (announcement_id,event_type,reason,payload,status,created_at) VALUES (?,?,?,?,?,?)").bind(announcementId,"pledge","交易所差异公告已人工确认，等待结构化解析",JSON.stringify(payload),"pending",now),
+    db.prepare("UPDATE exchange_observation SET match_status='exact',match_method='manual-confirmed-official-pdf',matched_announcement_id=?,review_status='promoted',reviewed_at=?,reviewed_by=?,review_note='已归档交易所官方 PDF 并进入解析队列' WHERE id=?").bind(announcementId,now,viewer,id),
+    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("exchange_observation",String(id),"promote_official_announcement",JSON.stringify({announcementId,r2Key,sha256,size:bytes.byteLength,pdfUrl:pdfUrl.toString()}),viewer,now),
+  ]);
+  return {status:"promoted",announcementId,r2Key,sha256,size:bytes.byteLength};
+}
+
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   await ensureSchema(env.DB);
   const url = new URL(request.url);
@@ -719,8 +794,8 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const latest=await env.DB.prepare("SELECT MAX(announce_date) AS date FROM exchange_observation").first<{date:string}>();
     const date=requestedDate&&/^\d{4}-\d{2}-\d{2}$/.test(requestedDate)?requestedDate:latest?.date||shanghaiDate(-1);
     const [summary,rows,lastRun]=await Promise.all([
-      env.DB.prepare("SELECT source,COUNT(*) AS observed,SUM(CASE WHEN match_status='exact' THEN 1 ELSE 0 END) AS exact,SUM(CASE WHEN match_status='likely' THEN 1 ELSE 0 END) AS likely,SUM(CASE WHEN match_status='ambiguous' THEN 1 ELSE 0 END) AS ambiguous,SUM(CASE WHEN match_status='missing_primary' THEN 1 ELSE 0 END) AS missingPrimary,MAX(observed_at) AS observedAt FROM exchange_observation WHERE announce_date=? GROUP BY source ORDER BY source").bind(date).all(),
-      env.DB.prepare("SELECT id,source,source_announcement_id AS sourceAnnouncementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,match_status AS matchStatus,match_method AS matchMethod,matched_announcement_id AS matchedAnnouncementId,observed_at AS observedAt FROM exchange_observation WHERE announce_date=? ORDER BY CASE match_status WHEN 'missing_primary' THEN 0 WHEN 'ambiguous' THEN 1 WHEN 'likely' THEN 2 ELSE 3 END,source,stock_code LIMIT 300").bind(date).all(),
+      env.DB.prepare("SELECT source,COUNT(*) AS observed,SUM(CASE WHEN match_status='exact' THEN 1 ELSE 0 END) AS exact,SUM(CASE WHEN match_status='likely' THEN 1 ELSE 0 END) AS likely,SUM(CASE WHEN match_status='ambiguous' THEN 1 ELSE 0 END) AS ambiguous,SUM(CASE WHEN match_status='missing_primary' THEN 1 ELSE 0 END) AS missingPrimary,SUM(CASE WHEN match_status='missing_primary' AND review_status='pending' THEN 1 ELSE 0 END) AS pendingReview,SUM(CASE WHEN review_status='promoted' THEN 1 ELSE 0 END) AS promoted,SUM(CASE WHEN review_status='rejected' THEN 1 ELSE 0 END) AS rejected,MAX(observed_at) AS observedAt FROM exchange_observation WHERE announce_date=? GROUP BY source ORDER BY source").bind(date).all(),
+      env.DB.prepare("SELECT id,source,source_announcement_id AS sourceAnnouncementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,match_status AS matchStatus,match_method AS matchMethod,matched_announcement_id AS matchedAnnouncementId,review_status AS reviewStatus,reviewed_at AS reviewedAt,reviewed_by AS reviewedBy,review_note AS reviewNote,observed_at AS observedAt FROM exchange_observation WHERE announce_date=? ORDER BY CASE WHEN match_status='missing_primary' AND review_status='pending' THEN 0 WHEN match_status='ambiguous' THEN 1 WHEN match_status='likely' THEN 2 ELSE 3 END,source,stock_code LIMIT 300").bind(date).all(),
       env.DB.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,announcements_found AS announcementsFound,failures,message FROM sync_run WHERE source='exchange-reconciliation' ORDER BY id DESC LIMIT 1").first(),
     ]);
     return json({date,summary:summary.results,rows:rows.results,lastRun,capabilities:{sse:"支持指定日期",szse:"公开接口仅支持最近披露窗口",bse:"支持指定日期"},scope:"独立观察与差异识别；missing_primary 需人工确认后才能补入主公告库",generatedAt:new Date().toISOString()});
@@ -735,6 +810,37 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const result=await runExchangeReconciliation(env.DB,date,sources);
     await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("exchange_reconciliation",date,"run",JSON.stringify(result),viewer,new Date().toISOString()).run();
     return json({ok:true,...result,scope:"对账结果不会自动进入正式事件库"});
+  }
+  const reconciliationAction=url.pathname.match(/^\/api\/reconciliation\/observations\/(\d+)\/(promote|reject)$/);
+  if(reconciliationAction&&request.method==="POST"){
+    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后处理对账差异"},{status:401});
+    const id=Number(reconciliationAction[1]);const action=reconciliationAction[2];
+    try{
+      if(action==="promote"){
+        const result=await promoteExchangeObservation(env.DB,env.DOCUMENTS,id,viewer);
+        if(result.status==="promoted"&&!result.idempotent){
+          ctx.waitUntil(processAnnouncement(env.DB,env.DOCUMENTS,result.announcementId,env).catch(async(error)=>{
+            const message=error instanceof Error?error.message:"parse failed";
+            await env.DB.batch([
+              env.DB.prepare("UPDATE announcement SET last_error=?,parse_attempts=parse_attempts+1 WHERE announcement_id=?").bind(message,result.announcementId),
+              env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",result.announcementId,"background_parse_failed",JSON.stringify({message}),"worker",new Date().toISOString()),
+            ]);
+          }));
+        }
+        return json({ok:true,...result,autoProcessing:result.status==="promoted"});
+      }
+      const input=await request.json<{note?:string}>().catch(()=>({}));
+      const note=(input.note||"人工判定无需补入主库").trim().slice(0,300);
+      const row=await env.DB.prepare("SELECT id,match_status AS matchStatus,review_status AS reviewStatus FROM exchange_observation WHERE id=?").bind(id).first<{id:number;matchStatus:string;reviewStatus:string}>();
+      if(!row)return json({error:"观察记录不存在"},{status:404});
+      if(row.matchStatus!=="missing_primary"||row.reviewStatus!=="pending")return json({error:"该差异已经处理或不允许驳回"},{status:409});
+      const now=new Date().toISOString();
+      await env.DB.batch([
+        env.DB.prepare("UPDATE exchange_observation SET review_status='rejected',reviewed_at=?,reviewed_by=?,review_note=? WHERE id=?").bind(now,viewer,note,id),
+        env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("exchange_observation",String(id),"reject_missing_candidate",JSON.stringify({note}),viewer,now),
+      ]);
+      return json({ok:true,status:"rejected",id});
+    }catch(error){return json({error:error instanceof Error?error.message:"差异处理失败"},{status:409});}
   }
   if (url.pathname === "/api/data-quality" && request.method === "GET") {
     const since = addDays(shanghaiDate(),-45);

@@ -125,6 +125,10 @@ export const exchangeObservations = sqliteTable("exchange_observation", {
   matchStatus: text("match_status").notNull().default("unmatched"),
   matchMethod: text("match_method"),
   matchedAnnouncementId: text("matched_announcement_id"),
+  reviewStatus: text("review_status").notNull().default("pending"),
+  reviewedAt: text("reviewed_at"),
+  reviewedBy: text("reviewed_by"),
+  reviewNote: text("review_note"),
   rawJson: text("raw_json").notNull(),
   observedAt: text("observed_at").notNull(),
 }, (table) => [
