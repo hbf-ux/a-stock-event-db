@@ -76,6 +76,8 @@ function RiskSummaryPanel({ history, profiles }: { history: ProfileData["history
   const highRatio = history.filter((row) => Number((row.ratio || row.total || "").replace(/[^0-9.]/g, "")) >= 50).length;
   const pledgees = new Set(history.map((row) => row.pledgee).filter(Boolean)).size;
   const completeness = profiles.length ? Math.round((profiles.filter((row) => row.sourceTitle && (row.holdingRatio || row.holdingShares)).length / profiles.length) * 100) : 0;
+  const score = Math.min(100, supplemental * 18 + highRatio * 12 + Math.max(0, history.length - releases) * 2 + (profiles.length ? Math.max(0, 20 - completeness / 5) : 20));
+  const scoreLabel = score >= 65 ? "重点核查" : score >= 35 ? "持续观察" : "常规跟进";
   const signals = [
     ["历史事件", `${history.length} 条`, "已解析公告"],
     ["补充质押", `${supplemental} 次`, supplemental ? "需要重点核查" : "暂无补充信号"],
@@ -84,7 +86,7 @@ function RiskSummaryPanel({ history, profiles }: { history: ProfileData["history
     ["质权人数量", `${pledgees} 家`, "历史公告去重"],
     ["资料完整度", `${completeness}%`, profiles.length ? "基础资料来源覆盖" : "尚未录入基础资料"],
   ];
-  return <section className="riskSummaryPanel"><div className="riskSummaryHead"><div><p className="eyebrow">CREDIT RESEARCH SIGNALS</p><h3>授信风险摘要</h3></div><span className="tag extra">行为信号</span></div><div className="riskSummaryGrid">{signals.map(([label, value, note]) => <div key={label}><span>{label}</span><b className={label === "补充质押" && supplemental ? "riskValue" : label === "高比例信号" && highRatio ? "warnValue" : ""}>{value}</b><small>{note}</small></div>)}</div><p className="researchDisclaimer">摘要用于尽调排序，不等同于违约、信用或授信结论；存量质押仍需结合持股基数、解除记录和最新披露逐笔核对。</p></section>;
+  return <section className="riskSummaryPanel"><div className="riskSummaryHead"><div><p className="eyebrow">CREDIT RESEARCH SIGNALS</p><h3>授信风险摘要</h3></div><span className={`tag ${score >= 65 ? "new" : score >= 35 ? "extra" : "release"}`}>{scoreLabel}</span></div><div className="scoreCard"><strong>{score}</strong><span>/ 100</span><b>{scoreLabel}</b><small>基于已解析行为与资料完整度</small></div><div className="riskSummaryGrid">{signals.map(([label, value, note]) => <div key={label}><span>{label}</span><b className={label === "补充质押" && supplemental ? "riskValue" : label === "高比例信号" && highRatio ? "warnValue" : ""}>{value}</b><small>{note}</small></div>)}</div><p className="researchDisclaimer">评分用于尽调排序，不等同于违约、信用或授信结论；存量质押仍需结合持股基数、解除记录和最新披露逐笔核对。</p></section>;
 }
 
 function ControlRiskPanel() {
