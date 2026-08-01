@@ -213,6 +213,40 @@ function CoverageOverview({ coverage }: { coverage: CoverageData }) {
   return <section className="coverageOverview panel"><div className="panelHead"><div><h2>数据覆盖与完整性</h2><span>实时统计已抓取范围，不代表全市场全历史覆盖</span></div><span className="tag extra">官方公告范围</span></div><div className="coverageOverviewGrid"><div><span>公告起止日期</span><b>{announcements.firstDate || "—"} <i>至</i> {announcements.latestDate || "—"}</b><small>{announcements.total || 0} 条公告</small></div><div><span>结构化事件起止日期</span><b>{events.firstDate || "—"} <i>至</i> {events.latestDate || "—"}</b><small>{events.total || 0} 条质押事件</small></div><div><span>已覆盖股票</span><b>{announcements.stockCount || 0}</b><small>公告中出现的股票数量</small></div><div><span>待解析公告</span><b className={(coverage.pending?.total || 0) > 0 ? "warnValue" : "safeValue"}>{coverage.pending?.total || 0}</b><small>未纳入正式事件</small></div></div><p className="researchDisclaimer">覆盖率只反映当前数据库已抓取与已解析范围；如需全历史结论，仍需按股票回补公告并核对缺失日期。</p></section>;
 }
 
+function DataQualityPanel({ announcements, events, reviews, runs, onProcess, onReprocess, onReviews }: { announcements: AnnouncementRow[]; events: EventRow[]; reviews: ReviewRow[]; runs: SyncRun[]; onProcess: () => void; onReprocess: () => void; onReviews: () => void }) {
+  const total = announcements.length;
+  const traceable = total ? announcements.filter((row) => row.pdfUrl && (row.sha256 || row.md5)).length / total : 0;
+  const parsed = total ? Math.min(events.length / total, 1) : 0;
+  const pending = reviews.filter((row) => row.status === "pending").length;
+  const reviewHealth = total ? Math.max(0, 1 - pending / total) : 1;
+  const latestRun = runs.find((row) => row.finishedAt || row.startedAt);
+  const freshness = latestRun ? Math.max(0, 1 - (Date.now() - new Date(latestRun.finishedAt || latestRun.startedAt).getTime()) / (48 * 60 * 60 * 1000)) : 0;
+  const score = Math.round((traceable * 35 + parsed * 35 + reviewHealth * 20 + freshness * 10) * 100);
+  const label = score >= 85 ? "可直接研究" : score >= 65 ? "建议抽样核查" : "需要补齐数据";
+  return <section className="panel qualityPanel"><div className="panelHead"><div><h2>数据质量与生产链路</h2><span>把来源、解析、审核和更新及时性统一量化</span></div><div className="qualityHeadActions"><span className={`tag ${score >= 85 ? "release" : score >= 65 ? "extra" : "new"}`}>{label}</span><strong className="qualityScore">{score}<small>/100</small></strong></div></div><div className="qualityGrid"><div><span>来源可追溯</span><b>{Math.round(traceable * 100)}%</b><small>PDF + 哈希</small></div><div><span>结构化完成</span><b>{Math.round(parsed * 100)}%</b><small>{events.length}/{total || 0} 条</small></div><div><span>待人工审核</span><b className={pending ? "warnValue" : "safeValue"}>{pending}</b><small>可进入审核工作台</small></div><div><span>最近生产任务</span><b>{latestRun ? "已运行" : "暂无"}</b><small>{latestRun ? new Date(latestRun.finishedAt || latestRun.startedAt).toLocaleString("zh-CN", { hour12: false }) : "需要先同步"}</small></div></div><div className="qualityActions"><button className="secondary" onClick={onProcess}>重试待解析</button><button className="secondary" onClick={onReprocess}>重跑 OCR / 失败项</button><button className="secondary" onClick={onReviews}>打开人工审核</button></div><p className="researchDisclaimer">评分仅反映当前入库范围和生产状态，不代表全市场覆盖率；缺失历史会保留为待回补或待审核。</p></section>;
+}
+
+function InvestorWorkflowPanel({ events, announcements, onExport }: { events: EventRow[]; announcements: AnnouncementRow[]; onExport: () => void }) {
+  const high = events.filter((row) => Math.max(Number((row.ratio || "").replace(/[^0-9.]/g, "")), Number((row.total || "").replace(/[^0-9.]/g, ""))) >= 50).length;
+  const supplemental = events.filter((row) => row.type.includes("补充")).length;
+  const shareholders = new Map<string, number>();
+  const pledgees = new Map<string, number>();
+  events.forEach((row) => { shareholders.set(row.shareholder, (shareholders.get(row.shareholder) || 0) + 1); pledgees.set(row.pledgee, (pledgees.get(row.pledgee) || 0) + 1); });
+  const topShareholder = [...shareholders.entries()].sort((a, b) => b[1] - a[1])[0];
+  const topPledgee = [...pledgees.entries()].sort((a, b) => b[1] - a[1])[0];
+  const checklist = [{ label: "高比例质押事件", value: high, tone: high ? "riskValue" : "safeValue" }, { label: "补充质押事件", value: supplemental, tone: supplemental ? "warnValue" : "safeValue" }, { label: "重点股东重复融资", value: topShareholder?.[1] || 0, tone: topShareholder && topShareholder[1] > 2 ? "warnValue" : "safeValue" }, { label: "质权人集中关系", value: topPledgee?.[1] || 0, tone: topPledgee && topPledgee[1] > 3 ? "warnValue" : "safeValue" }];
+  return <section className="panel investorWorkflow"><div className="panelHead"><div><h2>资方尽调工作台</h2><span>把事件数据转成可执行的重点核查清单</span></div><button className="secondary" onClick={onExport}>导出核查清单</button></div><div className="workflowGrid">{checklist.map((item) => <div key={item.label}><span>{item.label}</span><b className={item.tone}>{item.value}</b><small>{item.value ? "建议查看原始公告与股东基础资料" : "当前没有触发信号"}</small></div>)}</div><div className="workflowNotes"><p><b>当前质权人集中度：</b>{topPledgee ? `${topPledgee[0]} 占 ${topPledgee[1]} 条已解析事件` : "暂无足够事件"}</p><p><b>当前重复融资股东：</b>{topShareholder ? `${topShareholder[0]} 涉及 ${topShareholder[1]} 条事件` : "暂无足够事件"}</p><small>建议顺序：先看高比例与补充质押，再核对股东身份、公告原文和历史解除记录。事件数量不等于当前存量质押。</small></div></section>;
+}
+
+function WorkspacePanel() {
+  const [email, setEmail] = useState("");
+  const [workspace, setWorkspace] = useState("个人研究空间");
+  const [saved, setSaved] = useState(false);
+  useEffect(() => { try { setEmail(window.localStorage.getItem("risk-workspace-email") || ""); setWorkspace(window.localStorage.getItem("risk-workspace-name") || "个人研究空间"); } catch {} }, []);
+  const save = () => { try { window.localStorage.setItem("risk-workspace-email", email); window.localStorage.setItem("risk-workspace-name", workspace); } catch {} setSaved(true); window.setTimeout(() => setSaved(false), 2500); };
+  return <section className="panel workspacePanel"><div className="panelHead"><div><h2>账户与工作空间</h2><span>先用个人空间开始，企业权限和订阅支付接口已预留</span></div><span className="tag extra">内测版</span></div><div className="workspaceForm"><label>联系邮箱<input type="email" placeholder="name@company.com" value={email} onChange={(event) => setEmail(event.target.value)} /></label><label>空间名称<input value={workspace} onChange={(event) => setWorkspace(event.target.value)} /></label><button className="primary" onClick={save}>{saved ? "已保存" : "保存空间设置"}</button></div><div className="workspaceMeta"><span>当前额度：免费研究版 · CSV 导出</span><span>专业版：Excel/JSON、团队席位、权限管理和订阅支付</span></div></section>;
+}
+
 function DashboardPanel({ stats, runs }: { stats: StatsData; runs: SyncRun[] }) {
   const maxDaily = Math.max(...stats.daily.map((row) => row.announcements),1);
   const maxPledgee = Math.max(...stats.pledgees.map((row) => row.value),1);
@@ -398,6 +432,13 @@ export default function Home() {
   const toggleWatch = async (stock: string) => { const adding = !watchlist.includes(stock); const next = adding ? [...watchlist, stock] : watchlist.filter((item) => item !== stock); setWatchlist(next); try { window.localStorage.setItem("stock-event-watchlist", JSON.stringify(next)); } catch {} if (watchlistSource === "cloud") { const response = await fetch("/api/watchlist", { method: adding ? "PUT" : "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ stock }) }); if (!response.ok) { setWatchlistSource("device"); flash("云端同步暂不可用，已保存在本设备"); return; } } flash(adding ? `已关注 ${stock}` : `已取消关注 ${stock}`); };
   const submitInterest = async () => { const response = await fetch("/api/subscribe-interest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: interestEmail, plan: "pro" }) }); const result = await response.json() as { ok?: boolean; error?: string; message?: string }; if (!response.ok) { flash(result.error || "提交失败"); return; } setInterestEmail(""); flash(result.message || "已登记"); };
 
+  const exportWorkflowChecklist = () => {
+    const high = events.filter((row) => Math.max(Number((row.ratio || "").replace(/[^0-9.]/g, "")), Number((row.total || "").replace(/[^0-9.]/g, ""))) >= 50);
+    const supplemental = events.filter((row) => row.type.includes("补充"));
+    const selected = [...high, ...supplemental].filter((row, index, list) => list.findIndex((item) => (item.announcementId || item.id) === (row.announcementId || row.id)) === index);
+    const csv = "\ufeff" + [["公告日期", "股票", "股东", "质权人", "事件类型", "质押数量", "比例", "重点核查"], ...selected.map((row) => [row.date, `${row.name}(${row.code})`, row.shareholder, row.pledgee, row.type, row.amount, row.ratio || row.total || "", high.includes(row) ? "高比例" : "补充质押"])].map((line) => line.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(",")).join("\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" })); const link = document.createElement("a"); link.href = url; link.download = `资方重点核查清单-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url); flash("重点核查清单已导出");
+  };
   const rawCount = health.stats?.announcements ?? announcements.length;
   const eventCount = health.stats?.events ?? events.length;
   const pendingCount = health.stats?.pending_reviews ?? announcements.filter((row) => row.parseStatus !== "parsed").length;
@@ -436,7 +477,7 @@ export default function Home() {
           <div className="pagination"><span>当前显示 {view === "announcements" ? filteredAnnouncements.length : filteredEvents.length} 条</span></div>
         </section>}
         <footer><span>数据仅供研究参考，不构成投资建议</span><span>公开披露 · 原文可溯 · D1 持久化</span></footer>
-        {view === "dashboard" && <><CoverageOverview coverage={coverage} /><BackfillPlanPanel /><StockCoveragePanel onProfile={(stock) => void openProfile(stock)} /></>}
+        {view === "dashboard" && <><CoverageOverview coverage={coverage} /><DataQualityPanel announcements={announcements} events={events} reviews={reviews} runs={syncRuns} onProcess={() => void processPending()} onReprocess={() => void reprocessReviews()} onReviews={() => setView("reviews")} /><InvestorWorkflowPanel events={events} announcements={announcements} onExport={exportWorkflowChecklist} /><BackfillPlanPanel /><StockCoveragePanel onProfile={(stock) => void openProfile(stock)} /><WorkspacePanel /></>}
         {(view === "dashboard" || view === "research") && <RiskLeaderboardPanel events={events} onProfile={(stock) => void openProfile(stock)} />}
       </div>
     </section>
