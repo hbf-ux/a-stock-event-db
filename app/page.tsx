@@ -19,7 +19,7 @@ const statusText: Record<string, string> = { queued: "待归档", archived: "待
 function ReviewPanel({ reviews, onOpen, onReprocess, reprocessing }: { reviews: ReviewRow[]; onOpen: (review: ReviewRow) => void; onReprocess: () => void; reprocessing: boolean }) {
   const pending = reviews.filter((row) => row.status === "pending");
   return <section className="panel reviewPanel">
-    <div className="panelHead"><div><h2>人工审核工作台</h2><span>自动解析缺失关键字段的公告将在这里等待补全</span></div><div className="panelHeadActions"><button className="secondary" disabled={reprocessing || pending.length === 0} onClick={onReprocess}>{reprocessing ? "重跑中…" : "↻ 重跑 OCR"}</button><span className="tag extra">{pending.length} 条待处理</span></div></div>
+    <div className="panelHead"><div><h2>人工审核工作台</h2><span>规则解析与 OpenAI 自动复核后仍缺失关键字段的公告将在这里等待补全</span></div><div className="panelHeadActions"><button className="secondary" disabled={reprocessing || pending.length === 0} onClick={onReprocess}>{reprocessing ? "复核中…" : "↻ OpenAI 复核"}</button><span className="tag extra">{pending.length} 条待处理</span></div></div>
     <div className="resultMeta">审核通过后写入结构化事件库；驳回记录保留完整审计轨迹</div>
     <div className="tableWrap"><table><thead><tr><th>公告日期</th><th>股票</th><th>公告标题</th><th>异常原因</th><th>状态</th><th></th></tr></thead><tbody>
       {reviews.map((row) => <tr key={row.id}><td className="mono">{row.announceDate}</td><td><b>{row.stockName}</b><small>{row.stockCode}</small></td><td title={row.title}>{row.title}</td><td title={row.reason}>{row.reason}</td><td><span className={`tag ${row.status === "pending" ? "extra" : row.status === "approved" ? "release" : "new"}`}>{row.status === "pending" ? "待审核" : row.status === "approved" ? "已通过" : "已驳回"}</span></td><td>{row.status === "pending" ? <button className="detail" onClick={() => onOpen(row)}>补全字段 ↗</button> : <span className="muted">已处理</span>}</td></tr>)}
@@ -223,7 +223,7 @@ function DataQualityPanel({ announcements, events, reviews, runs, onProcess, onR
   const freshness = latestRun ? Math.max(0, 1 - (Date.now() - new Date(latestRun.finishedAt || latestRun.startedAt).getTime()) / (48 * 60 * 60 * 1000)) : 0;
   const score = Math.round((traceable * 35 + parsed * 35 + reviewHealth * 20 + freshness * 10) * 100);
   const label = score >= 85 ? "可直接研究" : score >= 65 ? "建议抽样核查" : "需要补齐数据";
-  return <section className="panel qualityPanel"><div className="panelHead"><div><h2>数据质量与生产链路</h2><span>把来源、解析、审核和更新及时性统一量化</span></div><div className="qualityHeadActions"><span className={`tag ${score >= 85 ? "release" : score >= 65 ? "extra" : "new"}`}>{label}</span><strong className="qualityScore">{score}<small>/100</small></strong></div></div><div className="qualityGrid"><div><span>来源可追溯</span><b>{Math.round(traceable * 100)}%</b><small>PDF + 哈希</small></div><div><span>结构化完成</span><b>{Math.round(parsed * 100)}%</b><small>{events.length}/{total || 0} 条</small></div><div><span>待人工审核</span><b className={pending ? "warnValue" : "safeValue"}>{pending}</b><small>可进入审核工作台</small></div><div><span>最近生产任务</span><b>{latestRun ? "已运行" : "暂无"}</b><small>{latestRun ? new Date(latestRun.finishedAt || latestRun.startedAt).toLocaleString("zh-CN", { hour12: false }) : "需要先同步"}</small></div></div><div className="qualityActions"><button className="secondary" onClick={onProcess}>重试待解析</button><button className="secondary" onClick={onReprocess}>重跑 OCR / 失败项</button><button className="secondary" onClick={onReviews}>打开人工审核</button></div><p className="researchDisclaimer">评分仅反映当前入库范围和生产状态，不代表全市场覆盖率；缺失历史会保留为待回补或待审核。</p></section>;
+  return <section className="panel qualityPanel"><div className="panelHead"><div><h2>数据质量与生产链路</h2><span>把来源、解析、审核和更新及时性统一量化</span></div><div className="qualityHeadActions"><span className={`tag ${score >= 85 ? "release" : score >= 65 ? "extra" : "new"}`}>{label}</span><strong className="qualityScore">{score}<small>/100</small></strong></div></div><div className="qualityGrid"><div><span>来源可追溯</span><b>{Math.round(traceable * 100)}%</b><small>PDF + 哈希</small></div><div><span>结构化完成</span><b>{Math.round(parsed * 100)}%</b><small>{events.length}/{total || 0} 条</small></div><div><span>待人工审核</span><b className={pending ? "warnValue" : "safeValue"}>{pending}</b><small>可进入审核工作台</small></div><div><span>最近生产任务</span><b>{latestRun ? "已运行" : "暂无"}</b><small>{latestRun ? new Date(latestRun.finishedAt || latestRun.startedAt).toLocaleString("zh-CN", { hour12: false }) : "需要先同步"}</small></div></div><div className="qualityActions"><button className="secondary" onClick={onProcess}>重试待解析</button><button className="secondary" onClick={onReprocess}>OpenAI 自动复核</button><button className="secondary" onClick={onReviews}>打开人工审核</button></div><p className="researchDisclaimer">评分仅反映当前入库范围和生产状态，不代表全市场覆盖率；缺失历史会保留为待回补或待审核。</p></section>;
 }
 
 function InvestorWorkflowPanel({ events, announcements, onExport }: { events: EventRow[]; announcements: AnnouncementRow[]; onExport: () => void }) {
@@ -375,13 +375,13 @@ export default function Home() {
   const reprocessReviews = async () => {
     setReprocessing(true);
     try {
-      const response = await fetch("/api/reprocess-reviews", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 5 }) });
-      const result = await response.json() as { processed?: number; results?: { status?: string; ocr_error?: string }[]; error?: string };
+      const response = await fetch("/api/reprocess-reviews", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 5, force: true }) });
+      const result = await response.json() as { processed?: number; results?: { status?: string; openai_error?: string }[]; error?: string };
       if (!response.ok) throw new Error(result.error || "重跑失败");
       await loadAll();
-      const quota = result.results?.some((item) => item.ocr_error?.includes("credit_balance_exhausted"));
-      flash(quota ? "OCR 已重跑，但 OpenAI 账户余额不足；记录已保留在审核队列" : `OCR 重跑完成：${result.processed || 0} 条`);
-    } catch (error) { flash(error instanceof Error ? error.message : "OCR 重跑失败"); }
+      const quota = result.results?.some((item) => item.openai_error?.includes("credit_balance_exhausted") || item.openai_error?.includes("insufficient_quota"));
+      flash(quota ? "OpenAI 自动复核已运行，但账户余额不足；记录已保留在审核队列" : `OpenAI 自动复核完成：${result.processed || 0} 条`);
+    } catch (error) { flash(error instanceof Error ? error.message : "OpenAI 自动复核失败"); }
     finally { setReprocessing(false); }
   };
 

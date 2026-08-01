@@ -7,7 +7,7 @@ interface Env {
   DB: D1Database;
   DOCUMENTS: R2Bucket;
   IMAGES: { input(stream: ReadableStream): { transform(options: Record<string, unknown>): { output(options: { format: string; quality: number }): Promise<{ response(): Response }> } } };
-  /** Legacy fields retained for schema compatibility; V1-Lite never reads them. */
+  /** OpenAI is a targeted fallback for PDFs that deterministic rules cannot parse safely. */
   OPENAI_API_KEY?: string;
   OPENAI_OCR_MODEL?: string;
 }
@@ -218,22 +218,56 @@ function normalizeVisionRows(value: unknown, title: string): ParsedPledge[] {
 }
 
 const validateParsedRows = (rows: ParsedPledge[]) => rows.map((row) => {
-  const invalidPledgee = row.pledgee.length < 3 || /^(占其|占公司|质押数量|比例|本次|股东)/.test(row.pledgee);
-  const missing = [!row.shareholder && "股东", (!row.pledgee || invalidPledgee) && "质权人", !row.amount && "质押数量"].filter(Boolean);
+  const invalidShareholder = row.shareholder.length < 2 || /^(股东|名称|合计|本次|质押|融资|借款)$/.test(row.shareholder);
+  const invalidPledgee = row.pledgee.length < 3 || /^(占其|占公司|质押数量|比例|本次|股东|名称|合计)/.test(row.pledgee);
+  const invalidType = !["新增质押","补充质押","解除质押","解除后再质押"].includes(row.type);
+  const missing = [(!row.shareholder || invalidShareholder) && "股东", (!row.pledgee || invalidPledgee) && "质权人", (!row.amount || !Number.isFinite(row.amount) || row.amount <= 0) && "质押数量", invalidType && "事件类型"].filter(Boolean);
   return {...row,missing} as ParsedPledge;
 });
 
-async function parseWithOpenAI(pdfBase64: string, title: string, env: Env) {
-  if (!env.OPENAI_API_KEY) return [];
-  const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json" }, body:JSON.stringify({ model:env.OPENAI_OCR_MODEL || "gpt-5.6-luna", input:[{ role:"user", content:[{ type:"input_file", filename:"announcement.pdf", file_data:`data:application/pdf;base64,${pdfBase64}` },{ type:"input_text", text:`Extract every share pledge or release row from this A-share announcement titled ${title}. Return JSON only as {\"events\":[{\"shareholder\":\"\",\"pledgee\":\"\",\"pledge_amount\":\"\",\"pledge_ratio\":\"\",\"total_ratio\":\"\",\"start_date\":\"\",\"end_date\":\"\",\"purpose\":\"\",\"type\":\"新增质押|补充质押|解除质押|解除后再质押\"}]}. Never invent missing values.` }] }] }) });
+type OpenAIParseResult = { rows: ParsedPledge[]; model: string; responseId: string; usage: unknown };
+
+async function parseWithOpenAI(pdfBase64: string, context: { title:string; stockCode:string; stockName:string; announceDate:string }, env: Env): Promise<OpenAIParseResult> {
+  if (!env.OPENAI_API_KEY) return {rows:[],model:"",responseId:"",usage:null};
+  const model = env.OPENAI_OCR_MODEL || "gpt-5.6-luna";
+  const schema = {
+    type:"object", additionalProperties:false, required:["events"],
+    properties:{events:{type:"array",maxItems:50,items:{
+      type:"object", additionalProperties:false,
+      required:["shareholder","pledgee","pledge_amount","pledge_ratio","total_ratio","start_date","end_date","purpose","type"],
+      properties:{
+        shareholder:{type:"string"}, pledgee:{type:"string"}, pledge_amount:{type:"string"},
+        pledge_ratio:{type:"string"}, total_ratio:{type:"string"}, start_date:{type:"string"},
+        end_date:{type:"string"}, purpose:{type:"string"},
+        type:{type:"string",enum:["新增质押","补充质押","解除质押","解除后再质押"]},
+      },
+    }}},
+  };
+  const prompt = `你是A股股权质押公告的数据审核员。请逐页读取官方公告，只提取公告正文中明确披露的本次质押、补充质押、解除质押记录。\n股票：${context.stockCode} ${context.stockName}\n公告日期：${context.announceDate}\n标题：${context.title}\n要求：1）表格每一行对应一个事件，不合并不同股东、质权人或日期；2）股份数量保留公告原始单位和文本；3）比例、日期、用途没有披露时返回空字符串；4）股东、质权人或数量无法从公告确认时保留空字符串，严禁推测；5）不要把表头、合计行、说明文字识别为主体名称。`;
+  const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json" }, body:JSON.stringify({
+    model,
+    reasoning:{effort:"low"},
+    max_output_tokens:5000,
+    input:[{ role:"user", content:[
+      { type:"input_file", filename:`${context.stockCode}-${context.announceDate}.pdf`, file_data:`data:application/pdf;base64,${pdfBase64}` },
+      { type:"input_text", text:prompt },
+    ] }],
+    text:{format:{type:"json_schema",name:"a_share_pledge_events",strict:true,schema}},
+  }) });
   if (!response.ok) {
     const detail = (await response.text()).slice(0,500);
-    throw new Error(`OpenAI OCR failed: ${response.status}${detail ? ` ${detail}` : ""}`);
+    throw new Error(`OpenAI review failed: ${response.status}${detail ? ` ${detail}` : ""}`);
   }
   const payload = await response.json<Record<string, unknown>>();
   const outputText = String(payload.output_text || ((payload.output as Array<{content?:Array<{text?:string}>}> | undefined)?.flatMap((item) => item.content || []).map((item) => item.text || "").join("") || ""));
+  if (!outputText.trim()) throw new Error("OpenAI review returned no structured output");
   const jsonText = outputText.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
-  return normalizeVisionRows(JSON.parse(jsonText), title);
+  return {
+    rows:validateParsedRows(normalizeVisionRows(JSON.parse(jsonText),context.title)),
+    model:String(payload.model || model),
+    responseId:String(payload.id || ""),
+    usage:payload.usage || null,
+  };
 }
 
 async function fingerprint(id: string, row: ParsedPledge, index: number) {
@@ -281,8 +315,8 @@ async function legacyProcessAnnouncement(db: D1Database, documents: R2Bucket, id
   return { id, status: "parsed", event: parsed };
 }
 
-async function processAnnouncement(db: D1Database, documents: R2Bucket, id: string, env?: Env) {
-  const item = await db.prepare("SELECT announcement_id AS id,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,r2_key AS r2Key,sha256 FROM announcement WHERE announcement_id=?").bind(id).first<{id:string;stockCode:string;stockName:string;title:string;announceDate:string;pdfUrl:string;r2Key?:string;sha256?:string}>();
+async function processAnnouncement(db: D1Database, documents: R2Bucket, id: string, env?: Env, options: {forceOpenAI?:boolean} = {}) {
+  const item = await db.prepare("SELECT announcement_id AS id,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,r2_key AS r2Key,sha256,parse_attempts AS parseAttempts FROM announcement WHERE announcement_id=?").bind(id).first<{id:string;stockCode:string;stockName:string;title:string;announceDate:string;pdfUrl:string;r2Key?:string;sha256?:string;parseAttempts:number}>();
   if (!item) throw new Error("announcement not found");
   let bytes: ArrayBuffer; let r2Key = item.r2Key; let sha256 = item.sha256;
   if (r2Key) { const object = await documents.get(r2Key); if (!object) throw new Error("archived PDF not found"); bytes = await object.arrayBuffer(); }
@@ -295,18 +329,40 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   const pdf = await getDocumentProxy(new Uint8Array(bytes)); const extracted = await extractText(pdf,{mergePages:true});
   const text = Array.isArray(extracted.text) ? extracted.text.join("\n") : extracted.text;
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
-  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.1-lite"; let confidence = rows.length > 1 ? 0.88 : 0.82;
-  // V1-Lite is local-only: PDFs that do not yield complete deterministic rows
-  // stay in the manual review queue; no OCR/LLM request is ever made.
+  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.2"; let confidence = rows.length > 1 ? 0.88 : 0.82;
+  const localIncomplete = !rows.length || rows.some((row) => row.missing.length > 0);
+  let openaiMeta: {model:string;responseId:string;usage:unknown} | null = null;
+  let openaiError = "";
+  const openaiAllowed = Boolean(env?.OPENAI_API_KEY) && ((item.parseAttempts || 0) < 2 || options.forceOpenAI === true);
+  let openaiAttempted = false;
+  if (localIncomplete && openaiAllowed && env) {
+    openaiAttempted = true;
+    try {
+      const reviewed = await parseWithOpenAI(arrayBufferToBase64(bytes),{title:item.title,stockCode:item.stockCode,stockName:item.stockName,announceDate:item.announceDate},env);
+      if (reviewed.rows.length) {
+        rows = reviewed.rows;
+        parserVersion = `openai-${reviewed.model}-pledge-v1`;
+        confidence = 0.94;
+        openaiMeta = {model:reviewed.model,responseId:reviewed.responseId,usage:reviewed.usage};
+      }
+    } catch (error) {
+      openaiError = error instanceof Error ? error.message : "OpenAI review failed";
+    }
+  }
   const completeRows = rows.filter((row) => !row.missing.length); const parsed = rows[0]; const now = new Date().toISOString();
-  if (!completeRows.length) {
+  if (!completeRows.length || rows.some((row) => row.missing.length > 0)) {
     const missing = parsed?.missing || ["股东","质权人","质押数量"];
+    const reviewReason = openaiAttempted
+      ? `OpenAI 自动复核后仍缺少字段：${missing.join("、")}${openaiError ? `；${openaiError.slice(0,180)}` : ""}`
+      : env?.OPENAI_API_KEY
+        ? `自动复核已达到重试上限；仍缺少字段：${missing.join("、")}，请人工审核`
+        : `本地规则解析缺少字段：${missing.join("、")}；OpenAI 未配置，请人工审核`;
     await db.batch([
-      db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review',last_error=NULL WHERE announcement_id=?").bind(r2Key,sha256,id),
-      db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(`本地规则解析缺少字段：${missing.join("、")}；V1-Lite 未启用 OCR，请人工审核`,JSON.stringify({...parsed,candidates:rows,textKey:`announcements/${id}.txt`,ocrConfigured:false}),id),
-      db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"parse_review",JSON.stringify({missing,parserVersion,ocrConfigured:false}),"worker",now),
+      db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='review',last_error=?,parse_attempts=parse_attempts+? WHERE announcement_id=?").bind(r2Key,sha256,openaiError || null,openaiAttempted ? 1 : 0,id),
+      db.prepare("UPDATE review_queue SET reason=?,payload=? WHERE announcement_id=? AND status='pending'").bind(reviewReason,JSON.stringify({...parsed,candidates:rows,textKey:`announcements/${id}.txt`,openaiConfigured:Boolean(env?.OPENAI_API_KEY),openaiAttempted,openaiMeta,openaiError:openaiError || null}),id),
+      db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"parse_review",JSON.stringify({missing,parserVersion,openaiConfigured:Boolean(env?.OPENAI_API_KEY),openaiAttempted,openaiMeta,openaiError:openaiError || null}),openaiMeta ? "openai" : "worker",now),
     ]);
-    return {id,status:"review",missing,ocr_attempted:false};
+    return {id,status:"review",missing,openai_attempted:openaiAttempted,openai_error:openaiError || undefined};
   }
   const statements: D1PreparedStatement[] = [];
   for (let index = 0; index < completeRows.length; index++) {
@@ -314,9 +370,9 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
     statements.push(db.prepare("INSERT OR IGNORE INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id,item.stockCode,item.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,item.announceDate,confidence,parserVersion,now,eventFingerprint));
   }
   statements.push(
-    db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='parsed',last_error=NULL WHERE announcement_id=?").bind(r2Key,sha256,id),
-    db.prepare("UPDATE review_queue SET status='approved',reason='自动解析字段完整',reviewed_at=?,reviewer='worker',resolution=? WHERE announcement_id=? AND status='pending'").bind(now,JSON.stringify(completeRows),id),
-    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("pledge",id,"auto_parse",JSON.stringify({events:completeRows,eventCount:completeRows.length,parserVersion}),"worker",now),
+    db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='parsed',last_error=NULL,parse_attempts=0 WHERE announcement_id=?").bind(r2Key,sha256,id),
+    db.prepare("UPDATE review_queue SET status='approved',reason=?,reviewed_at=?,reviewer=?,resolution=? WHERE announcement_id=? AND status='pending'").bind(openaiMeta ? "OpenAI 自动复核通过" : "本地规则解析字段完整",now,openaiMeta ? "openai" : "worker",JSON.stringify({events:completeRows,parserVersion,openaiMeta}),id),
+    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("pledge",id,openaiMeta ? "openai_review" : "auto_parse",JSON.stringify({events:completeRows,eventCount:completeRows.length,parserVersion,openaiMeta}),openaiMeta ? "openai" : "worker",now),
   );
   await db.batch(statements);
   return {id,status:"parsed",events:completeRows,event_count:completeRows.length,parser_version:parserVersion};
@@ -387,7 +443,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   const url = new URL(request.url);
   if (url.pathname === "/api/health") {
     const stats = await env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews").first();
-    return json({ status: "ok", storage: { d1: true, r2: true }, ocr: { configured: false, mode: "disabled-v1-lite" }, stats, timestamp: new Date().toISOString() });
+    return json({ status: "ok", storage: { d1: true, r2: true }, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, maxAutomaticAttempts: 2 }, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
@@ -590,12 +646,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ ok:true,...await processPendingQueue(env.DB,env.DOCUMENTS,Number(input.limit) || 3,env) });
   }
   if (url.pathname === "/api/reprocess-reviews" && request.method === "POST") {
-    const input = await request.json<{limit?:number}>().catch(() => ({}));
+    const input = await request.json<{limit?:number;force?:boolean}>().catch(() => ({}));
     const limit = Math.min(Math.max(Number(input.limit) || 3,1),5);
     const pending = await env.DB.prepare("SELECT DISTINCT announcement_id AS id FROM review_queue WHERE status='pending' ORDER BY created_at ASC LIMIT ?").bind(limit).all<{id:string}>();
     const results: unknown[] = [];
     for (const row of pending.results) {
-      try { results.push(await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env)); }
+      try { results.push(await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env,{forceOpenAI:input.force === true})); }
       catch (error) { results.push({id:row.id,status:"failed",error:error instanceof Error ? error.message : "reprocess failed"}); }
     }
     return json({ok:true,requested:limit,processed:results.length,results});

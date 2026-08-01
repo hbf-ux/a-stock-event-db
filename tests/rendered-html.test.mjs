@@ -36,8 +36,11 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /ALTER TABLE announcement ADD COLUMN parse_attempts/);
   assert.match(worker, /\/api\/stats/);
   assert.match(worker, /\/api\/backfill/);
+  assert.match(worker, /https:\/\/api\.openai\.com\/v1\/responses/);
+  assert.match(worker, /rules-then-openai/);
+  assert.match(worker, /maxAutomaticAttempts: 2/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
-  assert.match(layout, /A股事件库/);
+  assert.match(layout, /A股质押风险监测/);
 });
 
 test("deployment bundle exists", async () => {
