@@ -29,6 +29,27 @@
       "when": 1785561006475,
       "tag": "0003_round_maverick",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1785568632551,
+      "tag": "0004_past_franklin_storm",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1785568663973,
+      "tag": "0005_free_harrier",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1785568944708,
+      "tag": "0006_round_argent",
+      "breakpoints": true
     }
   ]
 }

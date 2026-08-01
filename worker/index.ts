@@ -31,6 +31,10 @@ async function ensureSchema(db: D1Database) {
     `CREATE INDEX IF NOT EXISTS user_watchlist_user_idx ON user_watchlist (user_id)`,
     `CREATE TABLE IF NOT EXISTS shareholder_profile (stock_code TEXT NOT NULL, shareholder TEXT NOT NULL, identity_type TEXT NOT NULL DEFAULT '股东', is_controller INTEGER NOT NULL DEFAULT 0, is_controlling_shareholder INTEGER NOT NULL DEFAULT 0, holding_shares REAL, holding_ratio TEXT, source_title TEXT, source_url TEXT, source_date TEXT, confidence REAL NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY (stock_code, shareholder))`,
     `CREATE INDEX IF NOT EXISTS shareholder_profile_stock_idx ON shareholder_profile (stock_code)`,
+    `CREATE TABLE IF NOT EXISTS match_request (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, organization TEXT NOT NULL, contact_name TEXT NOT NULL, email TEXT NOT NULL, stock_code TEXT, shareholder TEXT, amount_min REAL NOT NULL, amount_max REAL NOT NULL, term_months INTEGER, preference TEXT, purpose TEXT, notes TEXT, risk_snapshot TEXT, status TEXT NOT NULL DEFAULT 'new', viewer_id TEXT, request_fingerprint TEXT NOT NULL UNIQUE, consent_at TEXT NOT NULL, created_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS match_request_role_status_idx ON match_request (role,status)`,
+    `CREATE INDEX IF NOT EXISTS match_request_created_idx ON match_request (created_at)`,
+    `CREATE INDEX IF NOT EXISTS match_request_email_created_idx ON match_request (email,created_at)`,
     `CREATE INDEX IF NOT EXISTS pledge_date_idx ON pledge (announce_date)`,
     `CREATE INDEX IF NOT EXISTS pledge_stock_idx ON pledge (stock_code)`,
     `CREATE INDEX IF NOT EXISTS pledge_shareholder_idx ON pledge (shareholder)`,
@@ -693,6 +697,55 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     if (!["pro", "enterprise"].includes(plan)) return json({ error: "无效套餐" }, { status: 400 });
     await env.DB.prepare("INSERT OR IGNORE INTO subscription_interest (email,plan,source,created_at) VALUES (?,?,?,?)").bind(email,plan,"pricing-modal",new Date().toISOString()).run();
     return json({ ok: true, message: "已登记，我们会在产品开放订阅后联系你" });
+  }
+  if (url.pathname === "/api/match-market" && request.method === "GET") {
+    const [roles,total] = await Promise.all([
+      env.DB.prepare("SELECT role,COUNT(*) AS count FROM match_request WHERE status IN ('new','active','matched') GROUP BY role").all(),
+      env.DB.prepare("SELECT COUNT(*) AS total,MAX(created_at) AS latestAt FROM match_request WHERE status IN ('new','active','matched')").first(),
+    ]);
+    return json({ data:{ roles:roles.results,total },privacy:"仅返回匿名汇总，不公开联系人、融资主体或资金方信息",generatedAt:new Date().toISOString() });
+  }
+  if (url.pathname === "/api/match-requests" && request.method === "POST") {
+    type MatchInput = { role?:string;organization?:string;contactName?:string;email?:string;stockCode?:string;shareholder?:string;amountMin?:number;amountMax?:number;termMonths?:number;preference?:string;purpose?:string;notes?:string;consent?:boolean };
+    const input = await request.json<MatchInput>().catch(() => ({}));
+    const role = String(input.role || "").trim();
+    const organization = String(input.organization || "").trim();
+    const contactName = String(input.contactName || "").trim();
+    const email = String(input.email || request.headers.get("oai-authenticated-user-email") || "").trim().toLowerCase();
+    const stockCode = String(input.stockCode || "").trim();
+    const shareholder = String(input.shareholder || "").trim();
+    const amountMin = Number(input.amountMin) * 10000;
+    const amountMax = Number(input.amountMax) * 10000;
+    const termMonths = input.termMonths == null ? null : Math.round(Number(input.termMonths));
+    const preference = String(input.preference || "").trim();
+    const purpose = String(input.purpose || "").trim();
+    const notes = String(input.notes || "").trim();
+    if (!['capital','financing','advisor'].includes(role)) return json({error:"请选择正确的身份"},{status:400});
+    if (!organization || organization.length>120 || !contactName || contactName.length>60) return json({error:"请填写机构和联系人"},{status:400});
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length>160) return json({error:"请填写有效联系邮箱"},{status:400});
+    if (!Number.isFinite(amountMin) || !Number.isFinite(amountMax) || amountMin<=0 || amountMax<amountMin || amountMax>100000000000) return json({error:"请填写有效金额范围"},{status:400});
+    if (termMonths != null && (!Number.isFinite(termMonths) || termMonths<1 || termMonths>120)) return json({error:"期限应为 1 至 120 个月"},{status:400});
+    if ((role==='financing'||role==='advisor') && !/^\d{6}$/.test(stockCode)) return json({error:"融资需求必须填写六位股票代码"},{status:400});
+    if ((role==='financing'||role==='advisor') && (!shareholder || shareholder.length>120)) return json({error:"请填写融资股东名称"},{status:400});
+    if (!input.consent) return json({error:"提交前需同意隐私与人工撮合说明"},{status:400});
+    if (preference.length>300 || purpose.length>200 || notes.length>1000) return json({error:"补充说明过长"},{status:400});
+    const recentSubmissions = await env.DB.prepare("SELECT COUNT(*) AS count FROM match_request WHERE email=? AND created_at>=datetime('now','-1 day')").bind(email).first<{count:number}>();
+    if ((recentSubmissions?.count || 0) >= 5) return json({error:"今日提交次数已达上限，请稍后再试"},{status:429});
+    let riskSnapshot:string|null = null;
+    if (stockCode) {
+      const conditions = shareholder ? "stock_code=? AND shareholder=?" : "stock_code=?";
+      const bindings = shareholder ? [stockCode,shareholder] : [stockCode];
+      const snapshot = await env.DB.prepare(`SELECT COUNT(*) AS events,SUM(CASE WHEN type LIKE '%补充%' THEN 1 ELSE 0 END) AS supplemental,SUM(CASE WHEN type LIKE '%解除%' THEN 1 ELSE 0 END) AS releases,COUNT(DISTINCT pledgee) AS pledgees,MIN(announce_date) AS firstDate,MAX(announce_date) AS latestDate FROM pledge WHERE ${conditions}`).bind(...bindings).first();
+      riskSnapshot = JSON.stringify({ stockCode,shareholder:shareholder || null,officialEventSummary:snapshot || null,generatedAt:new Date().toISOString(),limitation:"仅基于当前已解析官方公告，不代表当前存量质押或授信结论" });
+    }
+    const now = new Date().toISOString();
+    const viewer = viewerId(request);
+    const fingerprintSource = [role,email,organization,stockCode,shareholder,amountMin,amountMax,shanghaiDate()].join("|").toLowerCase();
+    const requestFingerprint = hex(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(fingerprintSource)));
+    await env.DB.prepare("INSERT OR IGNORE INTO match_request (role,organization,contact_name,email,stock_code,shareholder,amount_min,amount_max,term_months,preference,purpose,notes,risk_snapshot,status,viewer_id,request_fingerprint,consent_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,?,?,?)").bind(role,organization,contactName,email,stockCode||null,shareholder||null,amountMin,amountMax,termMonths,preference||null,purpose||null,notes||null,riskSnapshot,viewer,requestFingerprint,now,now).run();
+    const saved = await env.DB.prepare("SELECT id,status,created_at AS createdAt FROM match_request WHERE request_fingerprint=?").bind(requestFingerprint).first<{id:number;status:string;createdAt:string}>();
+    if (saved) await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("match_request",String(saved.id),"submitted",JSON.stringify({role,stockCode:stockCode||null,shareholder:shareholder||null,amountMin,amountMax,status:saved.status}),viewer||"public-form",now).run();
+    return json({ok:true,requestId:saved?.id,status:saved?.status||"new",message:"需求已进入人工核验队列；联系方式不会公开，双方确认后再安排对接",riskContextAttached:Boolean(riskSnapshot)});
   }
   if (url.pathname === "/api/events" && request.method === "GET") {
     const conditions: string[] = []; const values: string[] = [];

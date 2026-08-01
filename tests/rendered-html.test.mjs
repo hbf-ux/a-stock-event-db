@@ -39,6 +39,9 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /\/api\/backfill/);
   assert.match(worker, /\/api\/capital-signals/);
   assert.match(worker, /eventGap:"质押类事件数量减解除类事件数量/);
+  assert.match(worker, /\/api\/match-requests/);
+  assert.match(worker, /双方确认后再安排对接/);
+  assert.match(worker, /requestFingerprint/);
   assert.match(worker, /https:\/\/api\.openai\.com\/v1\/responses/);
   assert.match(worker, /rules-then-openai/);
   assert.match(worker, /maxAutomaticAttempts: 2/);
@@ -54,7 +57,7 @@ test("deployment bundle exists", async () => {
 });
 
 test("commercial intelligence pages are wired to verified event data", async () => {
-  const [detail, company, shareholder, pledgee, event, capital, brief] = await Promise.all([
+  const [detail, company, shareholder, pledgee, event, capital, brief, match, migration] = await Promise.all([
     readFile(new URL("app/intelligence-detail.tsx", root), "utf8"),
     readFile(new URL("app/company/[code]/page.tsx", root), "utf8"),
     readFile(new URL("app/shareholder/[name]/page.tsx", root), "utf8"),
@@ -62,6 +65,8 @@ test("commercial intelligence pages are wired to verified event data", async () 
     readFile(new URL("app/event/[id]/page.tsx", root), "utf8"),
     readFile(new URL("app/capital/page.tsx", root), "utf8"),
     readFile(new URL("app/brief/page.tsx", root), "utf8"),
+    readFile(new URL("app/match/page.tsx", root), "utf8"),
+    readFile(new URL("drizzle/0004_past_franklin_storm.sql", root), "utf8"),
   ]);
   assert.match(detail, /质押事件时间线/);
   assert.match(detail, /完整股东融资风控报告/);
@@ -75,4 +80,8 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(capital, /事件差，不是存量质押/);
   assert.match(brief, /A股质押情报简报/);
   assert.match(brief, /打印简报/);
+  assert.match(match, /让真实融资需求与真实资金偏好相遇/);
+  assert.match(match, /联系方式不会公开/);
+  assert.match(match, /不承诺融资结果/);
+  assert.match(migration, /CREATE TABLE `match_request`/);
 });

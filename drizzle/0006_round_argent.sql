@@ -1,0 +1,1 @@
+CREATE INDEX `match_request_email_created_idx` ON `match_request` (`email`,`created_at`);

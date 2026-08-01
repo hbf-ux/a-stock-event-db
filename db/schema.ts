@@ -1,4 +1,4 @@
-import { integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const stockInfo = sqliteTable("stock_info", {
   code: text("code").primaryKey(),
@@ -111,3 +111,30 @@ export const shareholderProfiles = sqliteTable("shareholder_profile", {
   updatedAt: text("updated_at").notNull(),
   updatedBy: text("updated_by").notNull(),
 }, (table) => [primaryKey({ columns: [table.stockCode, table.shareholder] })]);
+
+export const matchRequests = sqliteTable("match_request", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  role: text("role").notNull(),
+  organization: text("organization").notNull(),
+  contactName: text("contact_name").notNull(),
+  email: text("email").notNull(),
+  stockCode: text("stock_code"),
+  shareholder: text("shareholder"),
+  amountMin: real("amount_min").notNull(),
+  amountMax: real("amount_max").notNull(),
+  termMonths: integer("term_months"),
+  preference: text("preference"),
+  purpose: text("purpose"),
+  notes: text("notes"),
+  riskSnapshot: text("risk_snapshot"),
+  status: text("status").notNull().default("new"),
+  viewerId: text("viewer_id"),
+  requestFingerprint: text("request_fingerprint").notNull(),
+  consentAt: text("consent_at").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  uniqueIndex("match_request_fingerprint_uq").on(table.requestFingerprint),
+  index("match_request_role_status_idx").on(table.role, table.status),
+  index("match_request_created_idx").on(table.createdAt),
+  index("match_request_email_created_idx").on(table.email, table.createdAt),
+]);
