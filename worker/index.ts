@@ -823,9 +823,13 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     if(!viewerId(request))return json({error:"请先登录后运行历史回补"},{status:401});
     const input = await request.json<{days?:number}>().catch(() => ({}));
     const tradingDays = Math.min(Math.max(Number(input.days) || 5,1),7);
-    const state = await env.DB.prepare("SELECT value FROM pipeline_state WHERE key='historical_backfill_cursor'").first<{value:string}>();
-    const earliest = await env.DB.prepare("SELECT MIN(announce_date) AS date FROM announcement").first<{date:string}>();
+    const [state,earliest,lastHistoricalRun] = await Promise.all([
+      env.DB.prepare("SELECT value FROM pipeline_state WHERE key='historical_backfill_cursor'").first<{value:string}>(),
+      env.DB.prepare("SELECT MIN(announce_date) AS date FROM announcement").first<{date:string}>(),
+      env.DB.prepare("SELECT status,failures,announcements_found AS found FROM sync_run WHERE source='historical-rolling-backfill' ORDER BY id DESC LIMIT 1").first<{status:string;failures:number;found:number}>(),
+    ]);
     let cursor = state?.value || earliest?.date || shanghaiDate();
+    if (earliest?.date && cursor < earliest.date && lastHistoricalRun?.failures && !lastHistoricalRun.found) cursor = earliest.date;
     const dates: string[] = [];
     let candidate = addDays(cursor,-1);
     while (dates.length < tradingDays) { if (isTradingDate(candidate)) dates.push(candidate); candidate = addDays(candidate,-1); }
@@ -836,13 +840,14 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       try { const result = await ingestCninfo(env.DB,date); found += result.found; inserted += result.inserted; results.push({date,...result}); }
       catch (error) { failures++; results.push({date,found:0,inserted:0,error:error instanceof Error ? error.message : "sync failed"}); }
     }
-    const nextCursor = dates[dates.length - 1]; const finishedAt = new Date().toISOString();
+    const nextCursor = failures ? cursor : dates[dates.length - 1]; const finishedAt = new Date().toISOString();
+    const firstError = results.find((result) => result.error)?.error;
     await env.DB.batch([
       env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('historical_backfill_cursor',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(nextCursor,finishedAt),
-      env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,failures=?,message=? WHERE id=?").bind(finishedAt,failures ? "completed_with_errors" : "completed",found,failures,`滚动回补 ${dates.length} 个交易日：发现 ${found} 条，新增 ${inserted} 条，失败 ${failures} 日`,run?.id),
+      env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,failures=?,message=? WHERE id=?").bind(finishedAt,failures ? "completed_with_errors" : "completed",found,failures,`滚动回补 ${dates.length} 个交易日：发现 ${found} 条，新增 ${inserted} 条，失败 ${failures} 日${firstError?`；${firstError.slice(0,180)}`:""}`,run?.id),
     ]);
-    ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,20,env));
-    return json({ok:true,run_id:run?.id,dates:results,found,inserted,failures,cursor:nextCursor,auto_processing:true});
+    if (inserted) ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,20,env));
+    return json({ok:!failures,run_id:run?.id,dates:results,found,inserted,failures,cursor:nextCursor,firstError:firstError || null,auto_processing:Boolean(inserted)});
   }
   if (url.pathname === "/api/backfill-plan" && request.method === "POST") {
     if(!viewerId(request))return json({error:"请先登录后运行缺口回补"},{status:401});
