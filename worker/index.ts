@@ -126,6 +126,7 @@ const shanghaiDate = (offsetDays = 0) => new Intl.DateTimeFormat("en-CA", { time
 const toDate = (timestamp: number) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(timestamp));
 const isTradingDate = (date: string) => { const day = new Date(`${date}T00:00:00Z`).getUTCDay(); return day !== 0 && day !== 6; };
 const addDays = (date: string, days: number) => { const value = new Date(`${date}T00:00:00Z`); value.setUTCDate(value.getUTCDate() + days); return value.toISOString().slice(0,10); };
+const latestTradingDate = () => { let date=shanghaiDate(); while(!isTradingDate(date)) date=addDays(date,-1); return date; };
 const hex = (buffer: ArrayBuffer) => [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
 type MatchRequestRecord = { id:number;role:string;amountMin:number;amountMax:number;termMonths:number|null;preference:string|null;purpose:string|null;riskSnapshot:string|null;viewerId:string|null };
 async function refreshMatchCandidates(db:D1Database,requestId:number) {
@@ -603,6 +604,7 @@ type ExchangeObservationRow = {
   announceDate:string;pdfUrl:string|null;titleFingerprint:string;matchStatus:string;reviewStatus:string;
   matchedAnnouncementId:string|null;
 };
+type PromotionResult={status:"promoted"|"linked";announcementId:string;idempotent?:boolean;r2Key?:string;sha256?:string;size?:number};
 
 const officialPdfHosts:Record<string,Set<string>> = {
   "上交所": new Set(["www.sse.com.cn","static.sse.com.cn"]),
@@ -623,7 +625,7 @@ function exchangeDownloadHeaders(source:string) {
   return {referer,"user-agent":"Mozilla/5.0 (compatible; PledgeRadar/1.0; official-disclosure-archive)"};
 }
 
-async function promoteExchangeObservation(db:D1Database,documents:R2Bucket,id:number,viewer:string) {
+async function promoteExchangeObservation(db:D1Database,documents:R2Bucket,id:number,viewer:string):Promise<PromotionResult> {
   const row=await db.prepare("SELECT id,source,source_announcement_id AS sourceAnnouncementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,title_fingerprint AS titleFingerprint,match_status AS matchStatus,review_status AS reviewStatus,matched_announcement_id AS matchedAnnouncementId FROM exchange_observation WHERE id=?").bind(id).first<ExchangeObservationRow>();
   if(!row) throw new Error("观察记录不存在");
   if(row.reviewStatus==="promoted"&&row.matchedAnnouncementId) return {status:"promoted",announcementId:row.matchedAnnouncementId,idempotent:true};
@@ -667,6 +669,31 @@ async function promoteExchangeObservation(db:D1Database,documents:R2Bucket,id:nu
   return {status:"promoted",announcementId,r2Key,sha256,size:bytes.byteLength};
 }
 
+async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:string) {
+  const startedAt=new Date().toISOString();
+  try{
+    const ingestion=await ingestCninfo(env.DB,date);
+    const reconciliation=await runExchangeReconciliation(env.DB,date,["sse","szse","bse"]);
+    const processing=await processPendingQueue(env.DB,env.DOCUMENTS,10,env);
+    const finishedAt=new Date().toISOString();
+    const result={date,ingestion,reconciliation:{found:reconciliation.found,failures:reconciliation.failures,results:reconciliation.results},processing,startedAt,finishedAt};
+    await env.DB.batch([
+      env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(finishedAt,(reconciliation.failures||processing.failures)?"completed_with_errors":"completed",ingestion.found,processing.events_created,reconciliation.failures+processing.failures,JSON.stringify(result),runId),
+      env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('daily_production_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify(result),finishedAt),
+      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_production",date,"completed",JSON.stringify({runId,announcements:ingestion.found,events:processing.events_created,failures:reconciliation.failures+processing.failures}),viewer,finishedAt),
+    ]);
+    return result;
+  }catch(error){
+    const message=error instanceof Error?error.message:"daily production failed";const finishedAt=new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE sync_run SET finished_at=?,status='failed',failures=failures+1,message=? WHERE id=?").bind(finishedAt,message,runId),
+      env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('daily_production_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify({date,runId,status:"failed",message,startedAt,finishedAt}),finishedAt),
+      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_production",date,"failed",JSON.stringify({runId,message}),viewer,finishedAt),
+    ]);
+    throw error;
+  }
+}
+
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   await ensureSchema(env.DB);
   const url = new URL(request.url);
@@ -688,6 +715,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ daily:daily.results.reverse(),eventTypes:eventTypes.results,pledgees:pledgees.results,statuses:statuses.results });
   }
   if (url.pathname === "/api/sync" && request.method === "POST") {
+    if(!viewerId(request))return json({error:"请先登录后同步公告"},{status:401});
     const input = await request.json<{date?:string}>().catch(() => ({})); const date = input.date && /^\d{4}-\d{2}-\d{2}$/.test(input.date) ? input.date : shanghaiDate(-1);
     const startedAt = new Date().toISOString();
     const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("official-adapters",startedAt,"running","V1 适配器初始化").first<{id:number}>();
@@ -710,6 +738,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ cursor, coverage, generatedAt:new Date().toISOString(), scope:"每日向更早日期滚动回补；游标独立于是否发现公告" });
   }
   if (url.pathname === "/api/backfill-extend" && request.method === "POST") {
+    if(!viewerId(request))return json({error:"请先登录后运行历史回补"},{status:401});
     const input = await request.json<{days?:number}>().catch(() => ({}));
     const tradingDays = Math.min(Math.max(Number(input.days) || 5,1),7);
     const state = await env.DB.prepare("SELECT value FROM pipeline_state WHERE key='historical_backfill_cursor'").first<{value:string}>();
@@ -734,6 +763,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ok:true,run_id:run?.id,dates:results,found,inserted,failures,cursor:nextCursor,auto_processing:true});
   }
   if (url.pathname === "/api/backfill-plan" && request.method === "POST") {
+    if(!viewerId(request))return json({error:"请先登录后运行缺口回补"},{status:401});
     const input = await request.json<{start?:string;end?:string}>().catch(() => ({}));
     const end = input.end || shanghaiDate(); const start = input.start || shanghaiDate(-6);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || start > end) return json({ error: "invalid-date-range" }, { status: 400 });
@@ -760,6 +790,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ start, end, days, calendar, missingDates, scope: "公告日期缺口提示；空白日期可能是周末、节假日或尚未抓取，需回补后确认" });
   }
   if (url.pathname === "/api/backfill" && request.method === "POST") {
+    if(!viewerId(request))return json({error:"请先登录后运行公告回补"},{status:401});
     const input = await request.json<{days?:number;endDate?:string}>().catch(() => ({}));
     const days = Math.min(Math.max(Number(input.days) || 7,1),7);
     const endDate = input.endDate && /^\d{4}-\d{2}-\d{2}$/.test(input.endDate) ? input.endDate : shanghaiDate();
@@ -841,6 +872,51 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       ]);
       return json({ok:true,status:"rejected",id});
     }catch(error){return json({error:error instanceof Error?error.message:"差异处理失败"},{status:409});}
+  }
+  if(url.pathname==="/api/reconciliation/batch"&&request.method==="POST"){
+    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后批量处理对账差异"},{status:401});
+    const input=await request.json<{ids?:number[];action?:"promote"|"reject";note?:string}>().catch(()=>({}));
+    const ids=[...new Set((input.ids||[]).map(Number).filter((id)=>Number.isInteger(id)&&id>0))].slice(0,10);
+    if(!ids.length||!["promote","reject"].includes(input.action||""))return json({error:"请选择 1 至 10 条待处理差异"},{status:400});
+    const results:{id:number;status:string;announcementId?:string;error?:string}[]=[];let promoted=0;
+    for(const id of ids){
+      try{
+        if(input.action==="promote"){
+          const result=await promoteExchangeObservation(env.DB,env.DOCUMENTS,id,viewer);results.push({id,status:result.status,announcementId:result.announcementId});if(result.status==="promoted"&&!result.idempotent)promoted++;
+        }else{
+          const row=await env.DB.prepare("SELECT match_status AS matchStatus,review_status AS reviewStatus FROM exchange_observation WHERE id=?").bind(id).first<{matchStatus:string;reviewStatus:string}>();
+          if(!row||row.matchStatus!=="missing_primary"||row.reviewStatus!=="pending")throw new Error("记录已经处理或不允许排除");
+          const now=new Date().toISOString();const note=(input.note||"批量人工判定无需补入主库").trim().slice(0,300);
+          await env.DB.batch([
+            env.DB.prepare("UPDATE exchange_observation SET review_status='rejected',reviewed_at=?,reviewed_by=?,review_note=? WHERE id=?").bind(now,viewer,note,id),
+            env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("exchange_observation",String(id),"batch_reject_missing_candidate",JSON.stringify({note}),viewer,now),
+          ]);results.push({id,status:"rejected"});
+        }
+      }catch(error){results.push({id,status:"failed",error:error instanceof Error?error.message:"处理失败"});}
+    }
+    if(promoted)ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,Math.min(promoted,10),env));
+    return json({ok:true,requested:ids.length,succeeded:results.filter((item)=>item.status!=="failed").length,failed:results.filter((item)=>item.status==="failed").length,autoProcessing:promoted>0,results});
+  }
+  if(url.pathname==="/api/operations/daily"&&request.method==="GET"){
+    const [run,state,counts]=await Promise.all([
+      env.DB.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,announcements_found AS announcementsFound,events_created AS eventsCreated,failures,message FROM sync_run WHERE source='daily-production-cycle' ORDER BY id DESC LIMIT 1").first(),
+      env.DB.prepare("SELECT value,updated_at AS updatedAt FROM pipeline_state WHERE key='daily_production_last'").first<{value:string;updatedAt:string}>(),
+      env.DB.prepare("SELECT (SELECT COUNT(*) FROM exchange_observation WHERE match_status='missing_primary' AND review_status='pending') AS pendingDifferences,(SELECT COUNT(*) FROM announcement WHERE parse_status IN ('queued','archived') AND parse_attempts<3) AS retryableAnnouncements,(SELECT COUNT(*) FROM review_queue WHERE status='pending') AS pendingReviews").first(),
+    ]);
+    return json({run,lastResult:state?JSON.parse(state.value):null,lastUpdatedAt:state?.updatedAt||null,counts,recommendedDate:latestTradingDate(),scope:"同步巨潮质押公告、运行三所独立对账并处理待解析队列"});
+  }
+  if(url.pathname==="/api/operations/daily"&&request.method==="POST"){
+    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后运行每日数据闭环"},{status:401});
+    const input=await request.json<{date?:string}>().catch(()=>({}));const date=input.date||latestTradingDate();
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!isTradingDate(date))return json({error:"请选择有效交易日"},{status:400});
+    const active=await env.DB.prepare("SELECT id,started_at AS startedAt FROM sync_run WHERE source='daily-production-cycle' AND status='running' ORDER BY id DESC LIMIT 1").first<{id:number;startedAt:string}>();
+    if(active)return json({error:"已有每日数据任务正在运行",runId:active.id,startedAt:active.startedAt},{status:409});
+    const startedAt=new Date().toISOString();
+    const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("daily-production-cycle",startedAt,"running",`每日生产闭环 ${date}`).first<{id:number}>();
+    if(!run?.id)return json({error:"无法创建每日数据任务"},{status:500});
+    await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_production",date,"started",JSON.stringify({runId:run.id}),viewer,startedAt).run();
+    ctx.waitUntil(runDailyProductionCycle(env,date,run.id,viewer).catch(()=>undefined));
+    return json({ok:true,accepted:true,runId:run.id,date,status:"running",scope:"后台同步、三所对账与解析已启动"},{status:202});
   }
   if (url.pathname === "/api/data-quality" && request.method === "GET") {
     const since = addDays(shanghaiDate(),-45);
@@ -1143,10 +1219,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ data: result.results });
   }
   if (url.pathname === "/api/process" && request.method === "POST") {
+    if(!viewerId(request))return json({error:"请先登录后处理解析队列"},{status:401});
     const input = await request.json<{limit?:number}>().catch(() => ({}));
     return json({ ok:true,...await processPendingQueue(env.DB,env.DOCUMENTS,Number(input.limit) || 3,env) });
   }
   if (url.pathname === "/api/reprocess-reviews" && request.method === "POST") {
+    if(!viewerId(request))return json({error:"请先登录后重试审核队列"},{status:401});
     const input = await request.json<{limit?:number;force?:boolean}>().catch(() => ({}));
     const limit = Math.min(Math.max(Number(input.limit) || 3,1),5);
     const pending = await env.DB.prepare("SELECT announcement_id AS id FROM review_queue WHERE status='pending' ORDER BY CASE WHEN reviewed_at IS NULL THEN 0 ELSE 1 END,COALESCE(reviewed_at,created_at) ASC LIMIT ?").bind(limit).all<{id:string}>();
@@ -1158,17 +1236,19 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ok:true,requested:limit,processed:results.length,results});
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/process") && request.method === "POST") {
+    if(!viewerId(request))return json({error:"请先登录后处理公告"},{status:401});
     const id = url.pathname.split("/")[3];
     return json(await processAnnouncement(env.DB, env.DOCUMENTS, id, env));
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/archive") && request.method === "POST") {
+    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后归档公告"},{status:401});
     const id = url.pathname.split("/")[3]; const item = await env.DB.prepare("SELECT pdf_url AS pdfUrl FROM announcement WHERE announcement_id=?").bind(id).first<{pdfUrl:string}>();
     if (!item?.pdfUrl) return json({error:"announcement not found"},{status:404});
     const response = await fetch(item.pdfUrl,{headers:{referer:"https://www.cninfo.com.cn/","user-agent":"Mozilla/5.0 (compatible; StockEventDB/1.0)"}}); if (!response.ok) return json({error:`PDF download failed: ${response.status}`},{status:502});
     const bytes = await response.arrayBuffer(); const sha256 = hex(await crypto.subtle.digest("SHA-256",bytes)); const key = `announcements/${id}.pdf`;
     await env.DOCUMENTS.put(key,bytes,{httpMetadata:{contentType:"application/pdf"},customMetadata:{announcementId:id,sha256}});
     await env.DB.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status=? WHERE announcement_id=?").bind(key,sha256,"archived",id).run();
-    await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"archive",JSON.stringify({key,sha256,size:bytes.byteLength}),"worker",new Date().toISOString()).run();
+    await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"archive",JSON.stringify({key,sha256,size:bytes.byteLength}),viewer,new Date().toISOString()).run();
     return json({ok:true,key,sha256,size:bytes.byteLength});
   }
   if (url.pathname === "/api/reviews" && request.method === "GET") {
@@ -1176,6 +1256,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ data: result.results });
   }
   if (url.pathname.startsWith("/api/reviews/") && request.method === "PATCH") {
+    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后提交人工审核"},{status:401});
     const id = Number(url.pathname.split("/").pop());
     const body = await request.json<{status?:string;resolution?:string;shareholder?:string;pledgee?:string;amount?:number;amountText?:string;pledgeRatio?:string;totalRatio?:string;type?:string}>();
     if (!id || !["approved","rejected"].includes(body.status || "")) return json({ error: "invalid review update" }, { status: 400 });
@@ -1184,8 +1265,8 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     if (before.status !== "pending") return json({ error: "review already completed" }, { status: 409 });
     const now = new Date().toISOString();
     const statements: D1PreparedStatement[] = [
-      env.DB.prepare("UPDATE review_queue SET status=?,resolution=?,reviewed_at=?,reviewer=? WHERE id=?").bind(body.status,body.resolution || "",now,"site-user",id),
-      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("review_queue",String(id),"review",JSON.stringify(before),JSON.stringify(body),"site-user",now),
+      env.DB.prepare("UPDATE review_queue SET status=?,resolution=?,reviewed_at=?,reviewer=? WHERE id=?").bind(body.status,body.resolution || "",now,viewer,id),
+      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("review_queue",String(id),"review",JSON.stringify(before),JSON.stringify(body),viewer,now),
     ];
     if (body.status === "approved") {
       const announcement = await env.DB.prepare("SELECT stock_code AS stockCode,stock_name AS stockName,announce_date AS announceDate FROM announcement WHERE announcement_id=?").bind(before.announcement_id).first<{stockCode:string;stockName:string;announceDate:string}>();

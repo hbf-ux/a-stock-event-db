@@ -59,6 +59,11 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /officialPdfHosts/);
   assert.match(worker, /manual-confirmed-official-pdf/);
   assert.match(worker, /promote\|reject/);
+  assert.match(worker, /\/api\/reconciliation\/batch/);
+  assert.match(worker, /\/api\/operations\/daily/);
+  assert.match(worker, /runDailyProductionCycle/);
+  assert.match(worker, /daily_production_last/);
+  assert.match(worker, /请先登录后提交人工审核/);
   assert.match(worker, /capital_stage='due_diligence'/);
   assert.match(worker, /stage_updated/);
   assert.match(worker, /需求已关闭，相关未完成候选不再推进/);
@@ -123,6 +128,9 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(quality, /只有人工确认并校验官方 PDF 后才进入解析队列/);
   assert.match(quality, /确认补入/);
   assert.match(quality, /无需补入/);
+  assert.match(quality, /每日数据生产闭环/);
+  assert.match(quality, /批量确认补入/);
+  assert.match(quality, /批量无需补入/);
   assert.match(migration, /CREATE TABLE `match_request`/);
   assert.match(matchMigration, /CREATE TABLE `match_candidate`/);
   assert.match(funnelMigration, /capital_stage/);
