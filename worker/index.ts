@@ -402,6 +402,17 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       return json({ ok:false,run_id:run?.id,error:message },{status:502});
     }
   }
+  if (url.pathname === "/api/backfill-plan" && request.method === "GET") {
+    const end = url.searchParams.get("end") || new Date().toISOString().slice(0,10);
+    const start = url.searchParams.get("start") || new Date(Date.now() - 6 * 86400000).toISOString().slice(0,10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || start > end) return json({ error: "invalid-date-range" }, { status: 400 });
+    const startDate = new Date(`${start}T00:00:00Z`); const endDate = new Date(`${end}T00:00:00Z`); const days = Math.floor((endDate.getTime() - startDate.getTime()) / 86400000) + 1;
+    if (days > 31) return json({ error: "date-range-too-large", maxDays: 31 }, { status: 400 });
+    const rows = await env.DB.prepare("SELECT announce_date AS date,COUNT(*) AS announcements FROM announcement WHERE announce_date BETWEEN ? AND ? GROUP BY announce_date ORDER BY announce_date").bind(start,end).all<{date:string;announcements:number}>();
+    const present = new Map(rows.results.map((row) => [row.date, row.announcements])); const missingDates: string[] = []; const calendar: {date:string;announcements:number}[] = [];
+    for (let index = 0; index < days; index++) { const date = new Date(startDate); date.setUTCDate(startDate.getUTCDate() + index); const key = date.toISOString().slice(0,10); const count = present.get(key) || 0; calendar.push({ date: key, announcements: count }); if (!count) missingDates.push(key); }
+    return json({ start, end, days, calendar, missingDates, scope: "公告日期缺口提示；空白日期可能是周末、节假日或尚未抓取，需回补后确认" });
+  }
   if (url.pathname === "/api/backfill" && request.method === "POST") {
     const input = await request.json<{days?:number;endDate?:string}>().catch(() => ({}));
     const days = Math.min(Math.max(Number(input.days) || 7,1),7);
