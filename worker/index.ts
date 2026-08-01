@@ -494,13 +494,20 @@ async function processPendingQueue(db: D1Database, documents: R2Bucket, requeste
 
 async function fetchCninfo(date: string) {
   const all: CninfoAnnouncement[] = [];
+  const warnings: string[] = [];
+  let successfulQueries = 0;
   const keywords = ["质押", "股份质押", "股票质押", "补充质押", "解除质押"];
-  for (const column of ["szse", "sse", "bjse"]) {
+  columnLoop: for (const column of ["szse", "sse", "bjse"]) {
     for (const searchkey of keywords) {
       for (let pageNum = 1; pageNum <= 10; pageNum++) {
         const body = new URLSearchParams({ pageNum: String(pageNum), pageSize: "100", column, tabName: "fulltext", plate: "", stock: "", searchkey, secid: "", category: "", trade: "", seDate: `${date}~${date}`, sortName: "", sortType: "", isHLtitle: "true" });
         const response = await fetchWithRetry("https://www.cninfo.com.cn/new/hisAnnouncement/query", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded; charset=UTF-8", accept: "application/json, text/plain, */*", referer: "https://www.cninfo.com.cn/new/disclosure", "user-agent": "Mozilla/5.0 (compatible; StockEventDB/1.0; public-disclosure-research)" }, body });
-        if (!response.ok) throw new Error(`巨潮资讯 ${column}/${searchkey} 返回 ${response.status}`);
+        if (!response.ok) {
+          warnings.push(`巨潮资讯 ${column}/${searchkey} 返回 ${response.status}`);
+          if (pageNum === 1) continue columnLoop;
+          break;
+        }
+        successfulQueries++;
         const data = await response.json<CninfoResult>();
         const rows = data.announcements || [];
         all.push(...rows);
@@ -508,11 +515,12 @@ async function fetchCninfo(date: string) {
       }
     }
   }
-  return [...new Map(all.map((item) => [item.announcementId, item])).values()];
+  if (!successfulQueries) throw new Error(warnings[0] || "巨潮资讯所有市场查询均失败");
+  return {items:[...new Map(all.map((item) => [item.announcementId, item])).values()],warnings};
 }
 
 async function ingestCninfo(db: D1Database, date: string) {
-  const fetched = await fetchCninfo(date); const announcements = fetched.filter((item) => isRelevantSharePledgeTitle(stripHtml(item.announcementTitle))); const now = new Date().toISOString(); let inserted = 0;
+  const fetched = await fetchCninfo(date); const announcements = fetched.items.filter((item) => isRelevantSharePledgeTitle(stripHtml(item.announcementTitle))); const now = new Date().toISOString(); let inserted = 0;
   for (const item of announcements) {
     const title = stripHtml(item.announcementTitle); const pdfUrl = `https://static.cninfo.com.cn/${item.adjunctUrl}`;
     const existing = await db.prepare("SELECT announcement_id FROM announcement WHERE announcement_id=?").bind(item.announcementId).first();
@@ -524,7 +532,7 @@ async function ingestCninfo(db: D1Database, date: string) {
     ]);
     inserted++;
   }
-  return { found: announcements.length, inserted };
+  return { found: announcements.length, inserted, warnings:fetched.warnings };
 }
 
 type ExchangeObservationInput = { source:string;sourceAnnouncementId:string;stockCode:string;stockName:string;title:string;announceDate:string;pdfUrl:string|null;raw:unknown };
@@ -835,19 +843,19 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     while (dates.length < tradingDays) { if (isTradingDate(candidate)) dates.push(candidate); candidate = addDays(candidate,-1); }
     const startedAt = new Date().toISOString();
     const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("historical-rolling-backfill",startedAt,"running",`滚动回补 ${dates[dates.length-1]} 至 ${dates[0]}`).first<{id:number}>();
-    let found = 0; let inserted = 0; let failures = 0; const results: {date:string;found:number;inserted:number;error?:string}[] = [];
+    let found = 0; let inserted = 0; let failures = 0; let sourceWarnings = 0; const results: {date:string;found:number;inserted:number;warnings?:string[];error?:string}[] = [];
     for (const date of [...dates].reverse()) {
-      try { const result = await ingestCninfo(env.DB,date); found += result.found; inserted += result.inserted; results.push({date,...result}); }
+      try { const result = await ingestCninfo(env.DB,date); found += result.found; inserted += result.inserted; sourceWarnings += result.warnings.length; results.push({date,...result}); }
       catch (error) { failures++; results.push({date,found:0,inserted:0,error:error instanceof Error ? error.message : "sync failed"}); }
     }
     const nextCursor = failures ? cursor : dates[dates.length - 1]; const finishedAt = new Date().toISOString();
     const firstError = results.find((result) => result.error)?.error;
     await env.DB.batch([
       env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('historical_backfill_cursor',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(nextCursor,finishedAt),
-      env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,failures=?,message=? WHERE id=?").bind(finishedAt,failures ? "completed_with_errors" : "completed",found,failures,`滚动回补 ${dates.length} 个交易日：发现 ${found} 条，新增 ${inserted} 条，失败 ${failures} 日${firstError?`；${firstError.slice(0,180)}`:""}`,run?.id),
+      env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,failures=?,message=? WHERE id=?").bind(finishedAt,failures || sourceWarnings ? "completed_with_errors" : "completed",found,failures,`滚动回补 ${dates.length} 个交易日：发现 ${found} 条，新增 ${inserted} 条，失败 ${failures} 日，来源警告 ${sourceWarnings} 条${firstError?`；${firstError.slice(0,180)}`:""}`,run?.id),
     ]);
     if (inserted) ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,20,env));
-    return json({ok:!failures,run_id:run?.id,dates:results,found,inserted,failures,cursor:nextCursor,firstError:firstError || null,auto_processing:Boolean(inserted)});
+    return json({ok:!failures,run_id:run?.id,dates:results,found,inserted,failures,sourceWarnings,cursor:nextCursor,firstError:firstError || null,auto_processing:Boolean(inserted)});
   }
   if (url.pathname === "/api/backfill-plan" && request.method === "POST") {
     if(!viewerId(request))return json({error:"请先登录后运行缺口回补"},{status:401});

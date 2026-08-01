@@ -80,6 +80,8 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /maxAutomaticAttempts: 2/);
   assert.match(worker, /parseSectionPledgeRows/);
   assert.match(worker, /failures \? cursor : dates\[dates\.length - 1\]/);
+  assert.match(worker, /successfulQueries/);
+  assert.match(worker, /sourceWarnings/);
   assert.match(worker, /openai_quota_blocked_until/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
   assert.match(layout, /A股股东融资风险即时情报与尽调报告/);
