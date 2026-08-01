@@ -138,3 +138,22 @@ export const matchRequests = sqliteTable("match_request", {
   index("match_request_created_idx").on(table.createdAt),
   index("match_request_email_created_idx").on(table.email, table.createdAt),
 ]);
+
+export const matchCandidates = sqliteTable("match_candidate", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  capitalRequestId: integer("capital_request_id").notNull(),
+  financingRequestId: integer("financing_request_id").notNull(),
+  score: integer("score").notNull(),
+  reasons: text("reasons").notNull(),
+  status: text("status").notNull().default("candidate"),
+  capitalConsented: integer("capital_consented", { mode: "boolean" }).notNull().default(false),
+  financingConsented: integer("financing_consented", { mode: "boolean" }).notNull().default(false),
+  capitalConsentedAt: text("capital_consented_at"),
+  financingConsentedAt: text("financing_consented_at"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  uniqueIndex("match_candidate_pair_uq").on(table.capitalRequestId, table.financingRequestId),
+  index("match_candidate_capital_status_idx").on(table.capitalRequestId, table.status),
+  index("match_candidate_financing_status_idx").on(table.financingRequestId, table.status),
+]);

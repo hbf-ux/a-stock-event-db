@@ -42,6 +42,9 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /\/api\/match-requests/);
   assert.match(worker, /双方确认后再安排对接/);
   assert.match(worker, /requestFingerprint/);
+  assert.match(worker, /refreshMatchCandidates/);
+  assert.match(worker, /ready_to_connect/);
+  assert.match(worker, /双方分别确认前不返回对方机构/);
   assert.match(worker, /https:\/\/api\.openai\.com\/v1\/responses/);
   assert.match(worker, /rules-then-openai/);
   assert.match(worker, /maxAutomaticAttempts: 2/);
@@ -57,7 +60,7 @@ test("deployment bundle exists", async () => {
 });
 
 test("commercial intelligence pages are wired to verified event data", async () => {
-  const [detail, company, shareholder, pledgee, event, capital, brief, match, migration] = await Promise.all([
+  const [detail, company, shareholder, pledgee, event, capital, brief, match, matchDesk, migration, matchMigration] = await Promise.all([
     readFile(new URL("app/intelligence-detail.tsx", root), "utf8"),
     readFile(new URL("app/company/[code]/page.tsx", root), "utf8"),
     readFile(new URL("app/shareholder/[name]/page.tsx", root), "utf8"),
@@ -66,7 +69,9 @@ test("commercial intelligence pages are wired to verified event data", async () 
     readFile(new URL("app/capital/page.tsx", root), "utf8"),
     readFile(new URL("app/brief/page.tsx", root), "utf8"),
     readFile(new URL("app/match/page.tsx", root), "utf8"),
+    readFile(new URL("app/match/desk/page.tsx", root), "utf8"),
     readFile(new URL("drizzle/0004_past_franklin_storm.sql", root), "utf8"),
+    readFile(new URL("drizzle/0007_free_guardian.sql", root), "utf8"),
   ]);
   assert.match(detail, /质押事件时间线/);
   assert.match(detail, /完整股东融资风控报告/);
@@ -83,5 +88,8 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(match, /让真实融资需求与真实资金偏好相遇/);
   assert.match(match, /联系方式不会公开/);
   assert.match(match, /不承诺融资结果/);
+  assert.match(matchDesk, /我的撮合进度/);
+  assert.match(matchDesk, /双方确认前/);
   assert.match(migration, /CREATE TABLE `match_request`/);
+  assert.match(matchMigration, /CREATE TABLE `match_candidate`/);
 });

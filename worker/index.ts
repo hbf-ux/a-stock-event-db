@@ -35,6 +35,9 @@ async function ensureSchema(db: D1Database) {
     `CREATE INDEX IF NOT EXISTS match_request_role_status_idx ON match_request (role,status)`,
     `CREATE INDEX IF NOT EXISTS match_request_created_idx ON match_request (created_at)`,
     `CREATE INDEX IF NOT EXISTS match_request_email_created_idx ON match_request (email,created_at)`,
+    `CREATE TABLE IF NOT EXISTS match_candidate (id INTEGER PRIMARY KEY AUTOINCREMENT, capital_request_id INTEGER NOT NULL, financing_request_id INTEGER NOT NULL, score INTEGER NOT NULL, reasons TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', capital_consented INTEGER NOT NULL DEFAULT 0, financing_consented INTEGER NOT NULL DEFAULT 0, capital_consented_at TEXT, financing_consented_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(capital_request_id,financing_request_id))`,
+    `CREATE INDEX IF NOT EXISTS match_candidate_capital_status_idx ON match_candidate (capital_request_id,status)`,
+    `CREATE INDEX IF NOT EXISTS match_candidate_financing_status_idx ON match_candidate (financing_request_id,status)`,
     `CREATE INDEX IF NOT EXISTS pledge_date_idx ON pledge (announce_date)`,
     `CREATE INDEX IF NOT EXISTS pledge_stock_idx ON pledge (stock_code)`,
     `CREATE INDEX IF NOT EXISTS pledge_shareholder_idx ON pledge (shareholder)`,
@@ -110,6 +113,35 @@ const toDate = (timestamp: number) => new Intl.DateTimeFormat("en-CA", { timeZon
 const isTradingDate = (date: string) => { const day = new Date(`${date}T00:00:00Z`).getUTCDay(); return day !== 0 && day !== 6; };
 const addDays = (date: string, days: number) => { const value = new Date(`${date}T00:00:00Z`); value.setUTCDate(value.getUTCDate() + days); return value.toISOString().slice(0,10); };
 const hex = (buffer: ArrayBuffer) => [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
+type MatchRequestRecord = { id:number;role:string;amountMin:number;amountMax:number;termMonths:number|null;preference:string|null;purpose:string|null;riskSnapshot:string|null;viewerId:string|null };
+async function refreshMatchCandidates(db:D1Database,requestId:number) {
+  const current = await db.prepare("SELECT id,role,amount_min AS amountMin,amount_max AS amountMax,term_months AS termMonths,preference,purpose,risk_snapshot AS riskSnapshot,viewer_id AS viewerId FROM match_request WHERE id=? AND status IN ('new','active','matched')").bind(requestId).first<MatchRequestRecord>();
+  if (!current) return 0;
+  const oppositeRoles = current.role === "capital" ? "('financing','advisor')" : "('capital')";
+  const candidates = await db.prepare(`SELECT id,role,amount_min AS amountMin,amount_max AS amountMax,term_months AS termMonths,preference,purpose,risk_snapshot AS riskSnapshot,viewer_id AS viewerId FROM match_request WHERE role IN ${oppositeRoles} AND status IN ('new','active','matched') AND id!=? AND (viewer_id IS NULL OR viewer_id!=?) ORDER BY created_at DESC LIMIT 200`).bind(current.id,current.viewerId || "").all<MatchRequestRecord>();
+  const now = new Date().toISOString(); let created = 0;
+  for (const candidate of candidates.results) {
+    const capital = current.role === "capital" ? current : candidate;
+    const financing = current.role === "capital" ? candidate : current;
+    const overlapMin = Math.max(capital.amountMin,financing.amountMin);
+    const overlapMax = Math.min(capital.amountMax,financing.amountMax);
+    if (overlapMax < overlapMin) continue;
+    const reasons:string[] = [`金额区间重合 ${Math.round(overlapMin/10000).toLocaleString("zh-CN")}–${Math.round(overlapMax/10000).toLocaleString("zh-CN")} 万元`];
+    let score = 55;
+    if (capital.termMonths && financing.termMonths) {
+      const difference = Math.abs(capital.termMonths-financing.termMonths);
+      if (difference <= 3) { score += 25; reasons.push("期限偏差不超过 3 个月"); }
+      else if (difference <= 6) { score += 15; reasons.push("期限偏差不超过 6 个月"); }
+      else if (difference <= 12) { score += 5; reasons.push("期限仍在可复核范围"); }
+    } else { score += 8; reasons.push("一方期限开放，需人工确认"); }
+    if (financing.riskSnapshot) { score += 10; reasons.push("已附官方质押事件摘要"); }
+    if (capital.preference && financing.purpose) { score += 5; reasons.push("双方均已填写业务偏好"); }
+    score = Math.min(100,score);
+    await db.prepare("INSERT INTO match_candidate (capital_request_id,financing_request_id,score,reasons,status,capital_consented,financing_consented,created_at,updated_at) VALUES (?,?,?,?,'candidate',0,0,?,?) ON CONFLICT(capital_request_id,financing_request_id) DO UPDATE SET score=excluded.score,reasons=excluded.reasons,updated_at=excluded.updated_at").bind(capital.id,financing.id,score,JSON.stringify(reasons),now,now).run();
+    created++;
+  }
+  return created;
+}
 const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve,milliseconds));
 async function fetchWithRetry(input: RequestInfo | URL, init?: RequestInit, attempts = 3) {
   let lastError: unknown;
@@ -705,8 +737,46 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     ]);
     return json({ data:{ roles:roles.results,total },privacy:"仅返回匿名汇总，不公开联系人、融资主体或资金方信息",generatedAt:new Date().toISOString() });
   }
+  if (url.pathname === "/api/match-requests" && request.method === "GET") {
+    const viewer = viewerId(request);
+    if (!viewer) return json({error:"请先登录后查看撮合需求"},{status:401});
+    const rows = await env.DB.prepare("SELECT r.id,r.role,r.organization,r.contact_name AS contactName,r.email,r.stock_code AS stockCode,r.shareholder,r.amount_min AS amountMin,r.amount_max AS amountMax,r.term_months AS termMonths,r.preference,r.purpose,r.status,r.created_at AS createdAt,(SELECT COUNT(*) FROM match_candidate m WHERE m.capital_request_id=r.id OR m.financing_request_id=r.id) AS candidateCount,(SELECT COUNT(*) FROM match_candidate m WHERE (m.capital_request_id=r.id OR m.financing_request_id=r.id) AND m.status='ready_to_connect') AS readyCount FROM match_request r WHERE r.viewer_id=? ORDER BY r.created_at DESC LIMIT 100").bind(viewer).all();
+    return json({data:rows.results,ownership:"仅返回当前登录用户提交的需求"});
+  }
+  if (url.pathname === "/api/matches" && request.method === "GET") {
+    const viewer = viewerId(request);
+    if (!viewer) return json({error:"请先登录后查看匹配候选"},{status:401});
+    type MatchCandidateRow = { id:number;score:number;reasons:string;status:string;capitalConsented:number;financingConsented:number;capitalId:number;financingId:number;capitalViewer:string;financingViewer:string;capitalOrganization:string;capitalContact:string;capitalEmail:string;capitalAmountMin:number;capitalAmountMax:number;capitalTerm:number|null;capitalPreference:string|null;financingOrganization:string;financingContact:string;financingEmail:string;financingStockCode:string|null;financingShareholder:string|null;financingAmountMin:number;financingAmountMax:number;financingTerm:number|null;financingPurpose:string|null;financingRiskSnapshot:string|null;updatedAt:string };
+    const result = await env.DB.prepare("SELECT m.id,m.score,m.reasons,m.status,m.capital_consented AS capitalConsented,m.financing_consented AS financingConsented,m.capital_request_id AS capitalId,m.financing_request_id AS financingId,c.viewer_id AS capitalViewer,f.viewer_id AS financingViewer,c.organization AS capitalOrganization,c.contact_name AS capitalContact,c.email AS capitalEmail,c.amount_min AS capitalAmountMin,c.amount_max AS capitalAmountMax,c.term_months AS capitalTerm,c.preference AS capitalPreference,f.organization AS financingOrganization,f.contact_name AS financingContact,f.email AS financingEmail,f.stock_code AS financingStockCode,f.shareholder AS financingShareholder,f.amount_min AS financingAmountMin,f.amount_max AS financingAmountMax,f.term_months AS financingTerm,f.purpose AS financingPurpose,f.risk_snapshot AS financingRiskSnapshot,m.updated_at AS updatedAt FROM match_candidate m JOIN match_request c ON c.id=m.capital_request_id JOIN match_request f ON f.id=m.financing_request_id WHERE c.viewer_id=? OR f.viewer_id=? ORDER BY CASE WHEN m.status='ready_to_connect' THEN 0 ELSE 1 END,m.score DESC,m.updated_at DESC LIMIT 200").bind(viewer,viewer).all<MatchCandidateRow>();
+    const data = result.results.map((row) => {
+      const side = row.capitalViewer===viewer ? "capital" : "financing";
+      const bothConsented = Boolean(row.capitalConsented && row.financingConsented);
+      const ownConsented = side==="capital" ? Boolean(row.capitalConsented) : Boolean(row.financingConsented);
+      const counterpart = side==="capital" ? { role:"financing",amountMin:row.financingAmountMin,amountMax:row.financingAmountMax,termMonths:row.financingTerm,summary:"A股上市公司股东融资项目",riskContextAttached:Boolean(row.financingRiskSnapshot),purpose:row.financingPurpose } : { role:"capital",amountMin:row.capitalAmountMin,amountMax:row.capitalAmountMax,termMonths:row.capitalTerm,summary:"机构资金方",riskContextAttached:false,preference:row.capitalPreference };
+      const contact = bothConsented ? (side==="capital" ? {organization:row.financingOrganization,contactName:row.financingContact,email:row.financingEmail,stockCode:row.financingStockCode,shareholder:row.financingShareholder} : {organization:row.capitalOrganization,contactName:row.capitalContact,email:row.capitalEmail}) : null;
+      return {id:row.id,score:row.score,reasons:JSON.parse(row.reasons || "[]"),status:row.status,side,ownConsented,counterpartConsented:side==="capital"?Boolean(row.financingConsented):Boolean(row.capitalConsented),bothConsented,counterpart,contact,updatedAt:row.updatedAt};
+    });
+    return json({data,privacy:"双方分别确认前不返回对方机构、联系人、邮箱或融资主体身份"});
+  }
+  if (url.pathname.startsWith("/api/matches/") && url.pathname.endsWith("/consent") && request.method === "POST") {
+    const viewer = viewerId(request);
+    if (!viewer) return json({error:"请先登录后确认撮合意向"},{status:401});
+    const id = Number(url.pathname.split("/")[3]);
+    if (!Number.isInteger(id)||id<=0) return json({error:"无效匹配编号"},{status:400});
+    const row = await env.DB.prepare("SELECT m.id,c.viewer_id AS capitalViewer,f.viewer_id AS financingViewer FROM match_candidate m JOIN match_request c ON c.id=m.capital_request_id JOIN match_request f ON f.id=m.financing_request_id WHERE m.id=?").bind(id).first<{id:number;capitalViewer:string;financingViewer:string}>();
+    if (!row || (row.capitalViewer!==viewer && row.financingViewer!==viewer)) return json({error:"无权操作该匹配"},{status:403});
+    const now = new Date().toISOString();
+    if (row.capitalViewer===viewer) await env.DB.prepare("UPDATE match_candidate SET capital_consented=1,capital_consented_at=?,updated_at=? WHERE id=?").bind(now,now,id).run();
+    else await env.DB.prepare("UPDATE match_candidate SET financing_consented=1,financing_consented_at=?,updated_at=? WHERE id=?").bind(now,now,id).run();
+    await env.DB.prepare("UPDATE match_candidate SET status=CASE WHEN capital_consented=1 AND financing_consented=1 THEN 'ready_to_connect' ELSE 'awaiting_counterparty' END,updated_at=? WHERE id=?").bind(now,id).run();
+    const updated = await env.DB.prepare("SELECT status,capital_consented AS capitalConsented,financing_consented AS financingConsented FROM match_candidate WHERE id=?").bind(id).first();
+    await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("match_candidate",String(id),"consent",JSON.stringify(updated),viewer,now).run();
+    return json({ok:true,data:updated,message:(updated as {status?:string})?.status==='ready_to_connect'?"双方已确认，可以查看对接信息":"已记录你的意向，等待对方确认"});
+  }
   if (url.pathname === "/api/match-requests" && request.method === "POST") {
     type MatchInput = { role?:string;organization?:string;contactName?:string;email?:string;stockCode?:string;shareholder?:string;amountMin?:number;amountMax?:number;termMonths?:number;preference?:string;purpose?:string;notes?:string;consent?:boolean };
+    const viewer = viewerId(request);
+    if (!viewer) return json({error:"请先登录后提交撮合需求"},{status:401});
     const input = await request.json<MatchInput>().catch(() => ({}));
     const role = String(input.role || "").trim();
     const organization = String(input.organization || "").trim();
@@ -739,13 +809,13 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       riskSnapshot = JSON.stringify({ stockCode,shareholder:shareholder || null,officialEventSummary:snapshot || null,generatedAt:new Date().toISOString(),limitation:"仅基于当前已解析官方公告，不代表当前存量质押或授信结论" });
     }
     const now = new Date().toISOString();
-    const viewer = viewerId(request);
     const fingerprintSource = [role,email,organization,stockCode,shareholder,amountMin,amountMax,shanghaiDate()].join("|").toLowerCase();
     const requestFingerprint = hex(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(fingerprintSource)));
     await env.DB.prepare("INSERT OR IGNORE INTO match_request (role,organization,contact_name,email,stock_code,shareholder,amount_min,amount_max,term_months,preference,purpose,notes,risk_snapshot,status,viewer_id,request_fingerprint,consent_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,?,?,?)").bind(role,organization,contactName,email,stockCode||null,shareholder||null,amountMin,amountMax,termMonths,preference||null,purpose||null,notes||null,riskSnapshot,viewer,requestFingerprint,now,now).run();
     const saved = await env.DB.prepare("SELECT id,status,created_at AS createdAt FROM match_request WHERE request_fingerprint=?").bind(requestFingerprint).first<{id:number;status:string;createdAt:string}>();
-    if (saved) await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("match_request",String(saved.id),"submitted",JSON.stringify({role,stockCode:stockCode||null,shareholder:shareholder||null,amountMin,amountMax,status:saved.status}),viewer||"public-form",now).run();
-    return json({ok:true,requestId:saved?.id,status:saved?.status||"new",message:"需求已进入人工核验队列；联系方式不会公开，双方确认后再安排对接",riskContextAttached:Boolean(riskSnapshot)});
+    if (saved) await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("match_request",String(saved.id),"submitted",JSON.stringify({role,stockCode:stockCode||null,shareholder:shareholder||null,amountMin,amountMax,status:saved.status}),viewer,now).run();
+    const candidatesCreated = saved ? await refreshMatchCandidates(env.DB,saved.id) : 0;
+    return json({ok:true,requestId:saved?.id,status:saved?.status||"new",message:"需求已进入人工核验队列；联系方式不会公开，双方确认后再安排对接",riskContextAttached:Boolean(riskSnapshot),candidatesCreated});
   }
   if (url.pathname === "/api/events" && request.method === "GET") {
     const conditions: string[] = []; const values: string[] = [];
