@@ -57,6 +57,13 @@
       "when": 1785569352430,
       "tag": "0007_free_guardian",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1785570125442,
+      "tag": "0008_wonderful_true_believers",
+      "breakpoints": true
     }
   ]
 }

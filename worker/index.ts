@@ -16,6 +16,7 @@ interface ExecutionContext { waitUntil(promise: Promise<unknown>): void; passThr
 
 const json = (data: unknown, init: ResponseInit = {}) => new Response(JSON.stringify(data), { ...init, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...(init.headers || {}) } });
 const viewerId = (request: Request) => request.headers.get("oai-authenticated-user-id")?.trim() || null;
+const matchStages = new Set(["reviewing","contacted","due_diligence","negotiating","completed","declined"]);
 
 async function ensureSchema(db: D1Database) {
   const statements = [
@@ -35,7 +36,7 @@ async function ensureSchema(db: D1Database) {
     `CREATE INDEX IF NOT EXISTS match_request_role_status_idx ON match_request (role,status)`,
     `CREATE INDEX IF NOT EXISTS match_request_created_idx ON match_request (created_at)`,
     `CREATE INDEX IF NOT EXISTS match_request_email_created_idx ON match_request (email,created_at)`,
-    `CREATE TABLE IF NOT EXISTS match_candidate (id INTEGER PRIMARY KEY AUTOINCREMENT, capital_request_id INTEGER NOT NULL, financing_request_id INTEGER NOT NULL, score INTEGER NOT NULL, reasons TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', capital_consented INTEGER NOT NULL DEFAULT 0, financing_consented INTEGER NOT NULL DEFAULT 0, capital_consented_at TEXT, financing_consented_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(capital_request_id,financing_request_id))`,
+    `CREATE TABLE IF NOT EXISTS match_candidate (id INTEGER PRIMARY KEY AUTOINCREMENT, capital_request_id INTEGER NOT NULL, financing_request_id INTEGER NOT NULL, score INTEGER NOT NULL, reasons TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', capital_consented INTEGER NOT NULL DEFAULT 0, financing_consented INTEGER NOT NULL DEFAULT 0, capital_consented_at TEXT, financing_consented_at TEXT, capital_stage TEXT NOT NULL DEFAULT 'reviewing', financing_stage TEXT NOT NULL DEFAULT 'reviewing', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(capital_request_id,financing_request_id))`,
     `CREATE INDEX IF NOT EXISTS match_candidate_capital_status_idx ON match_candidate (capital_request_id,status)`,
     `CREATE INDEX IF NOT EXISTS match_candidate_financing_status_idx ON match_candidate (financing_request_id,status)`,
     `CREATE INDEX IF NOT EXISTS pledge_date_idx ON pledge (announce_date)`,
@@ -52,6 +53,10 @@ async function ensureSchema(db: D1Database) {
   const names = new Set(announcementColumns.results.map((column) => column.name));
   if (!names.has("parse_attempts")) await db.prepare("ALTER TABLE announcement ADD COLUMN parse_attempts INTEGER NOT NULL DEFAULT 0").run();
   if (!names.has("last_error")) await db.prepare("ALTER TABLE announcement ADD COLUMN last_error TEXT").run();
+  const matchCandidateColumns = await db.prepare("PRAGMA table_info(match_candidate)").all<{name:string}>();
+  const matchCandidateNames = new Set(matchCandidateColumns.results.map((column) => column.name));
+  if (!matchCandidateNames.has("capital_stage")) await db.prepare("ALTER TABLE match_candidate ADD COLUMN capital_stage TEXT NOT NULL DEFAULT 'reviewing'").run();
+  if (!matchCandidateNames.has("financing_stage")) await db.prepare("ALTER TABLE match_candidate ADD COLUMN financing_stage TEXT NOT NULL DEFAULT 'reviewing'").run();
   const pledgeColumns = await db.prepare("PRAGMA table_info(pledge)").all<{name:string}>();
   if (!pledgeColumns.results.some((column) => column.name === "event_fingerprint")) {
     await db.batch([
@@ -740,21 +745,30 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (url.pathname === "/api/match-requests" && request.method === "GET") {
     const viewer = viewerId(request);
     if (!viewer) return json({error:"请先登录后查看撮合需求"},{status:401});
-    const rows = await env.DB.prepare("SELECT r.id,r.role,r.organization,r.contact_name AS contactName,r.email,r.stock_code AS stockCode,r.shareholder,r.amount_min AS amountMin,r.amount_max AS amountMax,r.term_months AS termMonths,r.preference,r.purpose,r.status,r.created_at AS createdAt,(SELECT COUNT(*) FROM match_candidate m WHERE m.capital_request_id=r.id OR m.financing_request_id=r.id) AS candidateCount,(SELECT COUNT(*) FROM match_candidate m WHERE (m.capital_request_id=r.id OR m.financing_request_id=r.id) AND m.status='ready_to_connect') AS readyCount FROM match_request r WHERE r.viewer_id=? ORDER BY r.created_at DESC LIMIT 100").bind(viewer).all();
+    const rows = await env.DB.prepare("SELECT r.id,r.role,r.organization,r.contact_name AS contactName,r.email,r.stock_code AS stockCode,r.shareholder,r.amount_min AS amountMin,r.amount_max AS amountMax,r.term_months AS termMonths,r.preference,r.purpose,r.status,r.created_at AS createdAt,(SELECT COUNT(*) FROM match_candidate m WHERE m.capital_request_id=r.id OR m.financing_request_id=r.id) AS candidateCount,(SELECT COUNT(*) FROM match_candidate m WHERE (m.capital_request_id=r.id OR m.financing_request_id=r.id) AND m.capital_consented=1 AND m.financing_consented=1) AS readyCount FROM match_request r WHERE r.viewer_id=? ORDER BY r.created_at DESC LIMIT 100").bind(viewer).all();
     return json({data:rows.results,ownership:"仅返回当前登录用户提交的需求"});
+  }
+  if (url.pathname === "/api/match-funnel" && request.method === "GET") {
+    const viewer = viewerId(request);
+    if (!viewer) return json({error:"请先登录后查看转化漏斗"},{status:401});
+    const [requests,funnel] = await Promise.all([
+      env.DB.prepare("SELECT COUNT(*) AS total,SUM(CASE WHEN status!='closed' THEN 1 ELSE 0 END) AS open,SUM(CASE WHEN status='closed' THEN 1 ELSE 0 END) AS closed FROM match_request WHERE viewer_id=?").bind(viewer).first(),
+      env.DB.prepare("SELECT COUNT(*) AS candidates,SUM(CASE WHEN m.capital_consented=1 AND m.financing_consented=1 THEN 1 ELSE 0 END) AS connected,SUM(CASE WHEN (c.viewer_id=? AND m.capital_stage='contacted') OR (f.viewer_id=? AND m.financing_stage='contacted') THEN 1 ELSE 0 END) AS contacted,SUM(CASE WHEN (c.viewer_id=? AND m.capital_stage='due_diligence') OR (f.viewer_id=? AND m.financing_stage='due_diligence') THEN 1 ELSE 0 END) AS dueDiligence,SUM(CASE WHEN (c.viewer_id=? AND m.capital_stage='negotiating') OR (f.viewer_id=? AND m.financing_stage='negotiating') THEN 1 ELSE 0 END) AS negotiating,SUM(CASE WHEN (c.viewer_id=? AND m.capital_stage='completed') OR (f.viewer_id=? AND m.financing_stage='completed') THEN 1 ELSE 0 END) AS completed,SUM(CASE WHEN (c.viewer_id=? AND m.capital_stage='declined') OR (f.viewer_id=? AND m.financing_stage='declined') THEN 1 ELSE 0 END) AS declined FROM match_candidate m JOIN match_request c ON c.id=m.capital_request_id JOIN match_request f ON f.id=m.financing_request_id WHERE c.viewer_id=? OR f.viewer_id=?").bind(viewer,viewer,viewer,viewer,viewer,viewer,viewer,viewer,viewer,viewer,viewer,viewer).first(),
+    ]);
+    return json({data:{requests:requests||{},funnel:funnel||{}},definition:"阶段由当前账户主动更新，双向确认后才计入已连接"});
   }
   if (url.pathname === "/api/matches" && request.method === "GET") {
     const viewer = viewerId(request);
     if (!viewer) return json({error:"请先登录后查看匹配候选"},{status:401});
-    type MatchCandidateRow = { id:number;score:number;reasons:string;status:string;capitalConsented:number;financingConsented:number;capitalId:number;financingId:number;capitalViewer:string;financingViewer:string;capitalOrganization:string;capitalContact:string;capitalEmail:string;capitalAmountMin:number;capitalAmountMax:number;capitalTerm:number|null;capitalPreference:string|null;financingOrganization:string;financingContact:string;financingEmail:string;financingStockCode:string|null;financingShareholder:string|null;financingAmountMin:number;financingAmountMax:number;financingTerm:number|null;financingPurpose:string|null;financingRiskSnapshot:string|null;updatedAt:string };
-    const result = await env.DB.prepare("SELECT m.id,m.score,m.reasons,m.status,m.capital_consented AS capitalConsented,m.financing_consented AS financingConsented,m.capital_request_id AS capitalId,m.financing_request_id AS financingId,c.viewer_id AS capitalViewer,f.viewer_id AS financingViewer,c.organization AS capitalOrganization,c.contact_name AS capitalContact,c.email AS capitalEmail,c.amount_min AS capitalAmountMin,c.amount_max AS capitalAmountMax,c.term_months AS capitalTerm,c.preference AS capitalPreference,f.organization AS financingOrganization,f.contact_name AS financingContact,f.email AS financingEmail,f.stock_code AS financingStockCode,f.shareholder AS financingShareholder,f.amount_min AS financingAmountMin,f.amount_max AS financingAmountMax,f.term_months AS financingTerm,f.purpose AS financingPurpose,f.risk_snapshot AS financingRiskSnapshot,m.updated_at AS updatedAt FROM match_candidate m JOIN match_request c ON c.id=m.capital_request_id JOIN match_request f ON f.id=m.financing_request_id WHERE c.viewer_id=? OR f.viewer_id=? ORDER BY CASE WHEN m.status='ready_to_connect' THEN 0 ELSE 1 END,m.score DESC,m.updated_at DESC LIMIT 200").bind(viewer,viewer).all<MatchCandidateRow>();
+    type MatchCandidateRow = { id:number;score:number;reasons:string;status:string;capitalConsented:number;financingConsented:number;capitalStage:string;financingStage:string;capitalId:number;financingId:number;capitalViewer:string;financingViewer:string;capitalOrganization:string;capitalContact:string;capitalEmail:string;capitalAmountMin:number;capitalAmountMax:number;capitalTerm:number|null;capitalPreference:string|null;financingOrganization:string;financingContact:string;financingEmail:string;financingStockCode:string|null;financingShareholder:string|null;financingAmountMin:number;financingAmountMax:number;financingTerm:number|null;financingPurpose:string|null;financingRiskSnapshot:string|null;updatedAt:string };
+    const result = await env.DB.prepare("SELECT m.id,m.score,m.reasons,m.status,m.capital_consented AS capitalConsented,m.financing_consented AS financingConsented,m.capital_stage AS capitalStage,m.financing_stage AS financingStage,m.capital_request_id AS capitalId,m.financing_request_id AS financingId,c.viewer_id AS capitalViewer,f.viewer_id AS financingViewer,c.organization AS capitalOrganization,c.contact_name AS capitalContact,c.email AS capitalEmail,c.amount_min AS capitalAmountMin,c.amount_max AS capitalAmountMax,c.term_months AS capitalTerm,c.preference AS capitalPreference,f.organization AS financingOrganization,f.contact_name AS financingContact,f.email AS financingEmail,f.stock_code AS financingStockCode,f.shareholder AS financingShareholder,f.amount_min AS financingAmountMin,f.amount_max AS financingAmountMax,f.term_months AS financingTerm,f.purpose AS financingPurpose,f.risk_snapshot AS financingRiskSnapshot,m.updated_at AS updatedAt FROM match_candidate m JOIN match_request c ON c.id=m.capital_request_id JOIN match_request f ON f.id=m.financing_request_id WHERE c.viewer_id=? OR f.viewer_id=? ORDER BY CASE WHEN m.capital_consented=1 AND m.financing_consented=1 THEN 0 ELSE 1 END,m.score DESC,m.updated_at DESC LIMIT 200").bind(viewer,viewer).all<MatchCandidateRow>();
     const data = result.results.map((row) => {
       const side = row.capitalViewer===viewer ? "capital" : "financing";
       const bothConsented = Boolean(row.capitalConsented && row.financingConsented);
       const ownConsented = side==="capital" ? Boolean(row.capitalConsented) : Boolean(row.financingConsented);
       const counterpart = side==="capital" ? { role:"financing",amountMin:row.financingAmountMin,amountMax:row.financingAmountMax,termMonths:row.financingTerm,summary:"A股上市公司股东融资项目",riskContextAttached:Boolean(row.financingRiskSnapshot),purpose:row.financingPurpose } : { role:"capital",amountMin:row.capitalAmountMin,amountMax:row.capitalAmountMax,termMonths:row.capitalTerm,summary:"机构资金方",riskContextAttached:false,preference:row.capitalPreference };
       const contact = bothConsented ? (side==="capital" ? {organization:row.financingOrganization,contactName:row.financingContact,email:row.financingEmail,stockCode:row.financingStockCode,shareholder:row.financingShareholder} : {organization:row.capitalOrganization,contactName:row.capitalContact,email:row.capitalEmail}) : null;
-      return {id:row.id,score:row.score,reasons:JSON.parse(row.reasons || "[]"),status:row.status,side,ownConsented,counterpartConsented:side==="capital"?Boolean(row.financingConsented):Boolean(row.capitalConsented),bothConsented,counterpart,contact,updatedAt:row.updatedAt};
+      return {id:row.id,score:row.score,reasons:JSON.parse(row.reasons || "[]"),status:row.status,side,ownStage:side==="capital"?row.capitalStage:row.financingStage,counterpartStage:bothConsented?(side==="capital"?row.financingStage:row.capitalStage):null,ownConsented,counterpartConsented:side==="capital"?Boolean(row.financingConsented):Boolean(row.capitalConsented),bothConsented,counterpart,contact,updatedAt:row.updatedAt};
     });
     return json({data,privacy:"双方分别确认前不返回对方机构、联系人、邮箱或融资主体身份"});
   }
@@ -763,8 +777,9 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     if (!viewer) return json({error:"请先登录后确认撮合意向"},{status:401});
     const id = Number(url.pathname.split("/")[3]);
     if (!Number.isInteger(id)||id<=0) return json({error:"无效匹配编号"},{status:400});
-    const row = await env.DB.prepare("SELECT m.id,c.viewer_id AS capitalViewer,f.viewer_id AS financingViewer FROM match_candidate m JOIN match_request c ON c.id=m.capital_request_id JOIN match_request f ON f.id=m.financing_request_id WHERE m.id=?").bind(id).first<{id:number;capitalViewer:string;financingViewer:string}>();
+    const row = await env.DB.prepare("SELECT m.id,m.status,c.viewer_id AS capitalViewer,f.viewer_id AS financingViewer FROM match_candidate m JOIN match_request c ON c.id=m.capital_request_id JOIN match_request f ON f.id=m.financing_request_id WHERE m.id=?").bind(id).first<{id:number;status:string;capitalViewer:string;financingViewer:string}>();
     if (!row || (row.capitalViewer!==viewer && row.financingViewer!==viewer)) return json({error:"无权操作该匹配"},{status:403});
+    if (["closed","declined","completed"].includes(row.status)) return json({error:"该匹配已结束，不能再次确认"},{status:409});
     const now = new Date().toISOString();
     if (row.capitalViewer===viewer) await env.DB.prepare("UPDATE match_candidate SET capital_consented=1,capital_consented_at=?,updated_at=? WHERE id=?").bind(now,now,id).run();
     else await env.DB.prepare("UPDATE match_candidate SET financing_consented=1,financing_consented_at=?,updated_at=? WHERE id=?").bind(now,now,id).run();
@@ -772,6 +787,42 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const updated = await env.DB.prepare("SELECT status,capital_consented AS capitalConsented,financing_consented AS financingConsented FROM match_candidate WHERE id=?").bind(id).first();
     await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("match_candidate",String(id),"consent",JSON.stringify(updated),viewer,now).run();
     return json({ok:true,data:updated,message:(updated as {status?:string})?.status==='ready_to_connect'?"双方已确认，可以查看对接信息":"已记录你的意向，等待对方确认"});
+  }
+  if (url.pathname.startsWith("/api/matches/") && url.pathname.endsWith("/stage") && request.method === "PATCH") {
+    const viewer = viewerId(request);
+    if (!viewer) return json({error:"请先登录后更新对接阶段"},{status:401});
+    const id = Number(url.pathname.split("/")[3]);
+    const input = await request.json<{stage?:string}>().catch(() => ({}));
+    const stage = String(input.stage||"");
+    if (!Number.isInteger(id)||id<=0 || !matchStages.has(stage)) return json({error:"无效匹配编号或阶段"},{status:400});
+    const row = await env.DB.prepare("SELECT m.id,m.status,m.capital_consented AS capitalConsented,m.financing_consented AS financingConsented,m.capital_stage AS capitalStage,m.financing_stage AS financingStage,c.viewer_id AS capitalViewer,f.viewer_id AS financingViewer FROM match_candidate m JOIN match_request c ON c.id=m.capital_request_id JOIN match_request f ON f.id=m.financing_request_id WHERE m.id=?").bind(id).first<{id:number;status:string;capitalConsented:number;financingConsented:number;capitalStage:string;financingStage:string;capitalViewer:string;financingViewer:string}>();
+    if (!row || (row.capitalViewer!==viewer && row.financingViewer!==viewer)) return json({error:"无权操作该匹配"},{status:403});
+    if (row.status==="closed") return json({error:"该匹配已关闭"},{status:409});
+    if (stage!=="declined" && !(row.capitalConsented&&row.financingConsented)) return json({error:"双方确认后才能更新对接阶段"},{status:409});
+    const now = new Date().toISOString();
+    const column = row.capitalViewer===viewer ? "capital_stage" : "financing_stage";
+    await env.DB.prepare(`UPDATE match_candidate SET ${column}=?,updated_at=? WHERE id=?`).bind(stage,now,id).run();
+    await env.DB.prepare("UPDATE match_candidate SET status=CASE WHEN capital_stage='declined' OR financing_stage='declined' THEN 'declined' WHEN capital_stage='completed' AND financing_stage='completed' THEN 'completed' WHEN capital_stage!='reviewing' OR financing_stage!='reviewing' THEN 'in_progress' ELSE 'ready_to_connect' END,updated_at=? WHERE id=?").bind(now,id).run();
+    const updated = await env.DB.prepare("SELECT status,capital_stage AS capitalStage,financing_stage AS financingStage FROM match_candidate WHERE id=?").bind(id).first();
+    await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("match_candidate",String(id),"stage_updated",JSON.stringify({capitalStage:row.capitalStage,financingStage:row.financingStage}),JSON.stringify(updated),viewer,now).run();
+    return json({ok:true,data:updated,message:"对接阶段已更新"});
+  }
+  if (url.pathname.startsWith("/api/match-requests/") && request.method === "PATCH") {
+    const viewer = viewerId(request);
+    if (!viewer) return json({error:"请先登录后管理需求"},{status:401});
+    const id = Number(url.pathname.split("/")[3]);
+    const input = await request.json<{status?:string}>().catch(() => ({}));
+    if (!Number.isInteger(id)||id<=0 || input.status!=="closed") return json({error:"只支持关闭有效需求"},{status:400});
+    const row = await env.DB.prepare("SELECT id,status FROM match_request WHERE id=? AND viewer_id=?").bind(id,viewer).first<{id:number;status:string}>();
+    if (!row) return json({error:"需求不存在或无权操作"},{status:404});
+    if (row.status==="closed") return json({ok:true,message:"需求已经关闭"});
+    const now = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE match_request SET status='closed' WHERE id=? AND viewer_id=?").bind(id,viewer),
+      env.DB.prepare("UPDATE match_candidate SET status='closed',updated_at=? WHERE (capital_request_id=? OR financing_request_id=?) AND status NOT IN ('completed','declined')").bind(now,id,id),
+      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("match_request",String(id),"closed",JSON.stringify({status:row.status}),JSON.stringify({status:"closed"}),viewer,now),
+    ]);
+    return json({ok:true,message:"需求已关闭，相关未完成候选不再推进"});
   }
   if (url.pathname === "/api/match-requests" && request.method === "POST") {
     type MatchInput = { role?:string;organization?:string;contactName?:string;email?:string;stockCode?:string;shareholder?:string;amountMin?:number;amountMax?:number;termMonths?:number;preference?:string;purpose?:string;notes?:string;consent?:boolean };

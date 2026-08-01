@@ -150,6 +150,8 @@ export const matchCandidates = sqliteTable("match_candidate", {
   financingConsented: integer("financing_consented", { mode: "boolean" }).notNull().default(false),
   capitalConsentedAt: text("capital_consented_at"),
   financingConsentedAt: text("financing_consented_at"),
+  capitalStage: text("capital_stage").notNull().default("reviewing"),
+  financingStage: text("financing_stage").notNull().default("reviewing"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [
