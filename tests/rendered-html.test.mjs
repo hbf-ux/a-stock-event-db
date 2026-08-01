@@ -64,6 +64,13 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /runDailyProductionCycle/);
   assert.match(worker, /daily_production_last/);
   assert.match(worker, /请先登录后提交人工审核/);
+  assert.match(worker, /\/api\/billing\/checkout/);
+  assert.match(worker, /\/api\/billing\/webhook/);
+  assert.match(worker, /verifyStripeSignature/);
+  assert.match(worker, /checkout\.session\.completed/);
+  assert.match(worker, /customer\.subscription\./);
+  assert.match(worker, /requiredEntitlement:\"advancedExport\"/);
+  assert.match(worker, /entitlementsFor/);
   assert.match(worker, /capital_stage='due_diligence'/);
   assert.match(worker, /stage_updated/);
   assert.match(worker, /需求已关闭，相关未完成候选不再推进/);
@@ -75,6 +82,22 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /openai_quota_blocked_until/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
   assert.match(layout, /A股股东融资风险即时情报与尽调报告/);
+});
+
+test("international intelligence and subscription surfaces use production data", async()=>{
+  const [english,pricing,billingMigration]=await Promise.all([
+    readFile(new URL("app/en/en-client.tsx",root),"utf8"),
+    readFile(new URL("app/pricing/pricing-client.tsx",root),"utf8"),
+    readFile(new URL("drizzle/0011_burly_shinko_yamashiro.sql",root),"utf8"),
+  ]);
+  assert.match(english,/\/api\/feed\?hours=168/);
+  assert.match(english,/Shareholder financing risk/);
+  assert.match(english,/OTC Filing Watch/);
+  assert.match(pricing,/\/api\/billing\/checkout/);
+  assert.match(pricing,/Global Filing Intelligence/);
+  assert.match(pricing,/Payment details are collected by Stripe Checkout/);
+  assert.match(billingMigration,/CREATE TABLE `billing_account`/);
+  assert.match(billingMigration,/CREATE TABLE `billing_event`/);
 });
 
 test("deployment bundle exists", async () => {

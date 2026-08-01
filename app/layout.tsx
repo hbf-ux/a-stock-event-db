@@ -9,5 +9,5 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="zh-CN"><body>{children}</body></html>;
+  return <html lang="zh-CN"><body>{children}<nav className="globalLanguageSwitch" aria-label="Language"><a href="/">中文</a><a href="/en">EN</a><a href="/pricing">订阅</a></nav></body></html>;
 }

@@ -184,3 +184,22 @@ export const matchCandidates = sqliteTable("match_candidate", {
   index("match_candidate_capital_status_idx").on(table.capitalRequestId, table.status),
   index("match_candidate_financing_status_idx").on(table.financingRequestId, table.status),
 ]);
+
+export const billingAccounts = sqliteTable("billing_account", {
+  userId: text("user_id").primaryKey(),
+  email: text("email").notNull(),
+  stripeCustomerId: text("stripe_customer_id").unique(),
+  stripeSubscriptionId: text("stripe_subscription_id").unique(),
+  plan: text("plan").notNull().default("free"),
+  status: text("status").notNull().default("inactive"),
+  currentPeriodEnd: text("current_period_end"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const billingEvents = sqliteTable("billing_event", {
+  eventId: text("event_id").primaryKey(),
+  type: text("type").notNull(),
+  payloadHash: text("payload_hash").notNull(),
+  processedAt: text("processed_at").notNull(),
+});

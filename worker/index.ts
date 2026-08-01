@@ -11,11 +11,17 @@ interface Env {
   /** OpenAI is a targeted fallback for PDFs that deterministic rules cannot parse safely. */
   OPENAI_API_KEY?: string;
   OPENAI_OCR_MODEL?: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  STRIPE_PRICE_PRO_MONTHLY?: string;
+  STRIPE_PRICE_TEAM_MONTHLY?: string;
+  STRIPE_PRICE_GLOBAL_MONTHLY?: string;
 }
 interface ExecutionContext { waitUntil(promise: Promise<unknown>): void; passThroughOnException(): void; }
 
 const json = (data: unknown, init: ResponseInit = {}) => new Response(JSON.stringify(data), { ...init, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...(init.headers || {}) } });
 const viewerId = (request: Request) => request.headers.get("oai-authenticated-user-id")?.trim() || null;
+const viewerEmail = (request: Request) => request.headers.get("oai-authenticated-user-email")?.trim().toLowerCase() || null;
 const matchStages = new Set(["reviewing","contacted","due_diligence","negotiating","completed","declined"]);
 
 async function ensureSchema(db: D1Database) {
@@ -42,6 +48,8 @@ async function ensureSchema(db: D1Database) {
     `CREATE TABLE IF NOT EXISTS match_candidate (id INTEGER PRIMARY KEY AUTOINCREMENT, capital_request_id INTEGER NOT NULL, financing_request_id INTEGER NOT NULL, score INTEGER NOT NULL, reasons TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', capital_consented INTEGER NOT NULL DEFAULT 0, financing_consented INTEGER NOT NULL DEFAULT 0, capital_consented_at TEXT, financing_consented_at TEXT, capital_stage TEXT NOT NULL DEFAULT 'reviewing', financing_stage TEXT NOT NULL DEFAULT 'reviewing', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(capital_request_id,financing_request_id))`,
     `CREATE INDEX IF NOT EXISTS match_candidate_capital_status_idx ON match_candidate (capital_request_id,status)`,
     `CREATE INDEX IF NOT EXISTS match_candidate_financing_status_idx ON match_candidate (financing_request_id,status)`,
+    `CREATE TABLE IF NOT EXISTS billing_account (user_id TEXT PRIMARY KEY, email TEXT NOT NULL, stripe_customer_id TEXT UNIQUE, stripe_subscription_id TEXT UNIQUE, plan TEXT NOT NULL DEFAULT 'free', status TEXT NOT NULL DEFAULT 'inactive', current_period_end TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS billing_event (event_id TEXT PRIMARY KEY, type TEXT NOT NULL, payload_hash TEXT NOT NULL, processed_at TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS pledge_date_idx ON pledge (announce_date)`,
     `CREATE INDEX IF NOT EXISTS pledge_stock_idx ON pledge (stock_code)`,
     `CREATE INDEX IF NOT EXISTS pledge_shareholder_idx ON pledge (shareholder)`,
@@ -694,16 +702,88 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
   }
 }
 
+const stripePlanPrices=(env:Env)=>({pro:env.STRIPE_PRICE_PRO_MONTHLY,team:env.STRIPE_PRICE_TEAM_MONTHLY,global:env.STRIPE_PRICE_GLOBAL_MONTHLY});
+const stripePlanFromPrice=(env:Env,priceId:string|null|undefined)=>Object.entries(stripePlanPrices(env)).find(([,id])=>id&&id===priceId)?.[0]||"free";
+const paidBillingStatuses=new Set(["active","trialing"]);
+const entitlementsFor=(plan:string,status:string)=>{const paid=plan!=="free"&&paidBillingStatuses.has(status);return {verifiedFeed:true,officialSources:true,csvExport:true,advancedExport:paid,fullHistory:paid,researchReports:paid,teamWorkspace:paid&&["team","global"].includes(plan),otcBundle:paid&&plan==="global"};};
+async function stripePost(env:Env,path:string,fields:Record<string,string>) {
+  if(!env.STRIPE_SECRET_KEY)throw new Error("Stripe 尚未配置");
+  const response=await fetch(`https://api.stripe.com/v1/${path}`,{method:"POST",headers:{authorization:`Bearer ${env.STRIPE_SECRET_KEY}`,"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams(fields)});
+  const payload=await response.json<Record<string,unknown>>().catch(()=>({}));
+  if(!response.ok)throw new Error(String((payload.error as {message?:string}|undefined)?.message||`Stripe HTTP ${response.status}`));
+  return payload;
+}
+function constantTimeHexEqual(left:string,right:string){if(left.length!==right.length)return false;let diff=0;for(let i=0;i<left.length;i++)diff|=left.charCodeAt(i)^right.charCodeAt(i);return diff===0;}
+async function verifyStripeSignature(rawBody:string,header:string|null,secret:string) {
+  if(!header)return false;const parts=header.split(",");const timestamp=parts.find((part)=>part.startsWith("t="))?.slice(2);const signatures=parts.filter((part)=>part.startsWith("v1=")).map((part)=>part.slice(3));
+  if(!timestamp||!signatures.length||Math.abs(Date.now()/1000-Number(timestamp))>300)return false;
+  const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+  const expected=hex(await crypto.subtle.sign("HMAC",key,new TextEncoder().encode(`${timestamp}.${rawBody}`)));
+  return signatures.some((signature)=>constantTimeHexEqual(signature,expected));
+}
+type StripeEvent={id:string;type:string;data:{object:Record<string,unknown>}};
+async function applyStripeEvent(db:D1Database,env:Env,event:StripeEvent,rawBody:string) {
+  const existing=await db.prepare("SELECT event_id FROM billing_event WHERE event_id=?").bind(event.id).first();if(existing)return {duplicate:true};
+  const object=event.data.object;const now=new Date().toISOString();const customerId=String(object.customer||"");const subscriptionId=String(object.subscription||object.id||"");
+  const metadata=(object.metadata||{}) as Record<string,string>;let userId=metadata.user_id||String(object.client_reference_id||"");
+  if(!userId&&customerId){const account=await db.prepare("SELECT user_id AS userId FROM billing_account WHERE stripe_customer_id=?").bind(customerId).first<{userId:string}>();userId=account?.userId||"";}
+  const eventStatement=db.prepare("INSERT INTO billing_event (event_id,type,payload_hash,processed_at) VALUES (?,?,?,?)").bind(event.id,event.type,hex(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(rawBody))),now);
+  if(!userId){await eventStatement.run();return {processed:true,accountUpdated:false};}
+  if(event.type==="checkout.session.completed"){
+    await db.batch([
+      db.prepare("UPDATE billing_account SET stripe_customer_id=?,stripe_subscription_id=?,status='processing',updated_at=? WHERE user_id=?").bind(customerId,subscriptionId,now,userId),eventStatement,
+    ]);return {processed:true,accountUpdated:true};
+  }
+  if(event.type.startsWith("customer.subscription.")){
+    const status=String(object.status||"inactive");const items=((object.items as {data?:Array<{price?:{id?:string}}>}|undefined)?.data||[]);const priceId=items[0]?.price?.id;const active=["active","trialing"].includes(status);const periodEnd=object.current_period_end?new Date(Number(object.current_period_end)*1000).toISOString():null;
+    await db.batch([
+      db.prepare("UPDATE billing_account SET stripe_customer_id=COALESCE(NULLIF(?,''),stripe_customer_id),stripe_subscription_id=?,plan=?,status=?,current_period_end=?,updated_at=? WHERE user_id=?").bind(customerId,String(object.id||subscriptionId),active?stripePlanFromPrice(env,priceId):"free",status,periodEnd,now,userId),eventStatement,
+    ]);return {processed:true,accountUpdated:true,plan:active?stripePlanFromPrice(env,priceId):"free",status};
+  }
+  await eventStatement.run();return {processed:true,accountUpdated:false};
+}
+
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   await ensureSchema(env.DB);
   const url = new URL(request.url);
+  if(url.pathname==="/api/billing/webhook"&&request.method==="POST"){
+    if(!env.STRIPE_WEBHOOK_SECRET)return json({error:"Stripe webhook 未配置"},{status:503});
+    const rawBody=await request.text();const valid=await verifyStripeSignature(rawBody,request.headers.get("stripe-signature"),env.STRIPE_WEBHOOK_SECRET);
+    if(!valid)return json({error:"invalid Stripe signature"},{status:400});
+    const event=JSON.parse(rawBody) as StripeEvent;const result=await applyStripeEvent(env.DB,env,event,rawBody);return json({received:true,...result});
+  }
+  if(url.pathname==="/api/billing/status"&&request.method==="GET"){
+    const viewer=viewerId(request);const configured=Boolean(env.STRIPE_SECRET_KEY&&Object.values(stripePlanPrices(env)).some(Boolean));
+    if(!viewer)return json({authenticated:false,configured,plan:"free",status:"anonymous",entitlements:entitlementsFor("free","anonymous")});
+    const account=await env.DB.prepare("SELECT email,stripe_customer_id AS stripeCustomerId,plan,status,current_period_end AS currentPeriodEnd,updated_at AS updatedAt FROM billing_account WHERE user_id=?").bind(viewer).first();
+    const plan=String((account as {plan?:string}|null)?.plan||"free");const status=String((account as {status?:string}|null)?.status||"inactive");return json({authenticated:true,configured,plan,status,...account,entitlements:entitlementsFor(plan,status)});
+  }
+  if(url.pathname==="/api/billing/checkout"&&request.method==="POST"){
+    const viewer=viewerId(request);const email=viewerEmail(request);if(!viewer||!email)return json({error:"请先登录后订阅"},{status:401});
+    const input=await request.json<{plan?:"pro"|"team"|"global";locale?:"zh"|"en"}>().catch(()=>({}));const plan=input.plan||"pro";const priceId=stripePlanPrices(env)[plan];
+    if(!env.STRIPE_SECRET_KEY||!priceId)return json({error:"支付通道尚未完成商户配置，请稍后再试"},{status:503});
+    const now=new Date().toISOString();let account=await env.DB.prepare("SELECT stripe_customer_id AS stripeCustomerId FROM billing_account WHERE user_id=?").bind(viewer).first<{stripeCustomerId:string}>();
+    if(!account?.stripeCustomerId){
+      const customer=await stripePost(env,"customers",{email,"metadata[user_id]":viewer,"metadata[source]":"pledge-radar"});const customerId=String(customer.id||"");if(!customerId)throw new Error("Stripe customer creation failed");
+      await env.DB.prepare("INSERT INTO billing_account (user_id,email,stripe_customer_id,plan,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET email=excluded.email,stripe_customer_id=excluded.stripe_customer_id,updated_at=excluded.updated_at").bind(viewer,email,customerId,"free","inactive",now,now).run();account={stripeCustomerId:customerId};
+    }
+    const returnPath=input.locale==="en"?"/en/pricing":"/pricing";
+    const session=await stripePost(env,"checkout/sessions",{mode:"subscription","line_items[0][price]":priceId,"line_items[0][quantity]":"1",customer:account.stripeCustomerId,"client_reference_id":viewer,"metadata[user_id]":viewer,"metadata[plan]":plan,"subscription_data[metadata][user_id]":viewer,"subscription_data[metadata][plan]":plan,success_url:`${url.origin}${returnPath}?checkout=success`,cancel_url:`${url.origin}${returnPath}?checkout=cancelled`,allow_promotion_codes:"true","billing_address_collection":"auto"});
+    return json({ok:true,url:session.url,sessionId:session.id});
+  }
+  if(url.pathname==="/api/billing/portal"&&request.method==="POST"){
+    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后管理订阅"},{status:401});
+    const input=await request.json<{locale?:"zh"|"en"}>().catch(()=>({}));
+    const account=await env.DB.prepare("SELECT stripe_customer_id AS stripeCustomerId FROM billing_account WHERE user_id=?").bind(viewer).first<{stripeCustomerId:string}>();if(!account?.stripeCustomerId)return json({error:"尚未建立付费账户"},{status:404});
+    const session=await stripePost(env,"billing_portal/sessions",{customer:account.stripeCustomerId,return_url:`${url.origin}${input.locale==="en"?"/en/pricing":"/pricing"}`});return json({ok:true,url:session.url});
+  }
   if (url.pathname === "/api/health") {
     const [stats,quotaState] = await Promise.all([
       env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews, (SELECT COUNT(*) FROM announcement WHERE parse_status='ignored') ignored_announcements").first(),
       env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
     ]);
     const quotaBlocked = Boolean(quotaState?.value && Date.parse(quotaState.value) > Date.now());
-    return json({ status: "ok", storage: { d1: true, r2: true }, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, stats, timestamp: new Date().toISOString() });
+    return json({ status: "ok", storage: { d1: true, r2: true }, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
@@ -1282,8 +1362,13 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ ok: true, status: body.status });
   }
   if (url.pathname === "/api/export" && request.method === "GET") {
-    const result = await env.DB.prepare("SELECT announce_date,stock_code,stock_name,shareholder,pledgee,pledge_amount_text,pledge_ratio,total_ratio,type FROM pledge ORDER BY announce_date DESC").all<Record<string, unknown>>();
     const format = url.searchParams.get("format") || "csv";
+    if(format!=="csv"){
+      const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后使用高级导出",upgrade:"/pricing"},{status:401});
+      const account=await env.DB.prepare("SELECT plan,status FROM billing_account WHERE user_id=?").bind(viewer).first<{plan:string;status:string}>();
+      if(!account||!entitlementsFor(account.plan,account.status).advancedExport)return json({error:"Excel 与 JSON 导出属于专业版权益",upgrade:"/pricing",requiredEntitlement:"advancedExport"},{status:402});
+    }
+    const result = await env.DB.prepare("SELECT announce_date,stock_code,stock_name,shareholder,pledgee,pledge_amount_text,pledge_ratio,total_ratio,type FROM pledge ORDER BY announce_date DESC").all<Record<string, unknown>>();
     if (format === "json") return json(result.results, { headers: { "content-disposition": "attachment; filename=pledge-events.json" } });
     const cols = ["announce_date","stock_code","stock_name","shareholder","pledgee","pledge_amount_text","pledge_ratio","total_ratio","type"];
     if (format === "xls") {

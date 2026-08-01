@@ -414,8 +414,12 @@ export default function Home() {
     flash(status === "approved" ? "审核通过，事件已写入数据库" : "该公告已标记为不入库");
   };
 
-  const exportData = () => {
-    window.location.href = `/api/export?format=${exportFormat}`;
+  const exportData = async () => {
+    const response=await fetch(`/api/export?format=${exportFormat}`);
+    if(response.status===401){window.location.href="/signin-with-chatgpt?return_to=/";return;}
+    if(response.status===402){window.location.href="/pricing";return;}
+    if(!response.ok){const body=await response.json().catch(()=>({})) as {error?:string};flash(body.error||"导出失败");return;}
+    const blob=await response.blob();const href=URL.createObjectURL(blob);const link=document.createElement("a");link.href=href;link.download=`pledge-events.${exportFormat}`;link.click();URL.revokeObjectURL(href);
     flash(`正在导出 ${exportFormat === "xls" ? "Excel" : exportFormat.toUpperCase()} 文件`);
   };
 
