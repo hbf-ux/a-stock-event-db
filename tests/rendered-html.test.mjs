@@ -21,6 +21,10 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(page, /profileIntelligenceStack/);
   assert.doesNotMatch(page, /\{profile && <CoveragePanel/);
   assert.match(page, /className="headerLanguage" href="\/en"/);
+  assert.match(page, /latestEvents=\{events\}/);
+  assert.match(page, /slice\(0, 12\)/);
+  assert.match(page, /const live24 =/);
+  assert.match(page, /intelFeedFooter/);
   assert.match(page, /主要质权人/);
   assert.match(page, /回补 7 日/);
   assert.match(page, /\/api\/announcements\/\$\{row\.announcementId\}\/process/);
