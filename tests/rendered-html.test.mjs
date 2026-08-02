@@ -104,8 +104,11 @@ test("production site contains the real announcement workflow", async () => {
 });
 
 test("international intelligence and subscription surfaces use production data", async()=>{
-  const [english,pricing,billingMigration]=await Promise.all([
+  const [english,englishDetail,englishLanguage,englishCompany,pricing,billingMigration]=await Promise.all([
     readFile(new URL("app/en/en-client.tsx",root),"utf8"),
+    readFile(new URL("app/en/intelligence-detail-en.tsx",root),"utf8"),
+    readFile(new URL("app/en/en-language.tsx",root),"utf8"),
+    readFile(new URL("app/en/company/[code]/page.tsx",root),"utf8"),
     readFile(new URL("app/pricing/pricing-client.tsx",root),"utf8"),
     readFile(new URL("drizzle/0011_burly_shinko_yamashiro.sql",root),"utf8"),
   ]);
@@ -113,6 +116,13 @@ test("international intelligence and subscription surfaces use production data",
   assert.match(english,/Shareholder financing risk/);
   assert.match(english,/OTC Filing Watch/);
   assert.match(english,/Hong Kong listings are not yet included/);
+  assert.match(english,/\/en\/company/);
+  assert.match(englishDetail,/\/api\/events/);
+  assert.match(englishDetail,/Verification and source evidence/);
+  assert.match(englishDetail,/route\("shareholder"/);
+  assert.match(englishDetail,/Mainland China A shares/);
+  assert.match(englishLanguage,/document\.documentElement\.lang = "en"/);
+  assert.match(englishCompany,/kind="company"/);
   assert.match(pricing,/\/api\/billing\/checkout/);
   assert.match(pricing,/Global Filing Intelligence/);
   assert.match(pricing,/Payment details are collected by Stripe Checkout/);
