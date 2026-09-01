@@ -1137,6 +1137,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ok:true,requested:ids.length,succeeded:results.filter((item)=>item.status!=="failed").length,failed:results.filter((item)=>item.status==="failed").length,autoProcessing:promoted>0,results});
   }
   if(url.pathname==="/api/operations/daily"&&request.method==="GET"){
+    await activeDailyProductionRun(env.DB);
     const [run,state,counts]=await Promise.all([
       env.DB.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,announcements_found AS announcementsFound,events_created AS eventsCreated,failures,message FROM sync_run WHERE source='daily-production-cycle' ORDER BY id DESC LIMIT 1").first(),
       env.DB.prepare("SELECT value,updated_at AS updatedAt FROM pipeline_state WHERE key='daily_production_last'").first<{value:string;updatedAt:string}>(),
