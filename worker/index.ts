@@ -500,11 +500,13 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   return {id,status:"parsed",events:completeRows,event_count:completeRows.length,parser_version:parserVersion};
 }
 
-async function processPendingQueue(db: D1Database, documents: R2Bucket, requestedLimit = 3, env?: Env) {
+async function processPendingQueue(db: D1Database, documents: R2Bucket, requestedLimit = 3, env?: Env, priorityDate?: string) {
   const limit = Math.min(Math.max(requestedLimit, 1), 10);
   const startedAt = new Date().toISOString();
   const run = await db.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("pdf-parser",startedAt,"running",`开始处理最多 ${limit} 条公告`).first<{id:number}>();
-  const pending = await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
+  const pending = priorityDate
+    ? await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') ORDER BY CASE WHEN announce_date=? THEN 0 ELSE 1 END,announce_date DESC LIMIT ?").bind(priorityDate,limit).all<{id:string}>()
+    : await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
   const results: unknown[] = []; let parsed = 0; let failures = 0;
   for (const row of pending.results) {
     try { const result = await processAnnouncement(db,documents,row.id,env); results.push(result); parsed += result.event_count || result.events_created || 0; }
@@ -797,7 +799,7 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
   try{
     const ingestion=await ingestCninfo(env.DB,date);
     const reconciliation=await runExchangeReconciliation(env.DB,date,["sse","szse","bse"]);
-    const processing=await processPendingQueue(env.DB,env.DOCUMENTS,10,env);
+    const processing=await processPendingQueue(env.DB,env.DOCUMENTS,10,env,date);
     const finishedAt=new Date().toISOString();
     const result={date,ingestion,reconciliation:{found:reconciliation.found,failures:reconciliation.failures,results:reconciliation.results},processing,startedAt,finishedAt};
     await env.DB.batch([
@@ -826,6 +828,16 @@ type AutomaticSyncState = {
   lastTriggeredAt?: string | null;
 };
 
+async function activeDailyProductionRun(db:D1Database) {
+  const active=await db.prepare("SELECT id,started_at AS startedAt FROM sync_run WHERE source='daily-production-cycle' AND status='running' ORDER BY id DESC LIMIT 1").first<{id:number;startedAt:string}>();
+  if(!active)return null;
+  const started=Date.parse(active.startedAt);
+  if(Number.isFinite(started)&&Date.now()-started<=45*60*1000)return active;
+  const finishedAt=new Date().toISOString();
+  await db.prepare("UPDATE sync_run SET finished_at=?,status='failed',failures=failures+1,message=? WHERE id=? AND status='running'").bind(finishedAt,"任务超过45分钟未结束，已自动释放锁以允许安全重试",active.id).run();
+  return null;
+}
+
 async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext):Promise<AutomaticSyncState> {
   const enabled=env.AUTO_SYNC_ENABLED?.trim().toLowerCase()!=="false";
   const configuredInterval=Number(env.AUTO_SYNC_INTERVAL_MINUTES||60);
@@ -833,7 +845,7 @@ async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext):Promi
   const targetDate=latestTradingDate();
   if(!enabled)return {enabled:false,status:"disabled",targetDate,intervalMinutes};
 
-  const activeRun=await env.DB.prepare("SELECT id,started_at AS startedAt FROM sync_run WHERE source='daily-production-cycle' AND status='running' ORDER BY id DESC LIMIT 1").first<{id:number;startedAt:string}>();
+  const activeRun=await activeDailyProductionRun(env.DB);
   if(activeRun)return {enabled:true,status:"running",targetDate,intervalMinutes,runId:activeRun.id,lastTriggeredAt:activeRun.startedAt};
   const startedAt=new Date().toISOString();
   const lockCutoff=new Date(Date.now()-intervalMinutes*60000).toISOString();
@@ -1136,7 +1148,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后运行每日数据闭环"},{status:401});
     const input=await request.json<{date?:string}>().catch(()=>({}));const date=input.date||latestTradingDate();
     if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!isTradingDate(date))return json({error:"请选择有效交易日"},{status:400});
-    const active=await env.DB.prepare("SELECT id,started_at AS startedAt FROM sync_run WHERE source='daily-production-cycle' AND status='running' ORDER BY id DESC LIMIT 1").first<{id:number;startedAt:string}>();
+    const active=await activeDailyProductionRun(env.DB);
     if(active)return json({error:"已有每日数据任务正在运行",runId:active.id,startedAt:active.startedAt},{status:409});
     const startedAt=new Date().toISOString();
     const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("daily-production-cycle",startedAt,"running",`每日生产闭环 ${date}`).first<{id:number}>();
@@ -1463,8 +1475,9 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   }
   if (url.pathname === "/api/process" && request.method === "POST") {
     if(!viewerId(request))return json({error:"请先登录后处理解析队列"},{status:401});
-    const input = await request.json<{limit?:number}>().catch(() => ({}));
-    return json({ ok:true,...await processPendingQueue(env.DB,env.DOCUMENTS,Number(input.limit) || 3,env) });
+    const input = await request.json<{limit?:number;date?:string}>().catch(() => ({}));
+    const priorityDate=/^\d{4}-\d{2}-\d{2}$/.test(input.date||"")?input.date:undefined;
+    return json({ ok:true,...await processPendingQueue(env.DB,env.DOCUMENTS,Number(input.limit) || 3,env,priorityDate) });
   }
   if (url.pathname === "/api/reprocess-reviews" && request.method === "POST") {
     if(!viewerId(request))return json({error:"请先登录后重试审核队列"},{status:401});
