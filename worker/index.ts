@@ -92,6 +92,9 @@ async function ensureSchema(db: D1Database) {
   if (!observationNames.has("reviewed_at")) await db.prepare("ALTER TABLE exchange_observation ADD COLUMN reviewed_at TEXT").run();
   if (!observationNames.has("reviewed_by")) await db.prepare("ALTER TABLE exchange_observation ADD COLUMN reviewed_by TEXT").run();
   if (!observationNames.has("review_note")) await db.prepare("ALTER TABLE exchange_observation ADD COLUMN review_note TEXT").run();
+  // Clear legacy false differences when the exchange row already has a
+  // deterministic one-to-one primary announcement match.
+  await db.prepare("UPDATE exchange_observation SET review_status='linked',reviewed_at=COALESCE(reviewed_at,?),reviewed_by=COALESCE(reviewed_by,'deterministic-reconciliation'),review_note=COALESCE(review_note,'同股票同日期只有一个质押公告候选，自动关联主库') WHERE review_status='pending' AND match_status='likely' AND match_method='single-pledge-candidate-same-stock-date' AND matched_announcement_id IS NOT NULL").bind(new Date().toISOString()).run();
   const pledgeColumns = await db.prepare("PRAGMA table_info(pledge)").all<{name:string}>();
   if (!pledgeColumns.results.some((column) => column.name === "event_fingerprint")) {
     await db.batch([
@@ -863,8 +866,10 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
   try{
     const ingestion=await ingestCninfo(env.DB,date);
     const reconciliation=await runExchangeReconciliation(env.DB,date,["sse","szse","bse"]);
-    const processing=await processPendingQueue(env.DB,env.DOCUMENTS,10,env,date);
-    const reviewCandidates=await env.DB.prepare("SELECT r.announcement_id AS id FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE r.status='pending' AND a.announce_date=? AND a.parse_status='review' AND a.parse_attempts<2 ORDER BY COALESCE(r.reviewed_at,r.created_at) ASC LIMIT 5").bind(date).all<{id:string}>();
+    // Keep each invocation bounded; report polling advances the queue in later
+    // idempotent runs instead of risking one oversized Worker execution.
+    const processing=await processPendingQueue(env.DB,env.DOCUMENTS,3,env,date);
+    const reviewCandidates=await env.DB.prepare("SELECT r.announcement_id AS id FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE r.status='pending' AND a.announce_date=? AND a.parse_status='review' AND a.parse_attempts<2 ORDER BY COALESCE(r.reviewed_at,r.created_at) ASC LIMIT 2").bind(date).all<{id:string}>();
     const reviews:unknown[]=[];
     for(const row of reviewCandidates.results){try{reviews.push(await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env));}catch(error){reviews.push({id:row.id,status:"failed",error:error instanceof Error?error.message:"review failed"});}}
     const closingSnapshot=await dailyReportSnapshot(env.DB,date);
@@ -897,24 +902,24 @@ type AutomaticSyncState = {
   lastTriggeredAt?: string | null;
 };
 
-async function activeDailyProductionRun(db:D1Database) {
-  const active=await db.prepare("SELECT id,started_at AS startedAt FROM sync_run WHERE source='daily-production-cycle' AND status='running' ORDER BY id DESC LIMIT 1").first<{id:number;startedAt:string}>();
+async function activeDailyProductionRun(db:D1Database,targetDate?:string) {
+  const staleAt=new Date(Date.now()-12*60*1000).toISOString();
+  await db.prepare("UPDATE sync_run SET finished_at=?,status='failed',failures=failures+1,message=COALESCE(message,'') || '；任务超过12分钟未结束，已自动释放锁' WHERE source='daily-production-cycle' AND status='running' AND started_at<?").bind(new Date().toISOString(),staleAt).run();
+  const active=targetDate
+    ?await db.prepare("SELECT id,started_at AS startedAt FROM sync_run WHERE source='daily-production-cycle' AND status='running' AND message LIKE ? ORDER BY id DESC LIMIT 1").bind(`%${targetDate}%`).first<{id:number;startedAt:string}>()
+    :await db.prepare("SELECT id,started_at AS startedAt FROM sync_run WHERE source='daily-production-cycle' AND status='running' ORDER BY id DESC LIMIT 1").first<{id:number;startedAt:string}>();
   if(!active)return null;
-  const started=Date.parse(active.startedAt);
-  if(Number.isFinite(started)&&Date.now()-started<=45*60*1000)return active;
-  const finishedAt=new Date().toISOString();
-  await db.prepare("UPDATE sync_run SET finished_at=?,status='failed',failures=failures+1,message=? WHERE id=? AND status='running'").bind(finishedAt,"任务超过45分钟未结束，已自动释放锁以允许安全重试",active.id).run();
-  return null;
+  return active;
 }
 
 async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext):Promise<AutomaticSyncState> {
   const enabled=env.AUTO_SYNC_ENABLED?.trim().toLowerCase()!=="false";
-  const configuredInterval=Number(env.AUTO_SYNC_INTERVAL_MINUTES||60);
-  const intervalMinutes=Number.isFinite(configuredInterval)?Math.min(Math.max(Math.round(configuredInterval),15),360):60;
+  const configuredInterval=Number(env.AUTO_SYNC_INTERVAL_MINUTES||5);
+  const intervalMinutes=Number.isFinite(configuredInterval)?Math.min(Math.max(Math.round(configuredInterval),3),360):5;
   const targetDate=automaticProductionTargetDate();
   if(!enabled)return {enabled:false,status:"disabled",targetDate,intervalMinutes};
 
-  const activeRun=await activeDailyProductionRun(env.DB);
+  const activeRun=await activeDailyProductionRun(env.DB,targetDate);
   if(activeRun)return {enabled:true,status:"running",targetDate,intervalMinutes,runId:activeRun.id,lastTriggeredAt:activeRun.startedAt};
   const startedAt=new Date().toISOString();
   const lockCutoff=new Date(Date.now()-intervalMinutes*60000).toISOString();
@@ -1274,7 +1279,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const input=await request.json<{date?:string}>().catch(()=>({}));const date=input.date||latestTradingDate();
     if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!isTradingDate(date))return json({error:"请选择有效交易日"},{status:400});
-    const active=await activeDailyProductionRun(env.DB);
+    const active=await activeDailyProductionRun(env.DB,date);
     if(active)return json({error:"已有每日数据任务正在运行",runId:active.id,startedAt:active.startedAt},{status:409});
     const startedAt=new Date().toISOString();
     const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("daily-production-cycle",startedAt,"running",`每日生产闭环 ${date}`).first<{id:number}>();

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import "./daily-report-pipeline.css";
 
 type EventRow = { id:number;announcementId:string;date:string;code:string;name:string;shareholder:string;pledgee:string;amount:string;ratio:string;total:string;type:string;verificationStatus:string;pdfUrl?:string };
 type Snapshot = {
@@ -8,6 +9,7 @@ type Snapshot = {
   announcement:{total?:number;classified?:number;pending?:number}; event:{total?:number;companies?:number;releases?:number;supplemental?:number};
   verification:{humanVerified?:number;aiReviewed?:number;rulesValidated?:number};
   reconciliation:{complete:boolean;successfulSources:number;requiredSources:number;unresolved:number};
+  automaticProduction?:{enabled:boolean;status:"disabled"|"fresh"|"running"|"started";targetDate:string;intervalMinutes:number;runId?:number;lastTriggeredAt?:string|null};
   published?:{reportVersion?:number;publishedAt?:string}|null; events:EventRow[]; methodology:string; generatedAt:string;
 };
 
@@ -25,6 +27,7 @@ export default function DailyReportClient({requestedDate}:{requestedDate?:string
   const [error,setError]=useState("");
   const load=useCallback(async()=>{setLoading(true);setError("");try{const query=requestedDate?`?date=${encodeURIComponent(requestedDate)}`:"";const response=await fetch(`/api/daily-report${query}`,{cache:"no-store"});if(!response.ok)throw new Error("日报数据暂不可用");setReport(await response.json() as Snapshot);}catch(reason){setError(reason instanceof Error?reason.message:"日报数据暂不可用");}finally{setLoading(false);}},[requestedDate]);
   useEffect(()=>{void load();},[load]);
+  useEffect(()=>{if(!report||report.status==="published")return;const timer=window.setInterval(()=>void load(),60_000);return()=>window.clearInterval(timer);},[load,report?.status]);
   const status=report?statusMap[report.status]:statusMap.collecting;
   const rows=report?.events||[];
   const highCount=useMemo(()=>rows.filter((row)=>Math.max(parseFloat(row.ratio)||0,parseFloat(row.total)||0)>=50).length,[rows]);
@@ -46,6 +49,7 @@ export default function DailyReportClient({requestedDate}:{requestedDate?:string
   return <main className="dailyPage"><header className="dailyHeader"><a className="dailyBrand" href="/"><span>HBF</span><b>质押日报<small>股东融资情报与撮合</small></b></a><nav><a className={!requestedDate?"active":""} href="/">今日报告</a><a className={requestedDate?"active":""} href="/reports">历史日报</a><a href="/match">撮合服务</a><a href="/match/desk">我的撮合</a></nav><a className="dailyEn" href="/en">EN</a></header>
     <div className="dailyShell">{loading?<div className="dailyState">正在读取关账数据…</div>:error?<div className="dailyState error">{error}<button onClick={()=>void load()}>重试</button></div>:report&&<>
       <section className="dailyMasthead"><div><p className="eyebrow">DAILY PLEDGE CLOSING REPORT</p><h1>{report.date}<br/>A股质押日报</h1><p>只发布每日20:00前披露、完成三所交叉核验和逐条审核的正式清单。</p></div><aside><span className={`closingStatus ${report.status}`}>{status.label}</span><b>{status.note}</b><small>关账时间：{report.date} 20:00（北京时间）</small><small>{report.published?.reportVersion?`报告版本：V${report.published.reportVersion}`:"正式发布前数据可能更新"}</small></aside></section>
+      {report.status!=="published"&&report.automaticProduction?.enabled&&<div className="dailyPipeline"><span className={report.automaticProduction.status==="running"||report.automaticProduction.status==="started"?"pulse":""}/><b>{report.automaticProduction.status==="running"||report.automaticProduction.status==="started"?"后台补跑中":"自动补跑已启用"}</b><em>目标交易日 {report.automaticProduction.targetDate}</em><small>{report.automaticProduction.runId?`任务 #${report.automaticProduction.runId}`:`每 ${report.automaticProduction.intervalMinutes} 分钟继续一批`} · 页面每分钟自动刷新</small></div>}
       <section className="dailyMetrics"><div><span>官方公告</span><strong>{number(report.announcement.total)}</strong><small>{number(report.announcement.pending)} 条待分类</small></div><div><span>质押事件</span><strong>{number(report.event.total)}</strong><small>逐条结构化核验</small></div><div><span>涉及公司</span><strong>{number(report.event.companies)}</strong><small>按股票代码去重</small></div><div><span>三所对账</span><strong>{report.reconciliation.successfulSources}/{report.reconciliation.requiredSources}</strong><small>{report.reconciliation.unresolved} 条差异待解决</small></div></section>
       <div className="dailyGrid"><section className="dailyReportCard"><div className="dailyCardHead"><div><p className="eyebrow">OFFICIAL DAILY LIST</p><h2>当日全部质押明细</h2><p>图片与PDF均由本页同一份关账数据生成。</p></div><div className="dailyActions"><button onClick={downloadImage} disabled={!rows.length}>下载长图 PNG</button><button className="primary" onClick={()=>window.print()} disabled={!rows.length}>打印 / 保存 PDF</button></div></div>
         <div className="dailyTrust"><span className={report.reconciliation.complete?"done":""}>三所公告对账</span><span className={!Number(report.announcement.pending)?"done":""}>公告完成分类</span><span className={report.ready?"done":""}>差异清零</span><b>{report.status==="published"?"正式关账版本":"未关账，不标注完整清单"}</b></div>
