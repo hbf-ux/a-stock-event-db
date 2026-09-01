@@ -14,6 +14,9 @@ interface Env {
   /** Request-driven production catch-up. Disable explicitly with "false". */
   AUTO_SYNC_ENABLED?: string;
   AUTO_SYNC_INTERVAL_MINUTES?: string;
+  /** Comma-separated Sites account user IDs and/or emails allowed to mutate production data. */
+  ADMIN_USER_IDS?: string;
+  ADMIN_EMAILS?: string;
   STRIPE_SECRET_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;
   STRIPE_PRICE_PRO_MONTHLY?: string;
@@ -25,6 +28,16 @@ interface ExecutionContext { waitUntil(promise: Promise<unknown>): void; passThr
 const json = (data: unknown, init: ResponseInit = {}) => new Response(JSON.stringify(data), { ...init, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...(init.headers || {}) } });
 const viewerId = (request: Request) => request.headers.get("oai-authenticated-user-id")?.trim() || null;
 const viewerEmail = (request: Request) => request.headers.get("oai-authenticated-user-email")?.trim().toLowerCase() || null;
+const commaSeparatedSet = (value?: string) => new Set((value || "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean));
+const adminViewer = (request: Request, env: Env) => {
+  const id = viewerId(request);
+  const email = viewerEmail(request);
+  if (!id) return null;
+  const ids = commaSeparatedSet(env.ADMIN_USER_IDS);
+  const emails = commaSeparatedSet(env.ADMIN_EMAILS);
+  return ids.has(id.toLowerCase()) || Boolean(email && emails.has(email)) ? id : null;
+};
+const adminRequired = () => json({ error: "仅运营管理员可执行此操作" }, { status: 403 });
 const matchStages = new Set(["reviewing","contacted","due_diligence","negotiating","completed","declined"]);
 
 async function ensureSchema(db: D1Database) {
@@ -1007,7 +1020,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ daily:daily.results.reverse(),eventTypes:eventTypes.results,pledgees:pledgees.results,statuses:statuses.results });
   }
   if (url.pathname === "/api/sync" && request.method === "POST") {
-    if(!viewerId(request))return json({error:"请先登录后同步公告"},{status:401});
+    if(!adminViewer(request,env))return adminRequired();
     const input = await request.json<{date?:string}>().catch(() => ({})); const date = input.date && /^\d{4}-\d{2}-\d{2}$/.test(input.date) ? input.date : shanghaiDate(-1);
     const startedAt = new Date().toISOString();
     const run = await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("official-adapters",startedAt,"running","V1 适配器初始化").first<{id:number}>();
@@ -1030,7 +1043,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ cursor, coverage, generatedAt:new Date().toISOString(), scope:"每日向更早日期滚动回补；游标独立于是否发现公告" });
   }
   if (url.pathname === "/api/backfill-extend" && request.method === "POST") {
-    if(!viewerId(request))return json({error:"请先登录后运行历史回补"},{status:401});
+    if(!adminViewer(request,env))return adminRequired();
     const input = await request.json<{days?:number}>().catch(() => ({}));
     const tradingDays = Math.min(Math.max(Number(input.days) || 5,1),7);
     const result=await runHistoricalBackfillBatch(env,tradingDays);
@@ -1038,7 +1051,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({...result,auto_processing:Boolean(result.inserted)});
   }
   if (url.pathname === "/api/backfill-plan" && request.method === "POST") {
-    if(!viewerId(request))return json({error:"请先登录后运行缺口回补"},{status:401});
+    if(!adminViewer(request,env))return adminRequired();
     const input = await request.json<{start?:string;end?:string}>().catch(() => ({}));
     const end = input.end || shanghaiDate(); const start = input.start || shanghaiDate(-6);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || start > end) return json({ error: "invalid-date-range" }, { status: 400 });
@@ -1065,7 +1078,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ start, end, days, calendar, missingDates, scope: "公告日期缺口提示；空白日期可能是周末、节假日或尚未抓取，需回补后确认" });
   }
   if (url.pathname === "/api/backfill" && request.method === "POST") {
-    if(!viewerId(request))return json({error:"请先登录后运行公告回补"},{status:401});
+    if(!adminViewer(request,env))return adminRequired();
     const input = await request.json<{days?:number;endDate?:string}>().catch(() => ({}));
     const days = Math.min(Math.max(Number(input.days) || 7,1),7);
     const endDate = input.endDate && /^\d{4}-\d{2}-\d{2}$/.test(input.endDate) ? input.endDate : shanghaiDate();
@@ -1112,7 +1125,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({date,summary:summary.results,rows:rows.results,lastRun,sourceRuns,completeness,capabilities:{sse:"支持指定日期全量分页",szse:"公开接口仅支持最近披露窗口",bse:"支持指定日期关键词核验"},scope:"独立观察与差异识别；只有三所均成功且未解决差异为零才通过完整性核验",generatedAt:new Date().toISOString()});
   }
   if (url.pathname === "/api/reconciliation/run" && request.method === "POST") {
-    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后运行交易所对账"},{status:401});
+    const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const input=await request.json<{date?:string;sources?:string[]}>().catch(()=>({}));
     const date=input.date||shanghaiDate(-1);if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return json({error:"无效对账日期"},{status:400});
     const sources=[...new Set((input.sources||["sse","szse","bse"]).filter((source)=>["sse","szse","bse"].includes(source)))];if(!sources.length)return json({error:"请选择至少一个交易所"},{status:400});
@@ -1124,7 +1137,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   }
   const reconciliationAction=url.pathname.match(/^\/api\/reconciliation\/observations\/(\d+)\/(promote|reject)$/);
   if(reconciliationAction&&request.method==="POST"){
-    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后处理对账差异"},{status:401});
+    const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const id=Number(reconciliationAction[1]);const action=reconciliationAction[2];
     try{
       if(action==="promote"){
@@ -1154,7 +1167,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     }catch(error){return json({error:error instanceof Error?error.message:"差异处理失败"},{status:409});}
   }
   if(url.pathname==="/api/reconciliation/batch"&&request.method==="POST"){
-    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后批量处理对账差异"},{status:401});
+    const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const input=await request.json<{ids?:number[];action?:"promote"|"reject";note?:string}>().catch(()=>({}));
     const ids=[...new Set((input.ids||[]).map(Number).filter((id)=>Number.isInteger(id)&&id>0))].slice(0,10);
     if(!ids.length||!["promote","reject"].includes(input.action||""))return json({error:"请选择 1 至 10 条待处理差异"},{status:400});
@@ -1187,7 +1200,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({run,lastResult:state?JSON.parse(state.value):null,lastUpdatedAt:state?.updatedAt||null,counts,recommendedDate:latestTradingDate(),scope:"同步巨潮质押公告、运行三所独立对账并处理待解析队列"});
   }
   if(url.pathname==="/api/operations/daily"&&request.method==="POST"){
-    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后运行每日数据闭环"},{status:401});
+    const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const input=await request.json<{date?:string}>().catch(()=>({}));const date=input.date||latestTradingDate();
     if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!isTradingDate(date))return json({error:"请选择有效交易日"},{status:400});
     const active=await activeDailyProductionRun(env.DB);
@@ -1208,7 +1221,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({lastResult:state?JSON.parse(state.value):null,lastUpdatedAt:state?.updatedAt||null,candidates,latestEvidenceRun,scope:"每天最多用v2.4重试3份待审核公告、处理5份PDF证据并向前回补1个交易日"});
   }
   if(url.pathname==="/api/maintenance"&&request.method==="POST"){
-    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后运行数据维护"},{status:401});
+    const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const active=await env.DB.prepare("SELECT id,source,started_at AS startedAt FROM sync_run WHERE source IN ('evidence-backfill','historical-rolling-backfill') AND status='running' ORDER BY id DESC LIMIT 1").first();
     if(active)return json({error:"已有数据维护任务正在运行",active},{status:409});
     const now=new Date().toISOString();await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('automatic_maintenance_trigger',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify({reason:"manual",status:"running",viewer}),now).run();
@@ -1320,8 +1333,8 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       const rows = await env.DB.prepare("SELECT stock_code AS stockCode,shareholder,identity_type AS identityType,is_controller AS isController,is_controlling_shareholder AS isControllingShareholder,holding_shares AS holdingShares,holding_ratio AS holdingRatio,source_title AS sourceTitle,source_url AS sourceUrl,source_date AS sourceDate,confidence,updated_at AS updatedAt,updated_by AS updatedBy FROM shareholder_profile WHERE stock_code=? ORDER BY is_controller DESC,is_controlling_shareholder DESC,updated_at DESC").bind(stock).all();
       return json({ data: rows.results, stock, traceable: true });
     }
-    const userId = viewerId(request);
-    if (!userId) return json({ error: "sign-in-required" }, { status: 401 });
+    const userId = adminViewer(request,env);
+    if (!userId) return adminRequired();
     const input = await request.json<{shareholder?:string;identityType?:string;holdingShares?:number|null;holdingRatio?:string;sourceTitle?:string;sourceUrl?:string;sourceDate?:string}>().catch(() => ({}));
     const shareholder = String(input.shareholder || "").trim();
     if (!shareholder || shareholder.length > 120) return json({ error: "invalid-shareholder" }, { status: 400 });
@@ -1516,13 +1529,13 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ data: result.results });
   }
   if (url.pathname === "/api/process" && request.method === "POST") {
-    if(!viewerId(request))return json({error:"请先登录后处理解析队列"},{status:401});
+    if(!adminViewer(request,env))return adminRequired();
     const input = await request.json<{limit?:number;date?:string}>().catch(() => ({}));
     const priorityDate=/^\d{4}-\d{2}-\d{2}$/.test(input.date||"")?input.date:undefined;
     return json({ ok:true,...await processPendingQueue(env.DB,env.DOCUMENTS,Number(input.limit) || 3,env,priorityDate) });
   }
   if (url.pathname === "/api/reprocess-reviews" && request.method === "POST") {
-    if(!viewerId(request))return json({error:"请先登录后重试审核队列"},{status:401});
+    if(!adminViewer(request,env))return adminRequired();
     const input = await request.json<{limit?:number;force?:boolean;date?:string}>().catch(() => ({}));
     const limit = Math.min(Math.max(Number(input.limit) || 3,1),10);
     const date=/^\d{4}-\d{2}-\d{2}$/.test(input.date||"")?input.date:undefined;
@@ -1537,7 +1550,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ok:true,requested:limit,processed:results.length,results});
   }
   if (url.pathname.startsWith("/api/review-corrections/") && request.method === "POST") {
-    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后应用逐页复核结果"},{status:401});
+    const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const date=decodeURIComponent(url.pathname.split("/").pop()||"");
     const corrections=OFFICIAL_DATE_CORRECTIONS[date];
     if(!corrections)return json({error:"该日期没有已签署的逐页复核校正集"},{status:404});
@@ -1565,12 +1578,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ok:failures.length===0,date,announcements,events,failures,reviewSet:`official-${date}-v1`},{status:failures.length?207:200});
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/process") && request.method === "POST") {
-    if(!viewerId(request))return json({error:"请先登录后处理公告"},{status:401});
+    if(!adminViewer(request,env))return adminRequired();
     const id = url.pathname.split("/")[3];
     return json(await processAnnouncement(env.DB, env.DOCUMENTS, id, env));
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/archive") && request.method === "POST") {
-    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后归档公告"},{status:401});
+    const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const id = url.pathname.split("/")[3]; const item = await env.DB.prepare("SELECT pdf_url AS pdfUrl FROM announcement WHERE announcement_id=?").bind(id).first<{pdfUrl:string}>();
     if (!item?.pdfUrl) return json({error:"announcement not found"},{status:404});
     const response = await fetch(item.pdfUrl,{headers:{referer:"https://www.cninfo.com.cn/","user-agent":"Mozilla/5.0 (compatible; StockEventDB/1.0)"}}); if (!response.ok) return json({error:`PDF download failed: ${response.status}`},{status:502});
@@ -1581,11 +1594,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ok:true,key,sha256,size:bytes.byteLength});
   }
   if (url.pathname === "/api/reviews" && request.method === "GET") {
+    if(!adminViewer(request,env))return adminRequired();
     const result = await env.DB.prepare("SELECT r.id,r.announcement_id AS announcementId,r.event_type AS eventType,r.reason,r.payload,r.status,r.created_at AS createdAt,r.reviewed_at AS reviewedAt,r.resolution,a.stock_code AS stockCode,a.stock_name AS stockName,a.title,a.announce_date AS announceDate,a.pdf_url AS pdfUrl FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id ORDER BY CASE WHEN r.status='pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 200").all();
     return json({ data: result.results });
   }
   if (url.pathname.startsWith("/api/reviews/") && request.method === "PATCH") {
-    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后提交人工审核"},{status:401});
+    const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const id = Number(url.pathname.split("/").pop());
     const body = await request.json<{status?:string;resolution?:string;shareholder?:string;pledgee?:string;amount?:number;amountText?:string;pledgeRatio?:string;totalRatio?:string;type?:string}>();
     if (!id || !["approved","rejected"].includes(body.status || "")) return json({ error: "invalid review update" }, { status: 400 });

@@ -73,7 +73,9 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /\/api\/operations\/daily/);
   assert.match(worker, /runDailyProductionCycle/);
   assert.match(worker, /daily_production_last/);
-  assert.match(worker, /请先登录后提交人工审核/);
+  assert.match(worker, /ADMIN_USER_IDS/);
+  assert.match(worker, /adminViewer/);
+  assert.match(worker, /仅运营管理员可执行此操作/);
   assert.match(worker, /\/api\/billing\/checkout/);
   assert.match(worker, /\/api\/billing\/webhook/);
   assert.match(worker, /verifyStripeSignature/);

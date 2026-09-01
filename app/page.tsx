@@ -308,13 +308,13 @@ export default function Home() {
         fetch("/api/stats", { cache: "no-store" }),
         fetch("/api/coverage", { cache: "no-store" }),
       ]);
-      if (!eventResponse.ok || !feedResponse.ok || !announcementResponse.ok || !healthResponse.ok || !reviewResponse.ok || !runResponse.ok || !statsResponse.ok || !coverageResponse.ok) throw new Error("API unavailable");
+      if (!eventResponse.ok || !feedResponse.ok || !announcementResponse.ok || !healthResponse.ok || !runResponse.ok || !statsResponse.ok || !coverageResponse.ok) throw new Error("API unavailable");
       const eventPayload = await eventResponse.json() as { data: EventRow[] };
       const announcementPayload = await announcementResponse.json() as { data: AnnouncementRow[] };
       setEvents(eventPayload.data);
       setFeedEvents((await feedResponse.json() as { data: EventRow[] }).data);
       setAnnouncements(announcementPayload.data);
-      setReviews((await reviewResponse.json() as { data: ReviewRow[] }).data);
+      setReviews(reviewResponse.ok ? (await reviewResponse.json() as { data: ReviewRow[] }).data : []);
       setSyncRuns((await runResponse.json() as { data: SyncRun[] }).data);
       setStatsData(await statsResponse.json() as StatsData);
       setHealth(await healthResponse.json() as Health);
