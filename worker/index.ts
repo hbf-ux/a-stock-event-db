@@ -212,12 +212,15 @@ const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resol
 async function fetchWithRetry(input: RequestInfo | URL, init?: RequestInit, attempts = 3) {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort("official source request timed out"), 12_000);
     try {
-      const response = await fetch(input,init);
+      const response = await fetch(input,{...init,signal:controller.signal});
       if (response.ok || (response.status < 500 && response.status !== 429)) return response;
       if (attempt === attempts) return response;
       lastError = new Error(`HTTP ${response.status}`);
     } catch (error) { lastError = error; }
+    finally { clearTimeout(timeout); }
     if (attempt < attempts) await wait(300 * 3 ** (attempt - 1));
   }
   throw lastError instanceof Error ? lastError : new Error("request failed after retries");
@@ -660,7 +663,10 @@ async function fetchCninfo(date: string) {
   const all: CninfoAnnouncement[] = [];
   const warnings: string[] = [];
   let successfulQueries = 0;
-  const keywords = ["质押", "股份质押", "股票质押", "补充质押", "解除质押"];
+  // “质押” is the inclusive full-text term for新增、补充、解除和展期。
+  // Repeating five overlapping terms multiplied the same result set and could
+  // leave a Worker waiting on 15-150 upstream requests before parsing began.
+  const keywords = ["质押"];
   for (const column of ["szse", "sse", "bjse"]) {
     keywordLoop: for (const searchkey of keywords) {
       for (let pageNum = 1; pageNum <= 10; pageNum++) {
