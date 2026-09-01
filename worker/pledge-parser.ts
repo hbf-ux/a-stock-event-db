@@ -28,7 +28,13 @@ const genericInstitutions = new Set(["有限公司","有限责任公司","股份
 
 export function normalizePledgeEntity(value: string, kind: "shareholder" | "pledgee") {
   let normalized = String(value || "").replace(/[\s\u00a0]+/g, "").replace(/^[，。；;：:、]+|[，。；;：:、]+$/g, "");
-  if (kind === "shareholder") normalized = normalized.replace(/^(?:申请人等|申请人|出质人)(?=[\u4e00-\u9fff（）()·]{2,})/,"");
+  if (kind === "shareholder") {
+    normalized = normalized.replace(/^(?:申请人等|申请人|出质人)(?=[\u4e00-\u9fff（）()·]{2,})/,"");
+    // PDF table extraction can glue the following 是/否 column to a short
+    // shareholder name (for example “马红富否”). Institution names end in a
+    // legal suffix, so only trim this residue from person-like Han names.
+    if (/^[\u4e00-\u9fff·]{3,20}[是否]$/.test(normalized)) normalized = normalized.slice(0,-1);
+  }
   if (kind === "pledgee") {
     normalized = normalized.replace(/^为准[）)]/,"");
     if (/^[日止][\u4e00-\u9fff（）()·]{4,}/.test(normalized) && institutionSuffix.test(normalized.slice(1))) normalized = normalized.slice(1);
