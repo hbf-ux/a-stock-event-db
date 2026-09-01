@@ -209,6 +209,11 @@ async function refreshMatchCandidates(db:D1Database,requestId:number) {
   return created;
 }
 const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve,milliseconds));
+async function withDeadline<T>(work:Promise<T>,milliseconds:number,label:string):Promise<T>{
+  let timeout:ReturnType<typeof setTimeout>|undefined;
+  try{return await Promise.race([work,new Promise<T>((_,reject)=>{timeout=setTimeout(()=>reject(new Error(`${label} exceeded ${Math.round(milliseconds/1000)} seconds`)),milliseconds);})]);}
+  finally{if(timeout)clearTimeout(timeout);}
+}
 async function fetchWithRetry(input: RequestInfo | URL, init?: RequestInit, attempts = 3) {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -578,7 +583,7 @@ async function processPendingQueue(db: D1Database, documents: R2Bucket, requeste
     : await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
   const results: unknown[] = []; let parsed = 0; let failures = 0;
   for (const row of pending.results) {
-    try { const result = await processAnnouncement(db,documents,row.id,env); results.push(result); parsed += result.event_count || result.events_created || 0; }
+    try { const result = await withDeadline(processAnnouncement(db,documents,row.id,env),25_000,`announcement ${row.id}`); results.push(result); parsed += result.event_count || result.events_created || 0; }
     catch (error) {
       failures++; const message = error instanceof Error ? error.message : "parse failed";
       await db.prepare("UPDATE announcement SET parse_attempts=parse_attempts+1,last_error=? WHERE announcement_id=?").bind(message,row.id).run();
