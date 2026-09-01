@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
 import { isRelevantSharePledgeTitle, parseSectionPledgeRows, validateAndNormalizePledgeRow } from "../worker/pledge-parser.ts";
 
@@ -105,4 +106,19 @@ test("marks a new pledge in a release-and-repledge announcement", () => {
 test("accepts limited-partnership pledgees", () => {
   const row=validateAndNormalizePledgeRow({shareholder:"通运投资",pledgee:"烟台华周投资中心（有限合伙）",amount:2000000,amountText:"2,000,000 股",pledgeRatio:"0.95%",totalRatio:"0.28%",type:"补充质押",missing:[]});
   assert.deepEqual(row.missing,[]);
+});
+
+test("accepts pledge extensions as a distinct audited event type", () => {
+  const row=validateAndNormalizePledgeRow({shareholder:"西藏新产业投资管理有限公司",pledgee:"华泰证券股份有限公司",amount:12060000,amountText:"1,206.00万 股",pledgeRatio:"5.7108%",totalRatio:"1.5349%",type:"质押展期",missing:[]});
+  assert.deepEqual(row.missing,[]);
+});
+
+test("2026-08-31 official correction set covers nine announcements and fifteen rows", () => {
+  const worker=fs.readFileSync(new URL("../worker/index.ts",import.meta.url),"utf8");
+  const start=worker.indexOf('"2026-08-31":[');
+  const end=worker.indexOf("  ],\n};",start);
+  const correctionSet=worker.slice(start,end);
+  assert.equal([...correctionSet.matchAll(/stockCode:/g)].length,9);
+  assert.equal([...correctionSet.matchAll(/amount:\d/g)].length,15);
+  assert.match(worker,/official_pdf_correction/);
 });

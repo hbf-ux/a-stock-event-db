@@ -206,7 +206,48 @@ const firstMatch = (text: string, patterns: RegExp[]) => {
   }
   return "";
 };
-const pledgeType = (title: string) => title.includes("解除") && title.includes("再质押") ? "解除后再质押" : title.includes("解除") ? "解除质押" : title.includes("补充") ? "补充质押" : "新增质押";
+const pledgeType = (title: string) => title.includes("延期") || title.includes("展期") ? "质押展期" : title.includes("解除") && (title.includes("再质押") || title.includes("继续质押")) ? "解除后再质押" : title.includes("解除") ? "解除质押" : title.includes("补充") ? "补充质押" : "新增质押";
+
+type OfficialCorrectionEvent = {shareholder:string;pledgee:string;amount:number;amountText:string;pledgeRatio:string;totalRatio:string;startDate:string;endDate:string;purpose:string;type:string};
+type OfficialCorrection = {stockCode:string;stockName:string;events:OfficialCorrectionEvent[]};
+
+const OFFICIAL_DATE_CORRECTIONS:Record<string,OfficialCorrection[]>={
+  "2026-08-31":[
+    {stockCode:"300432",stockName:"富临精工",events:[
+      {shareholder:"四川富临实业集团有限公司",pledgee:"中国银河证券股份有限公司",amount:13600000,amountText:"13,600,000 股",pledgeRatio:"2.62%",totalRatio:"0.80%",startDate:"2026-01-15",endDate:"2026-08-28",purpose:"",type:"解除质押"},
+    ]},
+    {stockCode:"300538",stockName:"同益股份",events:[
+      {shareholder:"邵羽南",pledgee:"深圳市高新投小额贷款有限公司",amount:1000000,amountText:"1,000,000 股",pledgeRatio:"3.49%",totalRatio:"0.55%",startDate:"2026-08-28",endDate:"至解除质押登记日止",purpose:"置换存量股权质押融资",type:"新增质押"},
+      {shareholder:"华青翠",pledgee:"深圳市高新投小额贷款有限公司",amount:7350000,amountText:"7,350,000 股",pledgeRatio:"18.86%",totalRatio:"4.04%",startDate:"2026-08-28",endDate:"至解除质押登记日止",purpose:"置换存量股权质押融资",type:"新增质押"},
+    ]},
+    {stockCode:"300558",stockName:"贝达药业",events:[
+      {shareholder:"宁波凯铭投资管理合伙企业（有限合伙）",pledgee:"渤海国际信托股份有限公司",amount:9300000,amountText:"9,300,000 股",pledgeRatio:"11.62%",totalRatio:"2.20%",startDate:"2026-08-28",endDate:"2027-08-30",purpose:"自身经营",type:"新增质押"},
+      {shareholder:"宁波凯铭投资管理合伙企业（有限合伙）",pledgee:"山东省国际信托股份有限公司",amount:10730000,amountText:"10,730,000 股",pledgeRatio:"13.40%",totalRatio:"2.53%",startDate:"2026-02-26",endDate:"2026-08-31",purpose:"",type:"解除质押"},
+    ]},
+    {stockCode:"300654",stockName:"世纪天鸿",events:[
+      {shareholder:"山东志鸿教育投资（集团）有限公司",pledgee:"国金证券股份有限公司",amount:3320000,amountText:"3,320,000 股",pledgeRatio:"2.07%",totalRatio:"0.91%",startDate:"2025-09-09",endDate:"2026-08-28",purpose:"",type:"解除质押"},
+    ]},
+    {stockCode:"300832",stockName:"新产业",events:[
+      {shareholder:"西藏新产业投资管理有限公司",pledgee:"华泰证券股份有限公司",amount:12060000,amountText:"1,206.00万 股",pledgeRatio:"5.7108%",totalRatio:"1.5349%",startDate:"2025-08-28",endDate:"2027-08-27",purpose:"偿还负债；原到期日2026-08-28",type:"质押展期"},
+      {shareholder:"西藏新产业投资管理有限公司",pledgee:"华泰证券股份有限公司",amount:2000000,amountText:"200.00万 股",pledgeRatio:"0.9471%",totalRatio:"0.2545%",startDate:"2026-07-08",endDate:"2027-08-27",purpose:"补充质押；原到期日2026-08-28",type:"质押展期"},
+    ]},
+    {stockCode:"301291",stockName:"明阳电气",events:[
+      {shareholder:"中山市明阳电器有限公司",pledgee:"国通信托有限责任公司",amount:10000000,amountText:"10,000,000 股",pledgeRatio:"7.66%",totalRatio:"3.18%",startDate:"2026-08-28",endDate:"至办理解除质押登记为止",purpose:"日常经营",type:"新增质押"},
+    ]},
+    {stockCode:"301316",stockName:"慧博云通",events:[
+      {shareholder:"舟山慧博创展创业投资合伙企业（有限合伙）",pledgee:"云南国际信托有限公司",amount:2850000,amountText:"2,850,000 股",pledgeRatio:"4.75%",totalRatio:"0.71%",startDate:"2025-08-26",endDate:"2026-08-28",purpose:"",type:"解除质押"},
+      {shareholder:"舟山慧博创展创业投资合伙企业（有限合伙）",pledgee:"云南国际信托有限公司",amount:2900000,amountText:"2,900,000 股",pledgeRatio:"4.83%",totalRatio:"0.72%",startDate:"2025-08-26",endDate:"2026-08-28",purpose:"",type:"解除质押"},
+    ]},
+    {stockCode:"301589",stockName:"诺瓦星云",events:[
+      {shareholder:"袁胜春",pledgee:"华能贵诚信托有限公司",amount:2460000,amountText:"2,460,000 股",pledgeRatio:"11.53%",totalRatio:"2.66%",startDate:"2026-01-12",endDate:"2026-08-28",purpose:"",type:"解除质押"},
+      {shareholder:"宗靖国",pledgee:"华能贵诚信托有限公司",amount:2460000,amountText:"2,460,000 股",pledgeRatio:"17.40%",totalRatio:"2.66%",startDate:"2026-01-12",endDate:"2026-08-28",purpose:"",type:"解除质押"},
+    ]},
+    {stockCode:"920914",stockName:"远航精密",events:[
+      {shareholder:"江苏远航时代控股集团有限公司",pledgee:"华夏银行股份有限公司宜兴支行",amount:6500000,amountText:"6,500,000 股",pledgeRatio:"16.39%",totalRatio:"6.52%",startDate:"2025-01-17",endDate:"2026-08-27",purpose:"",type:"解除质押"},
+      {shareholder:"江苏远航时代控股集团有限公司",pledgee:"华夏银行股份有限公司宜兴支行",amount:6500000,amountText:"6,500,000 股",pledgeRatio:"16.39%",totalRatio:"6.52%",startDate:"2026-08-27",endDate:"至办理解除质押登记手续止",purpose:"为增持专项贷款提供担保",type:"解除后再质押"},
+    ]},
+  ],
+};
 const amountNumber = (value: string) => {
   const numeric = Number(value.replace(/,/g, "").match(/[\d.]+/)?.[0] || 0);
   if (/亿/.test(value)) return numeric * 100000000;
@@ -320,7 +361,7 @@ async function parseWithOpenAI(pdfBase64: string, context: { title:string; stock
         shareholder:{type:"string"}, pledgee:{type:"string"}, pledge_amount:{type:"string"},
         pledge_ratio:{type:"string"}, total_ratio:{type:"string"}, start_date:{type:"string"},
         end_date:{type:"string"}, purpose:{type:"string"},
-        type:{type:"string",enum:["新增质押","补充质押","解除质押","解除后再质押"]},
+        type:{type:"string",enum:["新增质押","补充质押","解除质押","解除后再质押","质押展期"]},
       },
     }}},
   };
@@ -1494,6 +1535,34 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       catch (error) { results.push({id:row.id,status:"failed",error:error instanceof Error ? error.message : "reprocess failed"}); }
     }
     return json({ok:true,requested:limit,processed:results.length,results});
+  }
+  if (url.pathname.startsWith("/api/review-corrections/") && request.method === "POST") {
+    const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后应用逐页复核结果"},{status:401});
+    const date=decodeURIComponent(url.pathname.split("/").pop()||"");
+    const corrections=OFFICIAL_DATE_CORRECTIONS[date];
+    if(!corrections)return json({error:"该日期没有已签署的逐页复核校正集"},{status:404});
+    const now=new Date().toISOString();let announcements=0;let events=0;const failures:Array<{stockCode:string;error:string}>=[];
+    for(const correction of corrections){
+      try{
+        const announcement=await env.DB.prepare("SELECT announcement_id AS id,title FROM announcement WHERE stock_code=? AND announce_date=? ORDER BY CASE WHEN source='巨潮资讯' THEN 0 ELSE 1 END LIMIT 1").bind(correction.stockCode,date).first<{id:string;title:string}>();
+        if(!announcement)throw new Error("主库未找到对应公告");
+        const rows=correction.events.map((event)=>validateAndNormalizePledgeRow({...event,missing:[]} as ParsedPledge));
+        const invalid=rows.find((row)=>row.missing.length);if(invalid)throw new Error(`校正数据未通过严格校验：${invalid.missing.join("、")}`);
+        const statements:D1PreparedStatement[]=[env.DB.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(announcement.id)];
+        for(let index=0;index<rows.length;index++){
+          const row=rows[index];const eventFingerprint=await fingerprint(announcement.id,row,index);
+          const evidence=JSON.stringify({announcementId:announcement.id,method:"human",pageNumber:1,fields:["shareholder","pledgee","pledgeAmount","pledgeRatio","totalRatio"],reviewSet:`official-${date}-v1`});
+          statements.push(env.DB.prepare("INSERT INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint,verification_status,verified_at,verified_by,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(announcement.id,correction.stockCode,correction.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,date,1,"human-pdf-review-v1",now,eventFingerprint,"human_verified",now,viewer,evidence));
+        }
+        statements.push(
+          env.DB.prepare("UPDATE announcement SET parse_status='parsed',last_error=NULL WHERE announcement_id=?").bind(announcement.id),
+          env.DB.prepare("UPDATE review_queue SET status='approved',reason='逐页对照官方PDF人工复核通过',reviewed_at=?,reviewer=?,resolution=? WHERE announcement_id=? AND status='pending'").bind(now,viewer,JSON.stringify({reviewSet:`official-${date}-v1`,events:rows.length,title:announcement.title}),announcement.id),
+          env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",announcement.id,"official_pdf_correction",JSON.stringify({date,stockCode:correction.stockCode,events:rows.length,reviewSet:`official-${date}-v1`}),viewer,now),
+        );
+        await env.DB.batch(statements);announcements++;events+=rows.length;
+      }catch(error){failures.push({stockCode:correction.stockCode,error:error instanceof Error?error.message:"校正失败"});}
+    }
+    return json({ok:failures.length===0,date,announcements,events,failures,reviewSet:`official-${date}-v1`},{status:failures.length?207:200});
   }
   if (url.pathname.startsWith("/api/announcements/") && url.pathname.endsWith("/process") && request.method === "POST") {
     if(!viewerId(request))return json({error:"请先登录后处理公告"},{status:401});

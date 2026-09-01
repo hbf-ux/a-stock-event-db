@@ -8,7 +8,7 @@ export type SectionPledgeRow = {
   startDate: string;
   endDate: string;
   purpose: string;
-  type: "新增质押" | "补充质押" | "解除质押" | "解除后再质押";
+  type: "新增质押" | "补充质押" | "解除质押" | "解除后再质押" | "质押展期";
   missing: string[];
 };
 
@@ -59,7 +59,7 @@ export function validateAndNormalizePledgeRow<T extends ValidatablePledgeRow>(in
   const invalidRatio = [row.pledgeRatio,row.totalRatio].some((value) => value && (!/^\d{1,3}(?:\.\d+)?%$/.test(value) || Number(value.slice(0,-1)) > 100 || /^0\d/.test(value)));
   const disclosedRatio = Number((row.pledgeRatio || "").replace("%",""));
   const implausibleAmountRatio = row.amount < 10000 && Number.isFinite(disclosedRatio) && disclosedRatio >= 1;
-  const invalidType = !["新增质押","补充质押","解除质押","解除后再质押"].includes(row.type);
+  const invalidType = !["新增质押","补充质押","解除质押","解除后再质押","质押展期"].includes(row.type);
   row.missing = [
     (!row.shareholder || invalidShareholder) && "股东",
     (!row.pledgee || invalidPledgee) && "质权人",
