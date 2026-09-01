@@ -505,7 +505,7 @@ async function processPendingQueue(db: D1Database, documents: R2Bucket, requeste
   const startedAt = new Date().toISOString();
   const run = await db.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("pdf-parser",startedAt,"running",`开始处理最多 ${limit} 条公告`).first<{id:number}>();
   const pending = priorityDate
-    ? await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') ORDER BY CASE WHEN announce_date=? THEN 0 ELSE 1 END,announce_date DESC LIMIT ?").bind(priorityDate,limit).all<{id:string}>()
+    ? await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') AND announce_date=? ORDER BY announcement_id LIMIT ?").bind(priorityDate,limit).all<{id:string}>()
     : await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
   const results: unknown[] = []; let parsed = 0; let failures = 0;
   for (const row of pending.results) {
@@ -1482,9 +1482,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   }
   if (url.pathname === "/api/reprocess-reviews" && request.method === "POST") {
     if(!viewerId(request))return json({error:"请先登录后重试审核队列"},{status:401});
-    const input = await request.json<{limit?:number;force?:boolean}>().catch(() => ({}));
-    const limit = Math.min(Math.max(Number(input.limit) || 3,1),5);
-    const pending = await env.DB.prepare("SELECT announcement_id AS id FROM review_queue WHERE status='pending' ORDER BY CASE WHEN reviewed_at IS NULL THEN 0 ELSE 1 END,COALESCE(reviewed_at,created_at) ASC LIMIT ?").bind(limit).all<{id:string}>();
+    const input = await request.json<{limit?:number;force?:boolean;date?:string}>().catch(() => ({}));
+    const limit = Math.min(Math.max(Number(input.limit) || 3,1),10);
+    const date=/^\d{4}-\d{2}-\d{2}$/.test(input.date||"")?input.date:undefined;
+    const pending = date
+      ? await env.DB.prepare("SELECT r.announcement_id AS id FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE r.status='pending' AND a.announce_date=? ORDER BY CASE WHEN r.reviewed_at IS NULL THEN 0 ELSE 1 END,COALESCE(r.reviewed_at,r.created_at) ASC LIMIT ?").bind(date,limit).all<{id:string}>()
+      : await env.DB.prepare("SELECT announcement_id AS id FROM review_queue WHERE status='pending' ORDER BY CASE WHEN reviewed_at IS NULL THEN 0 ELSE 1 END,COALESCE(reviewed_at,created_at) ASC LIMIT ?").bind(limit).all<{id:string}>();
     const results: unknown[] = [];
     for (const row of pending.results) {
       try { results.push(await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env,{forceOpenAI:input.force === true})); }
