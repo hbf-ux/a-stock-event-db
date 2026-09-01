@@ -82,6 +82,7 @@ async function ensureSchema(db: D1Database) {
   const names = new Set(announcementColumns.results.map((column) => column.name));
   if (!names.has("parse_attempts")) await db.prepare("ALTER TABLE announcement ADD COLUMN parse_attempts INTEGER NOT NULL DEFAULT 0").run();
   if (!names.has("last_error")) await db.prepare("ALTER TABLE announcement ADD COLUMN last_error TEXT").run();
+  await db.prepare("UPDATE announcement SET parse_status=CASE WHEN parse_attempts>=3 THEN 'review' ELSE 'queued' END,last_error=COALESCE(last_error,'解析任务中断，已自动恢复') WHERE parse_status='processing' AND announcement_id IN (SELECT entity_id FROM audit_log WHERE entity_type='announcement' AND action='parse_claim' GROUP BY entity_id HAVING MAX(julianday(created_at))<julianday('now','-5 minutes'))").run();
   const matchCandidateColumns = await db.prepare("PRAGMA table_info(match_candidate)").all<{name:string}>();
   const matchCandidateNames = new Set(matchCandidateColumns.results.map((column) => column.name));
   if (!matchCandidateNames.has("capital_stage")) await db.prepare("ALTER TABLE match_candidate ADD COLUMN capital_stage TEXT NOT NULL DEFAULT 'reviewing'").run();
@@ -581,12 +582,17 @@ async function processPendingQueue(db: D1Database, documents: R2Bucket, requeste
   const pending = priorityDate
     ? await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') AND announce_date=? ORDER BY announcement_id LIMIT ?").bind(priorityDate,limit).all<{id:string}>()
     : await db.prepare("SELECT announcement_id AS id FROM announcement WHERE parse_status IN ('queued','archived') ORDER BY announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
+  const claimedAt=new Date().toISOString();
+  if(pending.results.length)await db.batch(pending.results.flatMap((row)=>[
+    db.prepare("UPDATE announcement SET parse_status='processing',parse_attempts=parse_attempts+1,last_error=NULL WHERE announcement_id=? AND parse_status IN ('queued','archived')").bind(row.id),
+    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",row.id,"parse_claim",JSON.stringify({runId:run?.id,priorityDate:priorityDate||null}),"pdf-worker",claimedAt),
+  ]));
   const results: unknown[] = []; let parsed = 0; let failures = 0;
   for (const row of pending.results) {
     try { const result = await withDeadline(processAnnouncement(db,documents,row.id,env),25_000,`announcement ${row.id}`); results.push(result); parsed += result.event_count || result.events_created || 0; }
     catch (error) {
       failures++; const message = error instanceof Error ? error.message : "parse failed";
-      await db.prepare("UPDATE announcement SET parse_attempts=parse_attempts+1,last_error=? WHERE announcement_id=?").bind(message,row.id).run();
+      await db.prepare("UPDATE announcement SET parse_status='queued',last_error=? WHERE announcement_id=?").bind(message,row.id).run();
       const attempt = await db.prepare("SELECT parse_attempts AS attempts FROM announcement WHERE announcement_id=?").bind(row.id).first<{attempts:number}>();
       if ((attempt?.attempts || 0) >= 3) {
         await db.batch([
