@@ -40,6 +40,8 @@ test("rejects non-shareholder pledge announcements", () => {
   assert.equal(isRelevantSharePledgeTitle("关于使用闲置资金购买债券通用质押式回购的公告"),false);
   assert.equal(isRelevantSharePledgeTitle("关于向银行申请融资提供抵质押担保的公告"),false);
   assert.equal(isRelevantSharePledgeTitle("关于拟签署证券质押合同暨关联交易的公告"),false);
+  assert.equal(isRelevantSharePledgeTitle("关于子公司股权质押的公告"),false);
+  assert.equal(isRelevantSharePledgeTitle("关于控股股东部分股权解除质押并继续质押的公告"),true);
 });
 
 test("normalizes safe OCR residue and rejects generic or contaminated entities", () => {

@@ -114,7 +114,7 @@ async function ensureSchema(db: D1Database) {
     ]);
   }
   await db.prepare("DELETE FROM pledge WHERE id NOT IN (SELECT MIN(id) FROM pledge GROUP BY announcement_id,shareholder,pledgee,pledge_amount_text,pledge_ratio,total_ratio,type,announce_date)").run();
-  const excludedTitleWhere = "title LIKE '%债券%质押式回购%' OR title LIKE '%质押式回购%债券%' OR title LIKE '%抵质押担保%' OR title LIKE '%知识产权质押%' OR title LIKE '%应收账款质押%' OR title LIKE '%拟签署%质押合同%'";
+  const excludedTitleWhere = "title LIKE '%债券%质押式回购%' OR title LIKE '%质押式回购%债券%' OR title LIKE '%抵质押担保%' OR title LIKE '%知识产权质押%' OR title LIKE '%应收账款质押%' OR title LIKE '%拟签署%质押合同%' OR title LIKE '%子公司%股权质押%' OR title LIKE '%股权质押%子公司%'";
   const ignoredAt = new Date().toISOString();
   await db.batch([
     db.prepare(`DELETE FROM pledge WHERE announcement_id IN (SELECT announcement_id FROM announcement WHERE ${excludedTitleWhere})`),
@@ -593,14 +593,14 @@ async function fetchCninfo(date: string) {
   const warnings: string[] = [];
   let successfulQueries = 0;
   const keywords = ["质押", "股份质押", "股票质押", "补充质押", "解除质押"];
-  columnLoop: for (const column of ["szse", "sse", "bjse"]) {
-    for (const searchkey of keywords) {
+  for (const column of ["szse", "sse", "bjse"]) {
+    keywordLoop: for (const searchkey of keywords) {
       for (let pageNum = 1; pageNum <= 10; pageNum++) {
         const body = new URLSearchParams({ pageNum: String(pageNum), pageSize: "100", column, tabName: "fulltext", plate: "", stock: "", searchkey, secid: "", category: "", trade: "", seDate: `${date}~${date}`, sortName: "", sortType: "", isHLtitle: "true" });
         const response = await fetchWithRetry("https://www.cninfo.com.cn/new/hisAnnouncement/query", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded; charset=UTF-8", accept: "application/json, text/plain, */*", referer: "https://www.cninfo.com.cn/new/disclosure", "user-agent": "Mozilla/5.0 (compatible; StockEventDB/1.0; public-disclosure-research)" }, body });
         if (!response.ok) {
           warnings.push(`巨潮资讯 ${column}/${searchkey} 返回 ${response.status}`);
-          if (pageNum === 1) continue columnLoop;
+          if (pageNum === 1) continue keywordLoop;
           break;
         }
         successfulQueries++;
@@ -637,12 +637,18 @@ const normalizeAnnouncementTitle = (title:string,stockName="") => stripHtml(titl
 const titleFingerprint = async (title:string,stockName:string) => hex(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(normalizeAnnouncementTitle(title,stockName))));
 
 async function fetchSseObservations(date:string):Promise<ExchangeObservationInput[]> {
-  const params=new URLSearchParams({isPagination:"true","pageHelp.pageSize":"100","pageHelp.pageNo":"1","pageHelp.beginPage":"1","pageHelp.endPage":"1","pageHelp.cacheSize":"1",START_DATE:date,END_DATE:date,SECURITY_CODE:"",TITLE:"质押",BULLETIN_TYPE:"",stockType:"",jsonCallBack:"callback"});
-  const response=await fetchWithRetry(`https://query.sse.com.cn/security/stock/queryCompanyBulletinNew.do?${params}`,{headers:{referer:"https://www.sse.com.cn/disclosure/listedinfo/announcement/","user-agent":"Mozilla/5.0 (compatible; PledgeRadar/1.0)"}},2);
-  if(!response.ok) throw new Error(`SSE HTTP ${response.status}`);
-  const payload=parseJsonp(await response.text()) as {pageHelp?:{data?:unknown[]}};
-  const rows=(payload.pageHelp?.data||[]).flatMap((group)=>Array.isArray(group)?group:[]) as Record<string,unknown>[];
-  return rows.filter((row)=>isRelevantSharePledgeTitle(String(row.TITLE||""))).map((row)=>({source:"上交所",sourceAnnouncementId:String(row.ORG_BULLETIN_ID||row.URL||""),stockCode:String(row.SECURITY_CODE||""),stockName:String(row.SECURITY_NAME||""),title:String(row.TITLE||""),announceDate:String(row.SSEDATE||date),pdfUrl:row.URL?new URL(String(row.URL),"https://www.sse.com.cn").toString():null,raw:row})).filter((row)=>row.sourceAnnouncementId&&row.stockCode&&row.title);
+  const collected:Record<string,unknown>[]=[];let pageCount=1;
+  for(let pageNo=1;pageNo<=Math.min(pageCount,30);pageNo++){
+    const params=new URLSearchParams({isPagination:"true","pageHelp.pageSize":"100","pageHelp.pageNo":String(pageNo),"pageHelp.beginPage":String(pageNo),"pageHelp.endPage":String(pageNo),"pageHelp.cacheSize":"1",START_DATE:date,END_DATE:date,SECURITY_CODE:"",TITLE:"",BULLETIN_TYPE:"",stockType:"",jsonCallBack:"callback"});
+    const response=await fetchWithRetry(`https://query.sse.com.cn/security/stock/queryCompanyBulletinNew.do?${params}`,{headers:{referer:"https://www.sse.com.cn/disclosure/listedinfo/announcement/","user-agent":"Mozilla/5.0 (compatible; PledgeRadar/1.0)"}},2);
+    if(!response.ok) throw new Error(`SSE HTTP ${response.status}`);
+    const payload=parseJsonp(await response.text()) as {pageHelp?:{data?:unknown[];pageCount?:number};result?:unknown[]};
+    pageCount=Math.max(1,Number(payload.pageHelp?.pageCount||1));
+    const raw=payload.pageHelp?.data||payload.result||[];
+    collected.push(...raw.flatMap((item)=>Array.isArray(item)?item:[item]).filter((item):item is Record<string,unknown>=>Boolean(item)&&typeof item==="object"));
+  }
+  const rows=[...new Map(collected.map((row)=>[String(row.ORG_BULLETIN_ID||row.URL||""),row])).values()];
+  return rows.filter((row)=>String(row.SSEDATE||date).slice(0,10)===date&&isRelevantSharePledgeTitle(String(row.TITLE||""))).map((row)=>({source:"上交所",sourceAnnouncementId:String(row.ORG_BULLETIN_ID||row.URL||""),stockCode:String(row.SECURITY_CODE||""),stockName:String(row.SECURITY_NAME||""),title:String(row.TITLE||""),announceDate:String(row.SSEDATE||date).slice(0,10),pdfUrl:row.URL?new URL(String(row.URL),"https://www.sse.com.cn").toString():null,raw:row})).filter((row)=>row.sourceAnnouncementId&&row.stockCode&&row.title);
 }
 
 async function fetchSzseObservations(date:string):Promise<{rows:ExchangeObservationInput[];supportedRange:string[]}> {
@@ -664,17 +670,20 @@ async function fetchSzseObservations(date:string):Promise<{rows:ExchangeObservat
 
 async function fetchBseObservations(date:string):Promise<ExchangeObservationInput[]> {
   const needFields=["companyCd","companyName","disclosureTitle","disclosurePostTitle","destFilePath","publishDate","xxfcbj","fileExt","xxzrlx"];
-  const rows:Record<string,unknown>[]=[];
-  for(let page=0;page<10;page++){
-    const form=new URLSearchParams({siteId:"6",flag:"0",disclosureType:"",page:String(page),companyCd:"",isNewThree:"1",startTime:date,endTime:date,keyword:"质押",hyType:""});
-    form.append("xxfcbj[]","2"); for(const field of needFields) form.append("needFields[]",field);
-    const response=await fetchWithRetry("https://www.bse.cn/disclosureInfoController/initDisclosureList.do?callback=callback",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded; charset=UTF-8",referer:"https://www.bse.cn/disclosure/announcement.html","user-agent":"Mozilla/5.0 (compatible; PledgeRadar/1.0)"},body:form.toString()},2);
+  const rows:Record<string,unknown>[]=[];let totalPages=1;
+  for(let page=0;page<Math.min(totalPages,20);page++){
+    const form=new URLSearchParams({siteId:"6",flag:"0",page:String(page),companyCd:"",isNewThree:"1",startTime:date,endTime:date,keyword:"质押",sortfield:"xxssdq",sorttype:"desc"});
+    form.append("noticeType[]","5");form.append("disclosureType[]","5");form.append("disclosureSubtype[]","");form.append("xxfcbj[]","2");form.append("hyType[]","");
+    for(const field of needFields) form.append("needFields[]",field);
+    const response=await fetchWithRetry("https://www.bse.cn/disclosureInfoController/initDisclosureList.do?callback=callback",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded; charset=UTF-8",accept:"text/javascript, application/javascript, application/json, */*; q=0.01",origin:"https://www.bse.cn",referer:"https://www.bse.cn/disclosure/announcement.html","x-requested-with":"XMLHttpRequest","user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"},body:form.toString()},2);
     if(!response.ok) throw new Error(`BSE HTTP ${response.status}`);
     const payload=parseJsonp(await response.text()) as {data?:{content?:{disclosures?:Record<string,unknown>[]}[];lastPage?:boolean;totalPages?:number}};
     for(const group of payload.data?.content||[]) rows.push(...(group.disclosures||[]));
-    if(payload.data?.lastPage||page+1>=Number(payload.data?.totalPages||1)) break;
+    totalPages=Math.max(1,Number(payload.data?.totalPages||1));
+    if(payload.data?.lastPage||page+1>=totalPages) break;
+    await wait(120);
   }
-  return rows.filter((row)=>String(row.publishDate||"")===date&&isRelevantSharePledgeTitle(String(row.disclosureTitle||"")+String(row.disclosurePostTitle||""))).map((row)=>({source:"北交所",sourceAnnouncementId:String(row.disclosureCode||row.destFilePath||""),stockCode:String(row.companyCd||""),stockName:String(row.companyName||""),title:`${String(row.disclosureTitle||"")}${String(row.disclosurePostTitle||"")}`,announceDate:String(row.publishDate||date),pdfUrl:row.destFilePath?new URL(String(row.destFilePath),"https://www.bse.cn").toString():null,raw:row})).filter((row)=>row.sourceAnnouncementId&&row.stockCode&&row.title);
+  return [...new Map(rows.map((row)=>[String(row.disclosureCode||row.destFilePath||""),row])).values()].filter((row)=>String(row.publishDate||"")===date&&isRelevantSharePledgeTitle(String(row.disclosureTitle||"")+String(row.disclosurePostTitle||""))).map((row)=>({source:"北交所",sourceAnnouncementId:String(row.disclosureCode||row.destFilePath||""),stockCode:String(row.companyCd||""),stockName:String(row.companyName||""),title:`${String(row.disclosureTitle||"")}${String(row.disclosurePostTitle||"")}`,announceDate:String(row.publishDate||date),pdfUrl:row.destFilePath?new URL(String(row.destFilePath),"https://www.bse.cn").toString():null,raw:row})).filter((row)=>row.sourceAnnouncementId&&row.stockCode&&row.title);
 }
 
 async function saveExchangeObservations(db:D1Database,rows:ExchangeObservationInput[]) {
@@ -1040,9 +1049,14 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const [summary,rows,lastRun]=await Promise.all([
       env.DB.prepare("SELECT source,COUNT(*) AS observed,SUM(CASE WHEN match_status='exact' THEN 1 ELSE 0 END) AS exact,SUM(CASE WHEN match_status='likely' THEN 1 ELSE 0 END) AS likely,SUM(CASE WHEN match_status='ambiguous' THEN 1 ELSE 0 END) AS ambiguous,SUM(CASE WHEN match_status='missing_primary' THEN 1 ELSE 0 END) AS missingPrimary,SUM(CASE WHEN match_status='missing_primary' AND review_status='pending' THEN 1 ELSE 0 END) AS pendingReview,SUM(CASE WHEN review_status='promoted' THEN 1 ELSE 0 END) AS promoted,SUM(CASE WHEN review_status='rejected' THEN 1 ELSE 0 END) AS rejected,MAX(observed_at) AS observedAt FROM exchange_observation WHERE announce_date=? GROUP BY source ORDER BY source").bind(date).all(),
       env.DB.prepare("SELECT id,source,source_announcement_id AS sourceAnnouncementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,match_status AS matchStatus,match_method AS matchMethod,matched_announcement_id AS matchedAnnouncementId,review_status AS reviewStatus,reviewed_at AS reviewedAt,reviewed_by AS reviewedBy,review_note AS reviewNote,observed_at AS observedAt FROM exchange_observation WHERE announce_date=? ORDER BY CASE WHEN match_status='missing_primary' AND review_status='pending' THEN 0 WHEN match_status='ambiguous' THEN 1 WHEN match_status='likely' THEN 2 ELSE 3 END,source,stock_code LIMIT 300").bind(date).all(),
-      env.DB.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,announcements_found AS announcementsFound,failures,message FROM sync_run WHERE source='exchange-reconciliation' ORDER BY id DESC LIMIT 1").first(),
+      env.DB.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,announcements_found AS announcementsFound,failures,message FROM sync_run WHERE source='exchange-reconciliation' AND json_valid(message) AND json_extract(message,'$.date')=? ORDER BY id DESC LIMIT 1").bind(date).first<{id:number;startedAt:string;finishedAt?:string;status:string;announcementsFound:number;failures:number;message:string}>(),
     ]);
-    return json({date,summary:summary.results,rows:rows.results,lastRun,capabilities:{sse:"支持指定日期",szse:"公开接口仅支持最近披露窗口",bse:"支持指定日期"},scope:"独立观察与差异识别；missing_primary 需人工确认后才能补入主公告库",generatedAt:new Date().toISOString()});
+    const sourceRuns=(lastRun?JSON.parse(lastRun.message||"{}").results:[]) as {source:string;status:string;observed?:number;exact?:number;likely?:number;ambiguous?:number;missing?:number;error?:string;note?:string}[];
+    const unresolved=summary.results.reduce((total,row)=>total+Number((row as Record<string,unknown>).pendingReview||0)+Number((row as Record<string,unknown>).ambiguous||0),0);
+    const requiredSources=3;const successfulSources=sourceRuns.filter((result)=>result.status==="completed").length;
+    const completenessStatus=!lastRun?"not_run":successfulSources===requiredSources&&unresolved===0?"verified":"incomplete";
+    const completeness={status:completenessStatus,label:completenessStatus==="verified"?"三所对账完成：可声明当日公开披露清单完整":completenessStatus==="not_run"?"该日期尚未运行三所对账":"对账未闭环：暂不可声明全市场完整",unresolved,successfulSources,requiredSources};
+    return json({date,summary:summary.results,rows:rows.results,lastRun,sourceRuns,completeness,capabilities:{sse:"支持指定日期全量分页",szse:"公开接口仅支持最近披露窗口",bse:"支持指定日期关键词核验"},scope:"独立观察与差异识别；只有三所均成功且未解决差异为零才通过完整性核验",generatedAt:new Date().toISOString()});
   }
   if (url.pathname === "/api/reconciliation/run" && request.method === "POST") {
     const viewer=viewerId(request);if(!viewer)return json({error:"请先登录后运行交易所对账"},{status:401});

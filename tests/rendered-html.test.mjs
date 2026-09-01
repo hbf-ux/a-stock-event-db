@@ -60,6 +60,9 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /fetchSzseObservations/);
   assert.match(worker, /fetchBseObservations/);
   assert.match(worker, /\/api\/reconciliation\/run/);
+  assert.match(worker, /支持指定日期全量分页/);
+  assert.match(worker, /sourceRuns/);
+  assert.match(worker, /三所均成功且未解决差异为零/);
   assert.match(worker, /missing_primary/);
   assert.match(worker, /对账结果不会自动进入正式事件库/);
   assert.match(worker, /promoteExchangeObservation/);
@@ -190,7 +193,7 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(quality, /解析器版本/);
   assert.match(quality, /交易所公告对账/);
   assert.match(quality, /运行官方对账/);
-  assert.match(quality, /只有人工确认并校验官方 PDF 后才进入解析队列/);
+  assert.match(quality, /只有三所均完成且未解决差异为零，才能声明当日清单完整/);
   assert.match(quality, /确认补入/);
   assert.match(quality, /无需补入/);
   assert.match(quality, /每日数据生产闭环/);

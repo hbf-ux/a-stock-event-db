@@ -187,5 +187,5 @@ export function parseSectionPledgeRows(text: string, title: string) {
 
 export function isRelevantSharePledgeTitle(title: string) {
   if (!/(股份|股票|股权).{0,8}(质押|解质)|(?:质押|解质).{0,8}(股份|股票|股权)/.test(title)) return false;
-  return !/(债券.*质押式回购|质押式回购.*债券|抵质押担保|知识产权质押|应收账款质押|拟签署.*质押合同|股票质押式回购交易业务)/.test(title);
+  return !/(债券.*质押式回购|质押式回购.*债券|抵质押担保|知识产权质押|应收账款质押|拟签署.*质押合同|股票质押式回购交易业务|子公司.{0,12}股权质押|股权质押.{0,12}子公司)/.test(title);
 }
