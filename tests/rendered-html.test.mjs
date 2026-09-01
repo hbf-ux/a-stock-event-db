@@ -4,30 +4,20 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("production site contains the real announcement workflow", async () => {
+test("public product is a daily closing report backed by the production workflow", async () => {
   const [page, worker, layout] = await Promise.all([
     readFile(new URL("app/page.tsx", root), "utf8"),
     readFile(new URL("worker/index.ts", root), "utf8"),
     readFile(new URL("app/layout.tsx", root), "utf8"),
   ]);
-  assert.match(page, /真实数据不为空/);
-  assert.match(page, /处理待解析/);
-  assert.match(page, /人工审核工作台/);
-  assert.match(page, /审核通过并入库/);
-  assert.match(page, /系统运行日志/);
-  assert.match(page, /导出格式/);
-  assert.match(page, /后台解析已启动/);
-  assert.match(page, /近 14 日公告趋势/);
-  assert.match(page, /profileIntelligenceStack/);
-  assert.doesNotMatch(page, /\{profile && <CoveragePanel/);
-  assert.match(page, /className="headerLanguage" href="\/en"/);
-  assert.match(page, /latestEvents=\{events\}/);
-  assert.match(page, /slice\(0, 12\)/);
-  assert.match(page, /const live24 =/);
-  assert.match(page, /intelFeedFooter/);
-  assert.match(page, /主要质权人/);
-  assert.match(page, /回补 7 日/);
-  assert.match(page, /\/api\/announcements\/\$\{row\.announcementId\}\/process/);
+  assert.match(page, /DailyReportClient/);
+  const daily=await readFile(new URL("app/daily-report-client.tsx",root),"utf8");
+  assert.match(daily,/每日20:00关账/);
+  assert.match(daily,/下载长图 PNG/);
+  assert.match(daily,/打印 \/ 保存 PDF/);
+  assert.match(daily,/三所公告对账/);
+  assert.match(daily,/未关账，不标注完整清单/);
+  assert.match(daily,/提交撮合需求/);
   assert.match(worker, /from "unpdf"/);
   assert.match(worker, /async function processAnnouncement/);
   assert.match(worker, /parse_status='parsed'/);
@@ -108,11 +98,16 @@ test("production site contains the real announcement workflow", async () => {
   assert.match(worker, /parser_upgrade_v2_4_attempt/);
   assert.match(worker, /maybeStartAutomaticMaintenance/);
   assert.match(worker, /\/api\/maintenance/);
+  assert.match(worker, /\/api\/daily-report/);
+  assert.match(worker, /\/api\/daily-reports/);
+  assert.match(worker, /dailyReportSnapshot/);
+  assert.match(worker, /T20:00:00\+08:00/);
+  assert.match(worker, /三所对账、公告分类和全部事件核验完成后方可关账发布/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
-  assert.match(layout, /A股股东融资风险即时情报与尽调报告/);
+  assert.match(layout, /每日A股质押关账报告与融资撮合/);
 });
 
-test("international intelligence and subscription surfaces use production data", async()=>{
+test("international daily report and existing billing backend remain wired", async()=>{
   const [english,englishDetail,englishLanguage,englishCompany,pricing,billingMigration]=await Promise.all([
     readFile(new URL("app/en/en-client.tsx",root),"utf8"),
     readFile(new URL("app/en/intelligence-detail-en.tsx",root),"utf8"),
@@ -121,10 +116,10 @@ test("international intelligence and subscription surfaces use production data",
     readFile(new URL("app/pricing/pricing-client.tsx",root),"utf8"),
     readFile(new URL("drizzle/0011_burly_shinko_yamashiro.sql",root),"utf8"),
   ]);
-  assert.match(english,/\/api\/feed\?hours=168/);
-  assert.match(english,/Shareholder financing risk/);
+  assert.match(english,/\/api\/daily-report/);
+  assert.match(english,/ONE TRADING DAY · ONE VERIFIED CLOSE/);
   assert.match(english,/OTC Filing Watch/);
-  assert.match(english,/Hong Kong listings are not yet included/);
+  assert.match(english,/Hong Kong listings are not included/);
   assert.match(english,/\/en\/company/);
   assert.match(englishDetail,/\/api\/events/);
   assert.match(englishDetail,/Verification and source evidence/);
@@ -180,10 +175,9 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(await readFile(new URL("drizzle/0012_curvy_cardiac.sql",root),"utf8"),/verification_status/);
   assert.match(capital, /融资活跃度，不是信用评分/);
   assert.match(capital, /事件差，不是存量质押/);
-  assert.match(brief, /A股质押情报简报/);
-  assert.match(brief, /打印简报/);
-  assert.match(match, /让真实融资需求与真实资金偏好相遇/);
-  assert.match(match, /联系方式不会公开/);
+  assert.match(brief, /DailyReportClient/);
+  assert.match(match, /让真实项目与真实资金偏好相遇/);
+  assert.match(match, /联系方式默认不公开/);
   assert.match(match, /不承诺融资结果/);
   assert.match(matchDesk, /融资撮合工作台/);
   assert.match(matchDesk, /双方确认前/);
@@ -209,4 +203,5 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(reconciliationMigration, /exchange_observation_date_status_idx/);
   assert.match(reviewMigration, /review_status/);
   assert.match(reviewMigration, /review_note/);
+  assert.match(await readFile(new URL("drizzle/0013_rare_purifiers.sql",root),"utf8"),/CREATE TABLE `daily_report`/);
 });

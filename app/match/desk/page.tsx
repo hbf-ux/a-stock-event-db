@@ -62,7 +62,7 @@ export default function MatchDeskPage(){
   ] as const;
 
   return <main className="publicIntelPage matchDeskPage">
-    <header className="publicHeader"><a className="publicBrand" href="/"><span>质</span><b>质押雷达<small>A股股东融资风险情报</small></b></a><nav><a href="/">即时情报</a><a href="/capital">资方机会</a><a href="/match">提交新需求</a><button>我的撮合</button></nav></header>
+    <header className="publicHeader"><a className="publicBrand" href="/"><span>H</span><b>HBF质押日报<small>每日关账报告与融资撮合</small></b></a><nav><a href="/">今日报告</a><a href="/reports">历史日报</a><a href="/match">提交新需求</a><button>我的撮合</button></nav></header>
     <div className="publicWrap">
       <div className="publicBreadcrumb"><a href="/">首页</a><span>/</span><a href="/match">撮合服务</a><span>/</span><b>我的撮合</b></div>
       <section className="deskHero"><div><p className="eyebrow">PRIVATE MATCHING DESK</p><h1>融资撮合工作台</h1><p>管理当前账户的需求、双向授权和项目推进阶段；双方确认前，对方身份与联系方式保持匿名。</p></div><div><span>活跃项目</span><strong>{funnel.requests.open||0}</strong><small>{matches.length} 个匹配候选</small></div></section>

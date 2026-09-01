@@ -48,6 +48,8 @@ async function ensureSchema(db: D1Database) {
     `CREATE TABLE IF NOT EXISTS review_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, announcement_id TEXT NOT NULL, event_type TEXT NOT NULL, reason TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, reviewed_at TEXT, reviewer TEXT, resolution TEXT)`,
     `CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, before_json TEXT, after_json TEXT, actor TEXT NOT NULL, created_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS sync_run (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, announcements_found INTEGER NOT NULL DEFAULT 0, events_created INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, message TEXT)`,
+    `CREATE TABLE IF NOT EXISTS daily_report (date TEXT PRIMARY KEY, cutoff_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', announcement_count INTEGER NOT NULL DEFAULT 0, event_count INTEGER NOT NULL DEFAULT 0, company_count INTEGER NOT NULL DEFAULT 0, reconciliation_status TEXT NOT NULL DEFAULT 'pending', report_version INTEGER NOT NULL DEFAULT 1, published_at TEXT, published_by TEXT, notes TEXT)`,
+    `CREATE INDEX IF NOT EXISTS daily_report_status_date_idx ON daily_report (status,date)`,
     `CREATE TABLE IF NOT EXISTS pipeline_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS subscription_interest (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, plan TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'pricing-modal', created_at TEXT NOT NULL, UNIQUE(email, plan))`,
     `CREATE TABLE IF NOT EXISTS user_watchlist (user_id TEXT NOT NULL, stock_code TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (user_id, stock_code))`,
@@ -966,6 +968,27 @@ async function applyStripeEvent(db:D1Database,env:Env,event:StripeEvent,rawBody:
   await eventStatement.run();return {processed:true,accountUpdated:false};
 }
 
+async function dailyReportSnapshot(db:D1Database,date:string) {
+  const [announcement,event,verification,reconciliationRun,unresolved,published] = await Promise.all([
+    db.prepare("SELECT COUNT(*) AS total,SUM(CASE WHEN parse_status IN ('parsed','ignored','rejected') THEN 1 ELSE 0 END) AS classified,SUM(CASE WHEN parse_status NOT IN ('parsed','ignored','rejected') THEN 1 ELSE 0 END) AS pending FROM announcement WHERE announce_date=?").bind(date).first<{total:number;classified:number;pending:number}>(),
+    db.prepare("SELECT COUNT(*) AS total,COUNT(DISTINCT stock_code) AS companies,SUM(CASE WHEN type LIKE '%解除%' THEN 1 ELSE 0 END) AS releases,SUM(CASE WHEN type LIKE '%补充%' THEN 1 ELSE 0 END) AS supplemental FROM pledge WHERE announce_date=?").bind(date).first<{total:number;companies:number;releases:number;supplemental:number}>(),
+    db.prepare("SELECT SUM(CASE WHEN verification_status='human_verified' THEN 1 ELSE 0 END) AS humanVerified,SUM(CASE WHEN verification_status='ai_reviewed' THEN 1 ELSE 0 END) AS aiReviewed,SUM(CASE WHEN verification_status='rules_validated' THEN 1 ELSE 0 END) AS rulesValidated FROM pledge WHERE announce_date=?").bind(date).first(),
+    db.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,message FROM sync_run WHERE source='exchange-reconciliation' AND json_valid(message) AND json_extract(message,'$.date')=? ORDER BY id DESC LIMIT 1").bind(date).first<{id:number;startedAt:string;finishedAt:string;status:string;message:string}>(),
+    db.prepare("SELECT COUNT(*) AS total FROM exchange_observation WHERE announce_date=? AND ((match_status IN ('likely','ambiguous') AND review_status='pending') OR (match_status='missing_primary' AND review_status='pending'))").bind(date).first<{total:number}>(),
+    db.prepare("SELECT date,cutoff_at AS cutoffAt,status,announcement_count AS announcementCount,event_count AS eventCount,company_count AS companyCount,reconciliation_status AS reconciliationStatus,report_version AS reportVersion,published_at AS publishedAt,notes FROM daily_report WHERE date=?").bind(date).first(),
+  ]);
+  const reconciliationMessage=reconciliationRun?JSON.parse(reconciliationRun.message||"{}"):{};
+  const sourceRuns=(Array.isArray(reconciliationMessage.results)?reconciliationMessage.results:[]) as Array<{source:string;status:string;observed?:number;exact?:number;likely?:number;missing?:number}>;
+  const successfulSources=sourceRuns.filter((row)=>row.status==="completed").length;
+  const reconciliationComplete=successfulSources===3&&Number(unresolved?.total||0)===0;
+  const contentComplete=Number(announcement?.total||0)>0&&Number(announcement?.pending||0)===0;
+  const ready=reconciliationComplete&&contentComplete;
+  const cutoffAt=`${date}T20:00:00+08:00`;
+  const cutoffPassed=Date.now()>=Date.parse(cutoffAt);
+  const status=(published as {status?:string}|null)?.status==="published"?"published":ready?"ready_to_close":cutoffPassed?"reviewing":"collecting";
+  return {date,cutoffAt,status,ready,cutoffPassed,announcement:announcement||{total:0,classified:0,pending:0},event:event||{total:0,companies:0,releases:0,supplemental:0},verification:verification||{},reconciliation:{complete:reconciliationComplete,successfulSources,requiredSources:3,unresolved:Number(unresolved?.total||0),sourceRuns,lastRun:reconciliationRun||null},published:published||null};
+}
+
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   await ensureSchema(env.DB);
   const url = new URL(request.url);
@@ -999,6 +1022,33 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const input=await request.json<{locale?:"zh"|"en"}>().catch(()=>({}));
     const account=await env.DB.prepare("SELECT stripe_customer_id AS stripeCustomerId FROM billing_account WHERE user_id=?").bind(viewer).first<{stripeCustomerId:string}>();if(!account?.stripeCustomerId)return json({error:"尚未建立付费账户"},{status:404});
     const session=await stripePost(env,"billing_portal/sessions",{customer:account.stripeCustomerId,return_url:`${url.origin}${input.locale==="en"?"/en/pricing":"/pricing"}`});return json({ok:true,url:session.url});
+  }
+  if(url.pathname==="/api/daily-report"&&request.method==="GET"){
+    const requested=url.searchParams.get("date");
+    const latest=await env.DB.prepare("SELECT MAX(announce_date) AS date FROM announcement").first<{date:string}>();
+    const date=requested&&/^\d{4}-\d{2}-\d{2}$/.test(requested)?requested:latest?.date||latestTradingDate();
+    const [snapshot,events]=await Promise.all([
+      dailyReportSnapshot(env.DB,date),
+      env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,p.verification_status AS verificationStatus,a.pdf_url AS pdfUrl FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE p.announce_date=? ORDER BY CASE WHEN p.type LIKE '%补充%' THEN 0 WHEN p.type NOT LIKE '%解除%' THEN 1 ELSE 2 END,p.id DESC").bind(date).all(),
+    ]);
+    return json({...snapshot,events:events.results,methodology:"交易日20:00停止纳入新公告；三所对账、公告分类和全部事件核验完成后方可关账发布",deliverables:{image:"由同一份关账数据生成PNG长图",pdf:"由同一份关账页面打印或保存为PDF"},generatedAt:new Date().toISOString()});
+  }
+  if(url.pathname==="/api/daily-reports"&&request.method==="GET"){
+    const rows=await env.DB.prepare("SELECT a.date,a.announcements,a.events,a.companies,a.pending,COALESCE(r.status,'draft') AS savedStatus,r.published_at AS publishedAt FROM (SELECT d.announce_date AS date,COUNT(DISTINCT d.announcement_id) AS announcements,COUNT(DISTINCT p.id) AS events,COUNT(DISTINCT p.stock_code) AS companies,COUNT(DISTINCT CASE WHEN d.parse_status NOT IN ('parsed','ignored','rejected') THEN d.announcement_id END) AS pending FROM announcement d LEFT JOIN pledge p ON p.announcement_id=d.announcement_id GROUP BY d.announce_date ORDER BY d.announce_date DESC LIMIT 90) a LEFT JOIN daily_report r ON r.date=a.date ORDER BY a.date DESC").all<{date:string}>();
+    const data=[];for(const row of rows.results){const snapshot=await dailyReportSnapshot(env.DB,row.date);data.push({...row,status:snapshot.status,ready:snapshot.ready,reconciliation:snapshot.reconciliation});}
+    return json({data,scope:"仅展示按交易日生成的关账报告；历史数据库查询不再作为公开产品",generatedAt:new Date().toISOString()});
+  }
+  if(url.pathname==="/api/daily-report/close"&&request.method==="POST"){
+    const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
+    const input=await request.json<{date?:string;notes?:string}>().catch(()=>({}));const date=input.date||latestTradingDate();
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return json({error:"无效报告日期"},{status:400});
+    const snapshot=await dailyReportSnapshot(env.DB,date);if(!snapshot.ready)return json({error:"当日尚未满足关账条件",snapshot},{status:409});
+    const now=new Date().toISOString();const announcement=snapshot.announcement as {total?:number};const event=snapshot.event as {total?:number;companies?:number};
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO daily_report (date,cutoff_at,status,announcement_count,event_count,company_count,reconciliation_status,report_version,published_at,published_by,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET status='published',announcement_count=excluded.announcement_count,event_count=excluded.event_count,company_count=excluded.company_count,reconciliation_status=excluded.reconciliation_status,report_version=daily_report.report_version+1,published_at=excluded.published_at,published_by=excluded.published_by,notes=excluded.notes").bind(date,snapshot.cutoffAt,"published",Number(announcement.total||0),Number(event.total||0),Number(event.companies||0),"verified",1,now,viewer,(input.notes||"").trim().slice(0,500)||null),
+      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"published",JSON.stringify({announcements:announcement.total||0,events:event.total||0,companies:event.companies||0}),viewer,now),
+    ]);
+    return json({ok:true,date,status:"published",publishedAt:now});
   }
   if (url.pathname === "/api/health") {
     const [stats,quotaState,automaticSync,automaticMaintenance] = await Promise.all([

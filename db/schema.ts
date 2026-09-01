@@ -88,6 +88,20 @@ export const syncRuns = sqliteTable("sync_run", {
   message: text("message"),
 });
 
+export const dailyReports = sqliteTable("daily_report", {
+  date: text("date").primaryKey(),
+  cutoffAt: text("cutoff_at").notNull(),
+  status: text("status").notNull().default("draft"),
+  announcementCount: integer("announcement_count").notNull().default(0),
+  eventCount: integer("event_count").notNull().default(0),
+  companyCount: integer("company_count").notNull().default(0),
+  reconciliationStatus: text("reconciliation_status").notNull().default("pending"),
+  reportVersion: integer("report_version").notNull().default(1),
+  publishedAt: text("published_at"),
+  publishedBy: text("published_by"),
+  notes: text("notes"),
+}, (table) => [index("daily_report_status_date_idx").on(table.status, table.date)]);
+
 export const pipelineState = sqliteTable("pipeline_state", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),

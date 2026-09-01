@@ -1,18 +1,5 @@
-"use client";
-
-import { useEffect, useMemo, useState } from "react";
-
-type EventRow = { id:number;date:string;code:string;name:string;shareholder:string;pledgee:string;amount:string;ratio:string;total:string;type:string;source:string;pdfUrl?:string };
-const pct = (value:string) => Number((value||"").replace(/[^0-9.]/g,""))||0;
+import DailyReportClient from "../daily-report-client";
 
 export default function BriefPage(){
-  const [events,setEvents]=useState<EventRow[]>([]);
-  const [date,setDate]=useState("");
-  useEffect(()=>{void fetch("/api/events?limit=500",{cache:"no-store"}).then((response)=>response.json() as Promise<{data:EventRow[]}>).then((payload)=>{setEvents(payload.data||[]);setDate(payload.data?.[0]?.date||"");});},[]);
-  const dates=useMemo(()=>[...new Set(events.map((row)=>row.date))].sort((a,b)=>b.localeCompare(a)),[events]);
-  const rows=events.filter((row)=>row.date===date);
-  const high=rows.filter((row)=>Math.max(pct(row.ratio),pct(row.total))>=50);
-  const supplemental=rows.filter((row)=>row.type.includes("补充"));
-  const releases=rows.filter((row)=>row.type.includes("解除"));
-  return <main className="publicIntelPage briefPage"><header className="publicHeader"><a className="publicBrand" href="/"><span>质</span><b>质押雷达<small>A股股东融资风险情报</small></b></a><nav><a href="/">即时情报</a><a href="/capital">资方机会</a><button>每日简报</button></nav></header><div className="publicWrap"><div className="publicBreadcrumb"><a href="/">首页</a><span>/</span><b>每日质押简报</b></div><section className="briefHero"><div><p className="eyebrow">DAILY PLEDGE BRIEF</p><h1>{date||"最新"} A股质押情报简报</h1><p>用一页快速查看当天已核验的质押变化、重点比例信号和官方公告证据。</p></div><label>简报日期<select value={date} onChange={(event)=>setDate(event.target.value)}>{dates.map((item)=><option key={item}>{item}</option>)}</select></label></section><section className="briefMetrics"><div><span>已核验事件</span><strong>{rows.length}</strong></div><div><span>涉及公司</span><strong>{new Set(rows.map((row)=>row.code)).size}</strong></div><div><span>补充质押</span><strong className={supplemental.length?"riskValue":""}>{supplemental.length}</strong></div><div><span>高比例信号</span><strong className={high.length?"warnValue":""}>{high.length}</strong></div><div><span>解除类事件</span><strong>{releases.length}</strong></div></section>{rows.length?<div className="briefGrid"><section className="publicPanel"><div className="publicPanelHead"><div><h2>当日事件</h2><p>全部结论来自已通过字段校验的公告</p></div><button onClick={()=>window.print()}>打印简报</button></div><div className="briefRows">{rows.map((row)=><article key={row.id}><time>{row.date}</time><div><a href={`/company/${row.code}`}>{row.name}<small>{row.code}</small></a><p><a href={`/shareholder/${encodeURIComponent(row.shareholder)}`}>{row.shareholder}</a> → <a href={`/pledgee/${encodeURIComponent(row.pledgee)}`}>{row.pledgee}</a></p></div><span className={`tag ${row.type.includes("解除")?"release":row.type.includes("补充")?"extra":"new"}`}>{row.type}</span><div><b>{row.amount}</b><small>占其持股 {row.ratio||"—"} · 占总股本 {row.total||"—"}</small></div><aside><a href={`/event/${row.id}`}>详情 →</a>{row.pdfUrl&&<a href={row.pdfUrl} target="_blank" rel="noreferrer">原文 ↗</a>}</aside></article>)}</div></section><aside className="briefAside"><section className="publicPanel"><div className="publicPanelHead"><div><h2>今日重点</h2><p>用于安排核查顺序</p></div></div><div className="briefHighlights"><div><b>{supplemental.length}</b><span>条补充质押信号</span><small>{supplemental.map((row)=>row.name).slice(0,4).join("、")||"暂无"}</small></div><div><b>{high.length}</b><span>条比例达到 50%</span><small>{high.map((row)=>row.name).slice(0,4).join("、")||"暂无"}</small></div><div><b>{releases.length}</b><span>条解除类事件</span><small>解除不等于风险消失，需与新增逐笔核对</small></div></div></section><a className="briefCapitalCta" href="/capital"><span>CAPITAL VIEW</span><b>进一步查看融资活跃股东</b><small>关系集中度 · 历史节奏 · 可核查证据 →</small></a></aside></div>:<div className="publicState">正在读取最新简报，或该日期暂无已核验事件。</div>}<footer className="publicFooter"><span>仅基于当前已抓取并解析的官方公告，不代表全市场全历史完整度。</span><span>质押雷达 · 每日质押简报</span></footer></div></main>;
+  return <DailyReportClient/>;
 }
