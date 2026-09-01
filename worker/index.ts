@@ -403,7 +403,7 @@ async function parseWithOpenAI(pdfBase64: string, context: { title:string; stock
       { type:"input_text", text:prompt },
     ] }],
     text:{format:{type:"json_schema",name:"a_share_pledge_events",strict:true,schema}},
-  }) });
+  }) },1);
   if (!response.ok) {
     const detail = (await response.text()).slice(0,500);
     throw new Error(`OpenAI review failed: ${response.status}${detail ? ` ${detail}` : ""}`);
@@ -489,7 +489,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   let bytes: ArrayBuffer; let r2Key = item.r2Key; let sha256 = item.sha256;
   if (r2Key) { const object = await documents.get(r2Key); if (!object) throw new Error("archived PDF not found"); bytes = await object.arrayBuffer(); }
   else {
-    const response = await fetchWithRetry(item.pdfUrl,{headers:{referer:"https://www.cninfo.com.cn/","user-agent":"Mozilla/5.0 (compatible; StockEventDB/1.0)"}});
+    const response = await fetchWithRetry(item.pdfUrl,{headers:{referer:"https://www.cninfo.com.cn/","user-agent":"Mozilla/5.0 (compatible; StockEventDB/1.0)"}},1);
     if (!response.ok) throw new Error(`PDF download failed: ${response.status}`);
     bytes = await response.arrayBuffer(); sha256 = hex(await crypto.subtle.digest("SHA-256",bytes)); r2Key = `announcements/${id}.pdf`;
     await documents.put(r2Key,bytes,{httpMetadata:{contentType:"application/pdf"},customMetadata:{announcementId:id,sha256}});
