@@ -909,8 +909,8 @@ type AutomaticSyncState = {
 };
 
 async function activeDailyProductionRun(db:D1Database,targetDate?:string) {
-  const staleAt=new Date(Date.now()-12*60*1000).toISOString();
-  await db.prepare("UPDATE sync_run SET finished_at=?,status='failed',failures=failures+1,message=COALESCE(message,'') || '；任务超过12分钟未结束，已自动释放锁' WHERE source='daily-production-cycle' AND status='running' AND started_at<?").bind(new Date().toISOString(),staleAt).run();
+  const staleAt=new Date(Date.now()-5*60*1000).toISOString();
+  await db.prepare("UPDATE sync_run SET finished_at=?,status='failed',failures=failures+1,message=COALESCE(message,'') || '；任务超过5分钟未结束，已自动释放锁' WHERE source='daily-production-cycle' AND status='running' AND started_at<?").bind(new Date().toISOString(),staleAt).run();
   const active=targetDate
     ?await db.prepare("SELECT id,started_at AS startedAt FROM sync_run WHERE source='daily-production-cycle' AND status='running' AND message LIKE ? ORDER BY id DESC LIMIT 1").bind(`%${targetDate}%`).first<{id:number;startedAt:string}>()
     :await db.prepare("SELECT id,started_at AS startedAt FROM sync_run WHERE source='daily-production-cycle' AND status='running' ORDER BY id DESC LIMIT 1").first<{id:number;startedAt:string}>();
