@@ -102,6 +102,9 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /\/api\/daily-reports/);
   assert.match(worker, /dailyReportSnapshot/);
   assert.match(worker, /T20:00:00\+08:00/);
+  assert.match(worker, /automaticProductionTargetDate/);
+  assert.match(worker, /deterministic-reconciliation/);
+  assert.match(worker, /await publishDailyReport/);
   assert.match(worker, /三所对账、公告分类和全部事件核验完成后方可关账发布/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
   assert.match(layout, /每日A股质押关账报告与融资撮合/);

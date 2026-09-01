@@ -168,6 +168,13 @@ const toDate = (timestamp: number) => new Intl.DateTimeFormat("en-CA", { timeZon
 const isTradingDate = (date: string) => { const day = new Date(`${date}T00:00:00Z`).getUTCDay(); return day !== 0 && day !== 6; };
 const addDays = (date: string, days: number) => { const value = new Date(`${date}T00:00:00Z`); value.setUTCDate(value.getUTCDate() + days); return value.toISOString().slice(0,10); };
 const latestTradingDate = () => { let date=shanghaiDate(); while(!isTradingDate(date)) date=addDays(date,-1); return date; };
+const automaticProductionTargetDate = () => {
+  const hour=Number(new Intl.DateTimeFormat("en-GB",{timeZone:"Asia/Shanghai",hour:"2-digit",hour12:false}).format(new Date()));
+  let date=shanghaiDate();
+  if(hour<20)date=addDays(date,-1);
+  while(!isTradingDate(date))date=addDays(date,-1);
+  return date;
+};
 const hex = (buffer: ArrayBuffer) => [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
 type MatchRequestRecord = { id:number;role:string;amountMin:number;amountMax:number;termMonths:number|null;preference:string|null;purpose:string|null;riskSnapshot:string|null;viewerId:string|null };
 async function refreshMatchCandidates(db:D1Database,requestId:number) {
@@ -757,6 +764,7 @@ async function saveExchangeObservations(db:D1Database,rows:ExchangeObservationIn
     const matchMethod=exactMatch?"stock-date-normalized-title":matched?"single-pledge-candidate-same-stock-date":relevant.length?"multiple-pledge-candidates-same-stock-date":"no-primary-candidate";
     if(matchStatus==="exact")exact++;else if(matchStatus==="likely")likely++;else if(matchStatus==="ambiguous")ambiguous++;else missing++;
     await db.prepare("INSERT INTO exchange_observation (source,source_announcement_id,stock_code,stock_name,title,announce_date,pdf_url,title_fingerprint,match_status,match_method,matched_announcement_id,raw_json,observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,source_announcement_id) DO UPDATE SET stock_code=excluded.stock_code,stock_name=excluded.stock_name,title=excluded.title,announce_date=excluded.announce_date,pdf_url=excluded.pdf_url,title_fingerprint=excluded.title_fingerprint,match_status=excluded.match_status,match_method=excluded.match_method,matched_announcement_id=excluded.matched_announcement_id,raw_json=excluded.raw_json,observed_at=excluded.observed_at").bind(row.source,row.sourceAnnouncementId,row.stockCode,row.stockName,row.title,row.announceDate,row.pdfUrl,fingerprint,matchStatus,matchMethod,matched?.announcementId||null,JSON.stringify(row.raw),now).run();
+    if(matchStatus==="likely"&&matched?.announcementId)await db.prepare("UPDATE exchange_observation SET review_status='linked',reviewed_at=?,reviewed_by='deterministic-reconciliation',review_note='同股票同日期只有一个质押公告候选，自动关联主库' WHERE source=? AND source_announcement_id=? AND review_status='pending'").bind(now,row.source,row.sourceAnnouncementId).run();
   }
   return {observed:rows.length,exact,likely,ambiguous,missing};
 }
@@ -856,8 +864,13 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
     const ingestion=await ingestCninfo(env.DB,date);
     const reconciliation=await runExchangeReconciliation(env.DB,date,["sse","szse","bse"]);
     const processing=await processPendingQueue(env.DB,env.DOCUMENTS,10,env,date);
+    const reviewCandidates=await env.DB.prepare("SELECT r.announcement_id AS id FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE r.status='pending' AND a.announce_date=? AND a.parse_status='review' AND a.parse_attempts<2 ORDER BY COALESCE(r.reviewed_at,r.created_at) ASC LIMIT 5").bind(date).all<{id:string}>();
+    const reviews:unknown[]=[];
+    for(const row of reviewCandidates.results){try{reviews.push(await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env));}catch(error){reviews.push({id:row.id,status:"failed",error:error instanceof Error?error.message:"review failed"});}}
+    const closingSnapshot=await dailyReportSnapshot(env.DB,date);
+    const closing=closingSnapshot.ready&&closingSnapshot.cutoffPassed?await publishDailyReport(env.DB,date,"automatic-production","自动关账：三所对账、公告分类与事件核验均已完成"):null;
     const finishedAt=new Date().toISOString();
-    const result={date,ingestion,reconciliation:{found:reconciliation.found,failures:reconciliation.failures,results:reconciliation.results},processing,startedAt,finishedAt};
+    const result={date,ingestion,reconciliation:{found:reconciliation.found,failures:reconciliation.failures,results:reconciliation.results},processing,reviews,closing,startedAt,finishedAt};
     await env.DB.batch([
       env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(finishedAt,(reconciliation.failures||processing.failures)?"completed_with_errors":"completed",ingestion.found,processing.events_created,reconciliation.failures+processing.failures,JSON.stringify(result),runId),
       env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('daily_production_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify(result),finishedAt),
@@ -898,21 +911,22 @@ async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext):Promi
   const enabled=env.AUTO_SYNC_ENABLED?.trim().toLowerCase()!=="false";
   const configuredInterval=Number(env.AUTO_SYNC_INTERVAL_MINUTES||60);
   const intervalMinutes=Number.isFinite(configuredInterval)?Math.min(Math.max(Math.round(configuredInterval),15),360):60;
-  const targetDate=latestTradingDate();
+  const targetDate=automaticProductionTargetDate();
   if(!enabled)return {enabled:false,status:"disabled",targetDate,intervalMinutes};
 
   const activeRun=await activeDailyProductionRun(env.DB);
   if(activeRun)return {enabled:true,status:"running",targetDate,intervalMinutes,runId:activeRun.id,lastTriggeredAt:activeRun.startedAt};
   const startedAt=new Date().toISOString();
   const lockCutoff=new Date(Date.now()-intervalMinutes*60000).toISOString();
-  const lock=await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('automatic_production_trigger',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE pipeline_state.updated_at<=? RETURNING updated_at AS updatedAt").bind(JSON.stringify({targetDate,reason:"public-health-check",status:"starting"}),startedAt,lockCutoff).first<{updatedAt:string}>();
+  const triggerKey=`automatic_production_trigger:${targetDate}`;
+  const lock=await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE pipeline_state.updated_at<=? RETURNING updated_at AS updatedAt").bind(triggerKey,JSON.stringify({targetDate,reason:"daily-report-request",status:"starting"}),startedAt,lockCutoff).first<{updatedAt:string}>();
   if(!lock){
-    const existing=await env.DB.prepare("SELECT updated_at AS updatedAt FROM pipeline_state WHERE key='automatic_production_trigger'").first<{updatedAt:string}>();
+    const existing=await env.DB.prepare("SELECT updated_at AS updatedAt FROM pipeline_state WHERE key=?").bind(triggerKey).first<{updatedAt:string}>();
     return {enabled:true,status:"fresh",targetDate,intervalMinutes,lastTriggeredAt:existing?.updatedAt||null};
   }
   const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("daily-production-cycle",startedAt,"running",`automatic production catch-up ${targetDate}`).first<{id:number}>();
   if(!run?.id)return {enabled:true,status:"fresh",targetDate,intervalMinutes,lastTriggeredAt:startedAt};
-  await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('automatic_production_trigger',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify({targetDate,runId:run.id,reason:"public-health-check"}),startedAt).run();
+  await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(triggerKey,JSON.stringify({targetDate,runId:run.id,reason:"daily-report-request"}),startedAt).run();
   ctx.waitUntil(runDailyProductionCycle(env,targetDate,run.id,"automatic-production").catch(()=>undefined));
   return {enabled:true,status:"started",targetDate,intervalMinutes,runId:run.id,lastTriggeredAt:startedAt};
 }
@@ -989,6 +1003,17 @@ async function dailyReportSnapshot(db:D1Database,date:string) {
   return {date,cutoffAt,status,ready,cutoffPassed,announcement:announcement||{total:0,classified:0,pending:0},event:event||{total:0,companies:0,releases:0,supplemental:0},verification:verification||{},reconciliation:{complete:reconciliationComplete,successfulSources,requiredSources:3,unresolved:Number(unresolved?.total||0),sourceRuns,lastRun:reconciliationRun||null},published:published||null};
 }
 
+async function publishDailyReport(db:D1Database,date:string,viewer:string,notes="") {
+  const snapshot=await dailyReportSnapshot(db,date);
+  if(!snapshot.ready)return {ok:false as const,status:"not_ready",snapshot};
+  const now=new Date().toISOString();const announcement=snapshot.announcement as {total?:number};const event=snapshot.event as {total?:number;companies?:number};
+  await db.batch([
+    db.prepare("INSERT INTO daily_report (date,cutoff_at,status,announcement_count,event_count,company_count,reconciliation_status,report_version,published_at,published_by,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET status='published',announcement_count=excluded.announcement_count,event_count=excluded.event_count,company_count=excluded.company_count,reconciliation_status=excluded.reconciliation_status,report_version=CASE WHEN daily_report.status='published' THEN daily_report.report_version ELSE daily_report.report_version+1 END,published_at=excluded.published_at,published_by=excluded.published_by,notes=excluded.notes").bind(date,snapshot.cutoffAt,"published",Number(announcement.total||0),Number(event.total||0),Number(event.companies||0),"verified",1,now,viewer,notes.trim().slice(0,500)||null),
+    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"published",JSON.stringify({announcements:announcement.total||0,events:event.total||0,companies:event.companies||0}),viewer,now),
+  ]);
+  return {ok:true as const,date,status:"published",publishedAt:now};
+}
+
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   await ensureSchema(env.DB);
   const url = new URL(request.url);
@@ -1024,6 +1049,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const session=await stripePost(env,"billing_portal/sessions",{customer:account.stripeCustomerId,return_url:`${url.origin}${input.locale==="en"?"/en/pricing":"/pricing"}`});return json({ok:true,url:session.url});
   }
   if(url.pathname==="/api/daily-report"&&request.method==="GET"){
+    const automaticProduction=await maybeStartAutomaticProduction(env,ctx);
     const requested=url.searchParams.get("date");
     const latest=await env.DB.prepare("SELECT MAX(announce_date) AS date FROM announcement").first<{date:string}>();
     const date=requested&&/^\d{4}-\d{2}-\d{2}$/.test(requested)?requested:latest?.date||latestTradingDate();
@@ -1031,7 +1057,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       dailyReportSnapshot(env.DB,date),
       env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,p.verification_status AS verificationStatus,a.pdf_url AS pdfUrl FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE p.announce_date=? ORDER BY CASE WHEN p.type LIKE '%补充%' THEN 0 WHEN p.type NOT LIKE '%解除%' THEN 1 ELSE 2 END,p.id DESC").bind(date).all(),
     ]);
-    return json({...snapshot,events:events.results,methodology:"交易日20:00停止纳入新公告；三所对账、公告分类和全部事件核验完成后方可关账发布",deliverables:{image:"由同一份关账数据生成PNG长图",pdf:"由同一份关账页面打印或保存为PDF"},generatedAt:new Date().toISOString()});
+    return json({...snapshot,events:events.results,automaticProduction,methodology:"交易日20:00停止纳入新公告；三所对账、公告分类和全部事件核验完成后方可关账发布",deliverables:{image:"由同一份关账数据生成PNG长图",pdf:"由同一份关账页面打印或保存为PDF"},generatedAt:new Date().toISOString()});
   }
   if(url.pathname==="/api/daily-reports"&&request.method==="GET"){
     const rows=await env.DB.prepare("SELECT a.date,a.announcements,a.events,a.companies,a.pending,COALESCE(r.status,'draft') AS savedStatus,r.published_at AS publishedAt FROM (SELECT d.announce_date AS date,COUNT(DISTINCT d.announcement_id) AS announcements,COUNT(DISTINCT p.id) AS events,COUNT(DISTINCT p.stock_code) AS companies,COUNT(DISTINCT CASE WHEN d.parse_status NOT IN ('parsed','ignored','rejected') THEN d.announcement_id END) AS pending FROM announcement d LEFT JOIN pledge p ON p.announcement_id=d.announcement_id GROUP BY d.announce_date ORDER BY d.announce_date DESC LIMIT 90) a LEFT JOIN daily_report r ON r.date=a.date ORDER BY a.date DESC").all<{date:string}>();
@@ -1042,13 +1068,8 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const input=await request.json<{date?:string;notes?:string}>().catch(()=>({}));const date=input.date||latestTradingDate();
     if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return json({error:"无效报告日期"},{status:400});
-    const snapshot=await dailyReportSnapshot(env.DB,date);if(!snapshot.ready)return json({error:"当日尚未满足关账条件",snapshot},{status:409});
-    const now=new Date().toISOString();const announcement=snapshot.announcement as {total?:number};const event=snapshot.event as {total?:number;companies?:number};
-    await env.DB.batch([
-      env.DB.prepare("INSERT INTO daily_report (date,cutoff_at,status,announcement_count,event_count,company_count,reconciliation_status,report_version,published_at,published_by,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET status='published',announcement_count=excluded.announcement_count,event_count=excluded.event_count,company_count=excluded.company_count,reconciliation_status=excluded.reconciliation_status,report_version=daily_report.report_version+1,published_at=excluded.published_at,published_by=excluded.published_by,notes=excluded.notes").bind(date,snapshot.cutoffAt,"published",Number(announcement.total||0),Number(event.total||0),Number(event.companies||0),"verified",1,now,viewer,(input.notes||"").trim().slice(0,500)||null),
-      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"published",JSON.stringify({announcements:announcement.total||0,events:event.total||0,companies:event.companies||0}),viewer,now),
-    ]);
-    return json({ok:true,date,status:"published",publishedAt:now});
+    const result=await publishDailyReport(env.DB,date,viewer,input.notes||"");if(!result.ok)return json({error:"当日尚未满足关账条件",snapshot:result.snapshot},{status:409});
+    return json(result);
   }
   if (url.pathname === "/api/health") {
     const [stats,quotaState,automaticSync,automaticMaintenance] = await Promise.all([
