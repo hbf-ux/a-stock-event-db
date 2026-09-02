@@ -894,7 +894,7 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
     const processing=await processPendingQueue(env.DB,env.DOCUMENTS,3,env,date);
     const reviewCandidates=await env.DB.prepare("SELECT r.announcement_id AS id FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE r.status='pending' AND a.announce_date=? AND a.parse_status='review' AND a.parse_attempts<2 ORDER BY COALESCE(r.reviewed_at,r.created_at) ASC LIMIT 2").bind(date).all<{id:string}>();
     const reviews:unknown[]=[];
-    for(const row of reviewCandidates.results){try{reviews.push(await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env));}catch(error){reviews.push({id:row.id,status:"failed",error:error instanceof Error?error.message:"review failed"});}}
+    for(const row of reviewCandidates.results){try{reviews.push(await withDeadline(processAnnouncement(env.DB,env.DOCUMENTS,row.id,env),25_000,`review ${row.id}`));}catch(error){reviews.push({id:row.id,status:"failed",error:error instanceof Error?error.message:"review failed"});}}
     const closingSnapshot=await dailyReportSnapshot(env.DB,date);
     const closing=closingSnapshot.ready&&closingSnapshot.cutoffPassed?await publishDailyReport(env.DB,date,"automatic-production","自动关账：三所对账、公告分类与事件核验均已完成"):null;
     const finishedAt=new Date().toISOString();
@@ -1012,7 +1012,7 @@ async function applyStripeEvent(db:D1Database,env:Env,event:StripeEvent,rawBody:
 
 async function dailyReportSnapshot(db:D1Database,date:string) {
   const [announcement,event,verification,reconciliationRun,unresolved,published] = await Promise.all([
-    db.prepare("SELECT COUNT(*) AS total,SUM(CASE WHEN parse_status IN ('parsed','ignored','rejected') THEN 1 ELSE 0 END) AS classified,SUM(CASE WHEN parse_status NOT IN ('parsed','ignored','rejected') THEN 1 ELSE 0 END) AS pending FROM announcement WHERE announce_date=?").bind(date).first<{total:number;classified:number;pending:number}>(),
+    db.prepare("SELECT COUNT(*) AS total,SUM(CASE WHEN parse_status IN ('parsed','ignored','rejected') THEN 1 ELSE 0 END) AS classified,SUM(CASE WHEN parse_status NOT IN ('parsed','ignored','rejected') THEN 1 ELSE 0 END) AS pending,SUM(CASE WHEN parse_status IN ('queued','archived','processing') THEN 1 ELSE 0 END) AS processing,SUM(CASE WHEN parse_status='review' THEN 1 ELSE 0 END) AS review FROM announcement WHERE announce_date=?").bind(date).first<{total:number;classified:number;pending:number;processing:number;review:number}>(),
     db.prepare("SELECT COUNT(*) AS total,COUNT(DISTINCT stock_code) AS companies,SUM(CASE WHEN type LIKE '%解除%' THEN 1 ELSE 0 END) AS releases,SUM(CASE WHEN type LIKE '%补充%' THEN 1 ELSE 0 END) AS supplemental FROM pledge WHERE announce_date=?").bind(date).first<{total:number;companies:number;releases:number;supplemental:number}>(),
     db.prepare("SELECT SUM(CASE WHEN verification_status='human_verified' THEN 1 ELSE 0 END) AS humanVerified,SUM(CASE WHEN verification_status='ai_reviewed' THEN 1 ELSE 0 END) AS aiReviewed,SUM(CASE WHEN verification_status='rules_validated' THEN 1 ELSE 0 END) AS rulesValidated FROM pledge WHERE announce_date=?").bind(date).first(),
     db.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,message FROM sync_run WHERE source='exchange-reconciliation' AND json_valid(message) AND json_extract(message,'$.date')=? ORDER BY id DESC LIMIT 1").bind(date).first<{id:number;startedAt:string;finishedAt:string;status:string;message:string}>(),
