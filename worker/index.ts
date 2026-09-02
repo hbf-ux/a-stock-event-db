@@ -896,7 +896,7 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
     const reviews:unknown[]=[];
     for(const row of reviewCandidates.results){try{reviews.push(await withDeadline(processAnnouncement(env.DB,env.DOCUMENTS,row.id,env),25_000,`review ${row.id}`));}catch(error){reviews.push({id:row.id,status:"failed",error:error instanceof Error?error.message:"review failed"});}}
     const closingSnapshot=await dailyReportSnapshot(env.DB,date);
-    const closing=closingSnapshot.ready&&closingSnapshot.cutoffPassed?await publishDailyReport(env.DB,date,"automatic-production","自动关账：三所对账、公告分类与事件核验均已完成"):null;
+    const closing=closingSnapshot.ready&&closingSnapshot.cutoffPassed?await publishDailyReport(env,date,"automatic-production","自动关账：三所对账、公告分类与事件核验均已完成"):null;
     const finishedAt=new Date().toISOString();
     const result={date,ingestion,reconciliation:{found:reconciliation.found,failures:reconciliation.failures,results:reconciliation.results},processing,reviews,closing,startedAt,finishedAt};
     await env.DB.batch([
@@ -1031,15 +1031,63 @@ async function dailyReportSnapshot(db:D1Database,date:string) {
   return {date,cutoffAt,status,ready,cutoffPassed,announcement:announcement||{total:0,classified:0,pending:0},event:event||{total:0,companies:0,releases:0,supplemental:0},verification:verification||{},reconciliation:{complete:reconciliationComplete,successfulSources,requiredSources:3,unresolved:Number(unresolved?.total||0),sourceRuns,lastRun:reconciliationRun||null},published:published||null};
 }
 
-async function publishDailyReport(db:D1Database,date:string,viewer:string,notes="") {
-  const snapshot=await dailyReportSnapshot(db,date);
+type DailyArtifactEvent={announcementId:string;code:string;name:string;shareholder:string;pledgee:string;amount:string;ratio:string;type:string;verificationStatus:string};
+const xmlEscape=(value:unknown)=>String(value??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&apos;");
+const compactArtifactText=(value:unknown,limit:number)=>{const text=String(value??"—").replace(/\s+/g," ").trim()||"—";return text.length>limit?`${text.slice(0,Math.max(1,limit-1))}…`:text;};
+const dailyArtifactKey=(date:string,version:number,extension:"png"|"pdf")=>`daily-reports/${date}/HBF-A-share-pledge-daily-v${version}.${extension}`;
+
+function renderDailyReportSvg(date:string,version:number,events:DailyArtifactEvent[]){
+  const width=1500,rowHeight=112,top=458,height=Math.max(920,top+events.length*rowHeight+160);
+  const highRatio=events.filter((row)=>Number.parseFloat(row.ratio)>=50).length;
+  const companies=new Set(events.map((row)=>row.code)).size;
+  const supplemental=events.filter((row)=>row.type.includes("补充")).length;
+  const cells=[70,230,475,770,1030,1240];
+  const metrics=[["质押事件",events.length],["涉及公司",companies],["补充质押",supplemental],["高比例信号",highRatio]];
+  const metricSvg=metrics.map(([label,value],index)=>{const x=70+index*350;return `<g><rect x="${x}" y="280" width="310" height="115" rx="8" fill="#fff"/><text x="${x+24}" y="322" class="metricLabel">${label}</text><text x="${x+24}" y="374" class="metricValue">${value}</text></g>`;}).join("");
+  const rows=events.map((row,index)=>{const y=top+index*rowHeight;return `<g>${index%2===0?`<rect x="50" y="${y-10}" width="1400" height="${rowHeight}" fill="#ebe6dc"/>`:""}<text x="${cells[0]}" y="${y+30}" class="rowStrong">${xmlEscape(compactArtifactText(`${row.name} ${row.code}`,14))}</text><text x="${cells[1]}" y="${y+30}" class="row">${xmlEscape(compactArtifactText(row.shareholder,15))}</text><text x="${cells[2]}" y="${y+30}" class="row">${xmlEscape(compactArtifactText(row.pledgee,18))}</text><text x="${cells[3]}" y="${y+30}" class="rowStrong">${xmlEscape(compactArtifactText(row.amount,16))}</text><text x="${cells[4]}" y="${y+30}" class="rowStrong">${xmlEscape(row.ratio||"—")}</text><text x="${cells[5]}" y="${y+30}" class="row">${xmlEscape(compactArtifactText(row.type,8))}</text><text x="${cells[0]}" y="${y+70}" class="evidence">公告 ${xmlEscape(compactArtifactText(row.announcementId,38))} · ${xmlEscape(row.verificationStatus||"已核验")}</text></g>`;}).join("");
+  const headers=["股票","质押股东","质权人","股份数量","占个人持股","事件"].map((label,index)=>`<text x="${cells[index]}" y="440" class="tableHead">${label}</text>`).join("");
+  return {width,height,svg:`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><style>text{font-family:'Noto Sans CJK SC','Microsoft YaHei',sans-serif}.brand{font-size:32px;font-weight:700;fill:#fff}.date{font-size:62px;font-weight:700;fill:#fff}.subtitle{font-size:24px;fill:#b9c9e4}.metricLabel{font-size:22px;fill:#65728a}.metricValue{font-size:42px;font-weight:700;fill:#0b1f3a}.tableHead{font-size:21px;font-weight:700;fill:#0b1f3a}.row{font-size:21px;fill:#12213a}.rowStrong{font-size:22px;font-weight:700;fill:#12213a}.evidence{font-size:17px;fill:#718096}.footer{font-size:20px;fill:#0b1f3a}.watermark{font-size:46px;font-weight:700;fill:#0b1f3a;opacity:.22}</style><rect width="${width}" height="${height}" fill="#f4f0e8"/><rect width="${width}" height="250" fill="#0b1f3a"/><text x="70" y="72" class="brand">HBF · A股质押日报</text><text x="70" y="158" class="date">${date}</text><text x="70" y="207" class="subtitle">每日20:00关账｜官方公告三所交叉核验｜正式版本 V${version}</text>${metricSvg}${headers}${rows}<text x="70" y="${height-72}" class="footer">已关账发布｜事件 ${events.length} 条｜PNG 与 PDF 生成自同一份锁定数据</text><text x="1430" y="${height-62}" text-anchor="end" class="watermark">HBF</text></svg>`};
+}
+
+function pdfFromJpeg(jpeg:ArrayBuffer,width:number,height:number){
+  const encoder=new TextEncoder();const chunks:Uint8Array[]=[];let size=0;const offsets:number[]=[];
+  const push=(value:string|ArrayBuffer|Uint8Array)=>{const bytes=typeof value==="string"?encoder.encode(value):value instanceof Uint8Array?value:new Uint8Array(value);chunks.push(bytes);size+=bytes.byteLength;};
+  const object=(id:number,body:string)=>{offsets[id]=size;push(`${id} 0 obj\n${body}\nendobj\n`);};
+  const pageWidth=842,pageHeight=Math.max(595,Math.round(pageWidth*height/width));
+  push("%PDF-1.4\n%HBF\n");object(1,"<< /Type /Catalog /Pages 2 0 R >>");object(2,"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");object(3,`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>`);
+  offsets[4]=size;push(`4 0 obj\n<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.byteLength} >>\nstream\n`);push(jpeg);push("\nendstream\nendobj\n");
+  const content=`q ${pageWidth} 0 0 ${pageHeight} 0 0 cm /Im0 Do Q`;object(5,`<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+  const xref=size;push("xref\n0 6\n0000000000 65535 f \n");for(let id=1;id<=5;id++)push(`${String(offsets[id]).padStart(10,"0")} 00000 n \n`);push(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`);
+  const result=new Uint8Array(size);let cursor=0;for(const chunk of chunks){result.set(chunk,cursor);cursor+=chunk.byteLength;}return result;
+}
+
+async function generateDailyReportArtifacts(env:Env,date:string,version:number){
+  const eventResult=await env.DB.prepare("SELECT p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.type,p.verification_status AS verificationStatus FROM pledge p WHERE p.announce_date=? ORDER BY CASE WHEN p.type LIKE '%补充%' THEN 0 WHEN p.type NOT LIKE '%解除%' THEN 1 ELSE 2 END,p.id DESC").bind(date).all<DailyArtifactEvent>();
+  const rendered=renderDailyReportSvg(date,version,eventResult.results);const makeStream=()=>new Response(rendered.svg,{headers:{"content-type":"image/svg+xml; charset=utf-8"}}).body!;
+  const [pngResponse,jpegResponse]=await Promise.all([env.IMAGES.input(makeStream()).transform({width:rendered.width}).output({format:"image/png",quality:100}).response(),env.IMAGES.input(makeStream()).transform({width:rendered.width}).output({format:"image/jpeg",quality:94}).response()]);
+  if(!pngResponse.ok||!jpegResponse.ok)throw new Error(`artifact rendering failed: PNG ${pngResponse.status}, JPEG ${jpegResponse.status}`);
+  const [png,jpeg]=await Promise.all([pngResponse.arrayBuffer(),jpegResponse.arrayBuffer()]);const pdf=pdfFromJpeg(jpeg,rendered.width,rendered.height);
+  const pngKey=dailyArtifactKey(date,version,"png"),pdfKey=dailyArtifactKey(date,version,"pdf");
+  await Promise.all([env.DOCUMENTS.put(pngKey,png,{httpMetadata:{contentType:"image/png"},customMetadata:{date,version:String(version),source:"locked-daily-report"}}),env.DOCUMENTS.put(pdfKey,pdf,{httpMetadata:{contentType:"application/pdf"},customMetadata:{date,version:String(version),source:"locked-daily-report"}})]);
+  return {pngKey,pdfKey,pngBytes:png.byteLength,pdfBytes:pdf.byteLength};
+}
+
+async function dailyArtifactLinks(env:Env,date:string,version:number){
+  const pngKey=dailyArtifactKey(date,version,"png"),pdfKey=dailyArtifactKey(date,version,"pdf");const [png,pdf]=await Promise.all([env.DOCUMENTS.head(pngKey),env.DOCUMENTS.head(pdfKey)]);
+  return {png:png?`/api/documents/${encodeURIComponent(pngKey)}`:null,pdf:pdf?`/api/documents/${encodeURIComponent(pdfKey)}`:null,locked:Boolean(png&&pdf)};
+}
+
+async function publishDailyReport(env:Env,date:string,viewer:string,notes="") {
+  const db=env.DB;const snapshot=await dailyReportSnapshot(db,date);
   if(!snapshot.ready)return {ok:false as const,status:"not_ready",snapshot};
   const now=new Date().toISOString();const announcement=snapshot.announcement as {total?:number};const event=snapshot.event as {total?:number;companies?:number};
   await db.batch([
     db.prepare("INSERT INTO daily_report (date,cutoff_at,status,announcement_count,event_count,company_count,reconciliation_status,report_version,published_at,published_by,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET status='published',announcement_count=excluded.announcement_count,event_count=excluded.event_count,company_count=excluded.company_count,reconciliation_status=excluded.reconciliation_status,report_version=CASE WHEN daily_report.status='published' THEN daily_report.report_version ELSE daily_report.report_version+1 END,published_at=excluded.published_at,published_by=excluded.published_by,notes=excluded.notes").bind(date,snapshot.cutoffAt,"published",Number(announcement.total||0),Number(event.total||0),Number(event.companies||0),"verified",1,now,viewer,notes.trim().slice(0,500)||null),
     db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"published",JSON.stringify({announcements:announcement.total||0,events:event.total||0,companies:event.companies||0}),viewer,now),
   ]);
-  return {ok:true as const,date,status:"published",publishedAt:now};
+  const saved=await db.prepare("SELECT report_version AS reportVersion FROM daily_report WHERE date=?").bind(date).first<{reportVersion:number}>();const version=Number(saved?.reportVersion||1);
+  try{const artifacts=await generateDailyReportArtifacts(env,date,version);await db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"artifacts_generated",JSON.stringify(artifacts),viewer,new Date().toISOString()).run();return {ok:true as const,date,status:"published",publishedAt:now,reportVersion:version,artifacts};}
+  catch(error){const artifactError=error instanceof Error?error.message:"artifact generation failed";await db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"artifacts_failed",JSON.stringify({artifactError}),viewer,new Date().toISOString()).run();return {ok:true as const,date,status:"published",publishedAt:now,reportVersion:version,artifactError};}
 }
 
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -1081,11 +1129,13 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const requested=url.searchParams.get("date");
     const latest=await env.DB.prepare("SELECT MAX(announce_date) AS date FROM announcement").first<{date:string}>();
     const date=requested&&/^\d{4}-\d{2}-\d{2}$/.test(requested)?requested:latest?.date||latestTradingDate();
-    const [snapshot,events]=await Promise.all([
+    const [snapshot,events,quotaState]=await Promise.all([
       dailyReportSnapshot(env.DB,date),
       env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,p.verification_status AS verificationStatus,a.pdf_url AS pdfUrl FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE p.announce_date=? ORDER BY CASE WHEN p.type LIKE '%补充%' THEN 0 WHEN p.type NOT LIKE '%解除%' THEN 1 ELSE 2 END,p.id DESC").bind(date).all(),
+      env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
     ]);
-    return json({...snapshot,events:events.results,automaticProduction,methodology:"交易日20:00停止纳入新公告；三所对账、公告分类和全部事件核验完成后方可关账发布",deliverables:{image:"由同一份关账数据生成PNG长图",pdf:"由同一份关账页面打印或保存为PDF"},generatedAt:new Date().toISOString()});
+    const blockedUntil=quotaState?.value&&Date.parse(quotaState.value)>Date.now()?quotaState.value:null;const version=Number((snapshot.published as {reportVersion?:number}|null)?.reportVersion||1);const artifacts=snapshot.status==="published"?await dailyArtifactLinks(env,date,version):{png:null,pdf:null,locked:false};
+    return json({...snapshot,events:events.results,automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),available:Boolean(env.OPENAI_API_KEY)&&!blockedUntil,blockedUntil},artifacts,methodology:"交易日20:00停止纳入新公告；三所对账、公告分类和全部事件核验完成后方可关账发布",deliverables:{image:"关账后从锁定数据生成并归档PNG长图",pdf:"关账后从同一锁定数据生成并归档PDF"},generatedAt:new Date().toISOString()});
   }
   if(url.pathname==="/api/daily-reports"&&request.method==="GET"){
     const rows=await env.DB.prepare("SELECT a.date,a.announcements,a.events,a.companies,a.pending,COALESCE(r.status,'draft') AS savedStatus,r.published_at AS publishedAt FROM (SELECT d.announce_date AS date,COUNT(DISTINCT d.announcement_id) AS announcements,COUNT(DISTINCT p.id) AS events,COUNT(DISTINCT p.stock_code) AS companies,COUNT(DISTINCT CASE WHEN d.parse_status NOT IN ('parsed','ignored','rejected') THEN d.announcement_id END) AS pending FROM announcement d LEFT JOIN pledge p ON p.announcement_id=d.announcement_id GROUP BY d.announce_date ORDER BY d.announce_date DESC LIMIT 90) a LEFT JOIN daily_report r ON r.date=a.date ORDER BY a.date DESC").all<{date:string}>();
@@ -1096,7 +1146,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const input=await request.json<{date?:string;notes?:string}>().catch(()=>({}));const date=input.date||latestTradingDate();
     if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return json({error:"无效报告日期"},{status:400});
-    const result=await publishDailyReport(env.DB,date,viewer,input.notes||"");if(!result.ok)return json({error:"当日尚未满足关账条件",snapshot:result.snapshot},{status:409});
+    const result=await publishDailyReport(env,date,viewer,input.notes||"");if(!result.ok)return json({error:"当日尚未满足关账条件",snapshot:result.snapshot},{status:409});
     return json(result);
   }
   if (url.pathname === "/api/health") {

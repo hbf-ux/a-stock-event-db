@@ -27,6 +27,37 @@
 .dailyPipeline em { font-style: normal; }
 .dailyPipeline small { margin-left: auto; color: #858b93; }
 
+.dailyReviewPause {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 14px;
+  border: 1px solid #ead7b4;
+  border-top: 0;
+  background: #fff8e9;
+  color: #745d35;
+  font-size: 9px;
+}
+
+.dailyReviewPause b { color: #9a6213; }
+
+.dailyDownload {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  padding: 0 16px;
+  border: 1px solid #aeb9c7;
+  border-radius: 4px;
+  color: #17304f;
+  background: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.dailyDownload.primary { border-color: #17304f; background: #17304f; color: #fff; }
+
 @keyframes dailyPulse {
   50% { box-shadow: 0 0 0 7px rgba(22, 129, 82, 0); }
 }
@@ -34,8 +65,9 @@
 @media (max-width: 560px) {
   .dailyPipeline { align-items: flex-start; flex-wrap: wrap; }
   .dailyPipeline small { width: 100%; margin-left: 16px; }
+  .dailyReviewPause { align-items: flex-start; flex-direction: column; gap: 4px; }
 }
 
 @media print {
-  .dailyPipeline { display: none !important; }
+  .dailyPipeline, .dailyReviewPause { display: none !important; }
 }
