@@ -7,5 +7,10 @@ workers_dev = true
 [vars]
 PRODUCTION_TICK_URL = "https://pledge.otcfilingwatch.com/api/internal/production-tick"
 
-[triggers]
-crons = ["*/5 * * * 1-5"]
+[[durable_objects.bindings]]
+name = "PLEDGE_SCHEDULER"
+class_name = "PledgeScheduler"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PledgeScheduler"]

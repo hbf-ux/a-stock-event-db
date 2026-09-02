@@ -158,9 +158,13 @@ test("deployment bundle exists", async () => {
     readFile(new URL("scheduler/pledge-daily-cron/wrangler.toml",root),"utf8"),
   ]);
   assert.match(cronWorker,/PRODUCTION_CRON_SECRET/);
-  assert.match(cronWorker,/cloudflare-cron-worker/);
+  assert.match(cronWorker,/cloudflare-durable-object-alarm/);
   assert.match(cronConfig,/hbf-pledge-daily-scheduler/);
-  assert.match(cronConfig,/\*\/5 \* \* \* 1-5/);
+  assert.match(cronConfig,/PLEDGE_SCHEDULER/);
+  assert.match(cronConfig,/new_sqlite_classes = \["PledgeScheduler"\]/);
+  assert.doesNotMatch(cronConfig,/\[triggers\]/);
+  assert.match(cronWorker,/setAlarm/);
+  assert.match(cronWorker,/\/start/);
   assert.match(cronWorker,/outside-production-window/);
   assert.doesNotMatch(cronConfig,/PRODUCTION_CRON_SECRET\s*=/);
 });
