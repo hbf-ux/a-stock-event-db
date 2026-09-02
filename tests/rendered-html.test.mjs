@@ -113,6 +113,8 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /dailyReportSnapshot/);
   assert.match(worker, /T20:00:00\+08:00/);
   assert.match(worker, /automaticProductionTargetDate/);
+  assert.match(worker, /const \[stats,quotaState,automaticProduction,automaticMaintenance\]/);
+  assert.match(worker, /automaticSync:automaticProduction/);
   assert.match(worker, /deterministic-reconciliation/);
   assert.match(worker, /await publishDailyReport/);
   assert.match(worker, /generateDailyReportArtifacts/);

@@ -1160,14 +1160,14 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json(result);
   }
   if (url.pathname === "/api/health") {
-    const [stats,quotaState,automaticSync,automaticMaintenance] = await Promise.all([
+    const [stats,quotaState,automaticProduction,automaticMaintenance] = await Promise.all([
       env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews, (SELECT COUNT(*) FROM announcement WHERE parse_status='ignored') ignored_announcements").first(),
       env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
       maybeStartAutomaticProduction(env,ctx),
       maybeStartAutomaticMaintenance(env,ctx),
     ]);
     const quotaBlocked = Boolean(quotaState?.value && Date.parse(quotaState.value) > Date.now());
-    return json({ status: "ok", storage: { d1: true, r2: true }, scheduler:{handlerReady:true,secureHttpTriggerConfigured:Boolean(env.PRODUCTION_CRON_SECRET),productionTargetDate:automaticProduction.targetDate}, automaticSync, automaticMaintenance, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
+    return json({ status: "ok", storage: { d1: true, r2: true }, scheduler:{handlerReady:true,secureHttpTriggerConfigured:Boolean(env.PRODUCTION_CRON_SECRET),productionTargetDate:automaticProduction.targetDate}, automaticSync:automaticProduction, automaticMaintenance, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
