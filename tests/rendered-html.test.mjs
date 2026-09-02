@@ -153,6 +153,16 @@ test("international daily report and existing billing backend remain wired", asy
 test("deployment bundle exists", async () => {
   await access(new URL("dist/server/index.js", root));
   await access(new URL(".openai/hosting.json", root));
+  const [cronWorker,cronConfig]=await Promise.all([
+    readFile(new URL("scheduler/pledge-daily-cron/src/index.mjs",root),"utf8"),
+    readFile(new URL("scheduler/pledge-daily-cron/wrangler.toml",root),"utf8"),
+  ]);
+  assert.match(cronWorker,/PRODUCTION_CRON_SECRET/);
+  assert.match(cronWorker,/cloudflare-cron-worker/);
+  assert.match(cronConfig,/hbf-pledge-daily-scheduler/);
+  assert.match(cronConfig,/\*\/5 \* \* \* 1-5/);
+  assert.match(cronWorker,/outside-production-window/);
+  assert.doesNotMatch(cronConfig,/PRODUCTION_CRON_SECRET\s*=/);
 });
 
 test("commercial intelligence pages are wired to verified event data", async () => {

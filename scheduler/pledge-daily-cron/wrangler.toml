@@ -1,0 +1,11 @@
+name = "hbf-pledge-daily-scheduler"
+main = "src/index.mjs"
+compatibility_date = "2026-09-02"
+account_id = "3f9b2cd1ab4dc4306bce3aa84819589f"
+workers_dev = true
+
+[vars]
+PRODUCTION_TICK_URL = "https://pledge.otcfilingwatch.com/api/internal/production-tick"
+
+[triggers]
+crons = ["*/5 * * * 1-5"]
