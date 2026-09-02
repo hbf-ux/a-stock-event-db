@@ -5,14 +5,14 @@ import "./daily-report-pipeline.css";
 
 type EventRow = { id:number;announcementId:string;date:string;code:string;name:string;shareholder:string;pledgee:string;amount:string;ratio:string;total:string;type:string;verificationStatus:string;pdfUrl?:string };
 type Snapshot = {
-  date:string; cutoffAt:string; status:"collecting"|"reviewing"|"ready_to_close"|"published"; ready:boolean;
+  date:string; cutoffAt:string; publicationDeadlineAt?:string; publicationOverdue?:boolean; status:"collecting"|"reviewing"|"ready_to_close"|"published"; ready:boolean;
   announcement:{total?:number;classified?:number;pending?:number;processing?:number;review?:number}; event:{total?:number;companies?:number;releases?:number;supplemental?:number};
   verification:{humanVerified?:number;aiReviewed?:number;rulesValidated?:number};
   reconciliation:{complete:boolean;successfulSources:number;requiredSources:number;unresolved:number};
-  automaticProduction?:{enabled:boolean;status:"disabled"|"fresh"|"running"|"started";targetDate:string;intervalMinutes:number;runId?:number;lastTriggeredAt?:string|null};
+  automaticProduction?:{enabled:boolean;status:"disabled"|"fresh"|"running"|"started"|"published";targetDate:string;intervalMinutes:number;runId?:number;lastTriggeredAt?:string|null};
   automatedReview?:{configured:boolean;available:boolean;blockedUntil?:string|null};
   artifacts?:{png?:string|null;pdf?:string|null;locked:boolean};
-  clock?:{shanghaiDate:string;productionTargetDate:string;cutoffHour:number};
+  clock?:{shanghaiDate:string;productionTargetDate:string;cutoffHour:number;publicationDeadlineHour?:number};
   published?:{reportVersion?:number;publishedAt?:string}|null; events:EventRow[]; methodology:string; generatedAt:string;
 };
 
@@ -41,7 +41,7 @@ export default function DailyReportClient({requestedDate}:{requestedDate?:string
     const width=1500,rowHeight=108,top=450,footer=150,height=Math.max(920,top+rows.length*rowHeight+footer);
     const canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;const ctx=canvas.getContext("2d");if(!ctx)return;
     ctx.fillStyle="#f4f0e8";ctx.fillRect(0,0,width,height);ctx.fillStyle="#0b1f3a";ctx.fillRect(0,0,width,250);
-    ctx.fillStyle="#fff";ctx.font="700 32px sans-serif";ctx.fillText("HBF · A股质押日报",70,70);ctx.font="700 62px sans-serif";ctx.fillText(report.date,70,155);ctx.font="24px sans-serif";ctx.fillStyle="#b9c9e4";ctx.fillText("每日20:00关账｜官方公告三所交叉核验",70,205);
+    ctx.fillStyle="#fff";ctx.font="700 32px sans-serif";ctx.fillText("HBF · A股质押日报",70,70);ctx.font="700 62px sans-serif";ctx.fillText(report.date,70,155);ctx.font="24px sans-serif";ctx.fillStyle="#b9c9e4";ctx.fillText("20:00截止｜21:00目标发布｜官方公告三所交叉核验",70,205);
     const metrics=[["质押事件",number(report.event.total)],["涉及公司",number(report.event.companies)],["补充质押",number(report.event.supplemental)],["高比例信号",number(highCount)]];
     metrics.forEach(([label,value],index)=>{const x=70+index*350;ctx.fillStyle="#fff";ctx.fillRect(x,280,310,115);ctx.fillStyle="#65728a";ctx.font="22px sans-serif";ctx.fillText(label,x+24,320);ctx.fillStyle="#0b1f3a";ctx.font="700 42px sans-serif";ctx.fillText(value,x+24,375);});
     const columns=[70,220,445,700,990,1210];ctx.fillStyle="#0b1f3a";ctx.font="700 21px sans-serif";["股票","股东","质权人","股份数量","占个人持股","类型"].forEach((label,index)=>ctx.fillText(label,columns[index],435));
@@ -53,7 +53,7 @@ export default function DailyReportClient({requestedDate}:{requestedDate?:string
   return <main className="dailyPage"><header className="dailyHeader"><a className="dailyBrand" href="/"><span>HBF</span><b>质押日报<small>股东融资情报与撮合</small></b></a><nav><a className={!requestedDate?"active":""} href="/">今日报告</a><a className={requestedDate?"active":""} href="/reports">历史日报</a><a href="/match">撮合服务</a><a href="/match/desk">我的撮合</a></nav><a className="dailyEn" href="/en">EN</a></header>
     <div className="dailyShell">{loading?<div className="dailyState">正在读取关账数据…</div>:error?<div className="dailyState error">{error}<button onClick={()=>void load()}>重试</button></div>:report&&<>
       <div className="dailyClock"><b>当前北京时间：{beijingTime(report.generatedAt)}</b><span>{requestedDate?`正在查看历史报告 ${report.date}`:`正在关账：${report.date}`}</span>{!requestedDate&&report.clock?.shanghaiDate!==report.date&&<em>{report.clock?.shanghaiDate} 日报将在20:00截止后进入关账</em>}</div>
-      <section className="dailyMasthead"><div><p className="eyebrow">DAILY PLEDGE CLOSING REPORT</p><h1>{report.date}<br/>A股质押关账报告</h1><p>数据截至 {report.date} 20:00，只发布完成三所交叉核验和逐条审核的正式清单。</p></div><aside><span className={`closingStatus ${report.status}`}>{status.label}</span><b>{status.note}</b><small>报告交易日：{report.date}</small><small>{report.published?.reportVersion?`报告版本：V${report.published.reportVersion}`:"正式发布前数据可能更新"}</small></aside></section>
+      <section className="dailyMasthead"><div><p className="eyebrow">DAILY PLEDGE CLOSING REPORT</p><h1>{report.date}<br/>A股质押关账报告</h1><p>数据截至 {report.date} 20:00；之后披露的公告顺延到下一交易日日报，目标 21:00 发布正式清单。</p></div><aside><span className={`closingStatus ${report.status}`}>{status.label}</span><b>{status.note}</b><small>报告交易日：{report.date}</small><small>发布目标：{report.date} 21:00</small><small>{report.published?.reportVersion?`报告版本：V${report.published.reportVersion}`:"正式发布前数据可能更新"}</small></aside></section>
       {report.status!=="published"&&report.automaticProduction?.enabled&&<div className="dailyPipeline"><span className={report.automaticProduction.status==="running"||report.automaticProduction.status==="started"?"pulse":""}/><b>{report.automaticProduction.status==="running"||report.automaticProduction.status==="started"?"后台补跑中":"自动补跑已启用"}</b><em>目标交易日 {report.automaticProduction.targetDate}</em><small>{report.automaticProduction.runId?`任务 #${report.automaticProduction.runId}`:`每 ${report.automaticProduction.intervalMinutes} 分钟继续一批`} · 页面每分钟自动刷新</small></div>}
       {report.status!=="published"&&report.automatedReview?.blockedUntil&&<div className="dailyReviewPause"><b>AI 自动复核暂缓</b><span>规则解析与人工审核仍可继续；预计 {beijingTime(report.automatedReview.blockedUntil)} 后恢复额度检测。</span></div>}
       <section className="dailyMetrics"><div><span>官方公告</span><strong>{number(report.announcement.total)}</strong><small>{number(report.announcement.processing)} 条处理中 · {number(report.announcement.review)} 条待复核</small></div><div><span>质押事件</span><strong>{number(report.event.total)}</strong><small>逐条结构化核验</small></div><div><span>涉及公司</span><strong>{number(report.event.companies)}</strong><small>按股票代码去重</small></div><div><span>三所对账</span><strong>{report.reconciliation.successfulSources}/{report.reconciliation.requiredSources}</strong><small>{report.reconciliation.unresolved} 条差异待解决</small></div></section>

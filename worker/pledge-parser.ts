@@ -85,7 +85,7 @@ const amountNumber = (value: string) => {
 };
 
 const amountUnitFromHeader = (value:string,kind:"pledge"|"release") => {
-  const label=kind==="pledge"?/(?:本次)?质押(?:股数|数量|股份数量)?[（(]?\s*(万|亿)?\s*股/:/(?:本次)?(?:解除质押|解质)(?:股份|股数|数量|股份数量)?[（(]?\s*(万|亿)?\s*股/;
+  const label=kind==="pledge"?/(?:本次)?质押(?:股数|数量|股份数量)?[（(]?\s*(万|亿)?\s*股[）)]?/:/(?:本次)?(?:解除质押|解质)(?:股份|股数|数量|股份数量)?[（(]?\s*(万|亿)?\s*股[）)]?/;
   return value.match(label)?.[1] || "";
 };
 

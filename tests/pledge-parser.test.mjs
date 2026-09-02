@@ -125,3 +125,15 @@ test("2026-08-31 official correction set covers nine announcements and fifteen r
   assert.equal([...correctionSet.matchAll(/amount:\d/g)].length,15);
   assert.match(worker,/official_pdf_correction/);
 });
+
+test("infers 万股 when the table header closes its Chinese parenthesis", () => {
+  const text=`一、本次股份质押基本情况
+股东名称 是否为实际控制人 本次质押股数（万股） 是否为限售股 是否为补充质押 质押起始日 质押到期日 质权人 占其所持股份比例（%） 占公司总股本比例（%）
+崔小丽 是 275 否 否 2026年9月1日 2027年8月31日 中银国际证券股份有限公司 29.83 2.81
+合计 - 275 - - - - - 29.83 2.81`;
+  const rows=parseSectionPledgeRows(text,"关于实际控制人进行股份质押的公告");
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].amount,2_750_000);
+  assert.equal(rows[0].amountText,"275万 股");
+  assert.deepEqual(validateAndNormalizePledgeRow(rows[0]).missing,[]);
+});

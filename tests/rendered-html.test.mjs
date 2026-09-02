@@ -12,7 +12,8 @@ test("public product is a daily closing report backed by the production workflow
   ]);
   assert.match(page, /DailyReportClient/);
   const daily=await readFile(new URL("app/daily-report-client.tsx",root),"utf8");
-  assert.match(daily,/每日20:00关账/);
+  assert.match(daily,/21:00目标发布/);
+  assert.match(daily,/顺延到下一交易日日报/);
   assert.match(daily,/下载长图 PNG/);
   assert.match(daily,/打印 \/ 保存 PDF/);
   assert.match(daily,/下载归档 PNG/);
@@ -112,15 +113,23 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /\/api\/daily-reports/);
   assert.match(worker, /dailyReportSnapshot/);
   assert.match(worker, /T20:00:00\+08:00/);
+  assert.match(worker, /T21:00:00\+08:00/);
+  assert.match(worker, /publicationDeadlineAt/);
   assert.match(worker, /automaticProductionTargetDate/);
+  assert.match(worker, /reportDateForDisclosure/);
+  assert.match(worker, /hour>=20\?nextTradingDate/);
+  assert.match(worker, /WHERE a\.report_date=\?/);
   assert.match(worker, /const \[stats,quotaState,automaticProduction,automaticMaintenance\]/);
   assert.match(worker, /automaticSync:automaticProduction/);
+  assert.match(worker, /status='published'/);
+  assert.match(worker, /a\.parse_attempts<3/);
+  assert.match(worker, /60 \* 60 \* 1000/);
   assert.match(worker, /deterministic-reconciliation/);
   assert.match(worker, /await publishDailyReport/);
   assert.match(worker, /generateDailyReportArtifacts/);
   assert.match(worker, /locked-daily-report/);
   assert.match(worker, /pdfFromJpeg/);
-  assert.match(worker, /三所对账、公告分类和全部事件核验完成后方可关账发布/);
+  assert.match(worker, /20:00后的官方公告顺延到下一交易日日报/);
   assert.doesNotMatch(worker, /await seed\(env\.DB\)/);
   assert.match(layout, /每日A股质押关账报告与融资撮合/);
 });
@@ -167,7 +176,8 @@ test("deployment bundle exists", async () => {
   assert.doesNotMatch(cronConfig,/\[triggers\]/);
   assert.match(cronWorker,/setAlarm/);
   assert.match(cronWorker,/\/start/);
-  assert.match(cronWorker,/outside-production-window/);
+  assert.doesNotMatch(cronWorker,/outside-production-window/);
+  assert.match(cronWorker,/return \{ shouldRun: true/);
   assert.doesNotMatch(cronConfig,/PRODUCTION_CRON_SECRET\s*=/);
 });
 

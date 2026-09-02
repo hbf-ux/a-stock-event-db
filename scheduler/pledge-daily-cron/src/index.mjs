@@ -40,11 +40,6 @@ export class PledgeScheduler {
       beijingTime: window.localTime,
     };
 
-    if (!window.shouldRun) {
-      await this.record({ ...baseStatus, status: "skipped", reason: window.reason });
-      return;
-    }
-
     try {
       validateEnvironment(this.env);
       const response = await fetch(this.env.PRODUCTION_TICK_URL, {
@@ -137,11 +132,7 @@ function beijingWindow(timestamp) {
     hour12: false,
   }).formatToParts(new Date(timestamp));
   const value = (type) => parts.find((part) => part.type === type)?.value || "";
-  const weekday = value("weekday");
-  const hour = Number(value("hour"));
   const localTime = `${value("year")}-${value("month")}-${value("day")} ${value("hour")}:${value("minute")}:${value("second")}`;
-  if (weekday === "Sat" || weekday === "Sun") return { shouldRun: false, reason: "weekend", localTime };
-  if (hour < 20 || hour >= 22) return { shouldRun: false, reason: "outside-production-window", localTime };
   return { shouldRun: true, reason: null, localTime };
 }
 
