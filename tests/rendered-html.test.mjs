@@ -12,7 +12,7 @@ test("public product is a daily closing report backed by the production workflow
   ]);
   assert.match(page, /DailyReportClient/);
   const daily=await readFile(new URL("app/daily-report-client.tsx",root),"utf8");
-  assert.match(daily,/21:00目标发布/);
+  assert.match(daily,/目标 21:00 发布正式清单/);
   assert.match(daily,/顺延到下一自然日日报/);
   assert.match(daily,/周末照常运行/);
   assert.match(daily,/下载长图 PNG/);
@@ -20,6 +20,8 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(daily,/下载归档 PNG/);
   assert.match(daily,/下载归档 PDF/);
   assert.match(daily,/AI 自动复核暂缓/);
+  assert.match(daily,/临时版已发布/);
+  assert.match(daily,/完成后自动升级/);
   assert.match(daily,/当前北京时间/);
   assert.match(daily,/正在关账/);
   assert.match(daily,/日报将在20:00截止后进入关账/);
@@ -98,6 +100,10 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /successfulQueries/);
   assert.match(worker, /sourceWarnings/);
   assert.match(worker, /openai_quota_blocked_until/);
+  assert.match(worker, /openai_review_usage/);
+  assert.match(worker, /OpenAIReviewError/);
+  assert.match(worker, /x-client-request-id/);
+  assert.match(worker, /x-ratelimit-reset-requests/);
   assert.match(worker, /verification_status/);
   assert.match(worker, /human_verified/);
   assert.match(worker, /ai_reviewed/);
@@ -120,13 +126,15 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /reportDateForDisclosure/);
   assert.match(worker, /hour>=20\?addDays\(publishedDate,1\)/);
   assert.match(worker, /WHERE a\.report_date=\?/);
-  assert.match(worker, /const \[stats,quotaState,automaticProduction,automaticMaintenance\]/);
+  assert.match(worker, /const \[stats,quotaState,openaiErrorState,openaiUsage,automaticProduction,automaticMaintenance\]/);
   assert.match(worker, /automaticSync:automaticProduction/);
   assert.match(worker, /status='published'/);
   assert.match(worker, /a\.parse_attempts<3/);
-  assert.match(worker, /60 \* 60 \* 1000/);
+  assert.match(worker, /60\*60\*1000/);
   assert.match(worker, /deterministic-reconciliation/);
   assert.match(worker, /await publishDailyReport/);
+  assert.match(worker, /provisional_published/);
+  assert.match(worker, /publicationKind:"provisional"\|"final"/);
   assert.match(worker, /generateDailyReportArtifacts/);
   assert.match(worker, /locked-daily-report/);
   assert.match(worker, /pdfFromJpeg/);

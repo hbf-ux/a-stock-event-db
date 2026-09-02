@@ -73,6 +73,11 @@
 
 .dailyDownload.primary { border-color: #17304f; background: #17304f; color: #fff; }
 
+.closingStatus.provisional {
+  background: #fff0d9;
+  color: #8a5815;
+}
+
 @keyframes dailyPulse {
   50% { box-shadow: 0 0 0 7px rgba(22, 129, 82, 0); }
 }

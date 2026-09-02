@@ -53,6 +53,9 @@ async function ensureSchema(db: D1Database) {
     `CREATE TABLE IF NOT EXISTS sync_run (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, announcements_found INTEGER NOT NULL DEFAULT 0, events_created INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, message TEXT)`,
     `CREATE TABLE IF NOT EXISTS daily_report (date TEXT PRIMARY KEY, cutoff_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', announcement_count INTEGER NOT NULL DEFAULT 0, event_count INTEGER NOT NULL DEFAULT 0, company_count INTEGER NOT NULL DEFAULT 0, reconciliation_status TEXT NOT NULL DEFAULT 'pending', report_version INTEGER NOT NULL DEFAULT 1, published_at TEXT, published_by TEXT, notes TEXT)`,
     `CREATE INDEX IF NOT EXISTS daily_report_status_date_idx ON daily_report (status,date)`,
+    `CREATE TABLE IF NOT EXISTS openai_review_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, announcement_id TEXT NOT NULL, attempted_at TEXT NOT NULL, succeeded INTEGER NOT NULL DEFAULT 0, model TEXT, response_id TEXT, request_id TEXT, error_category TEXT, error_code TEXT, error_message TEXT, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0)`,
+    `CREATE INDEX IF NOT EXISTS openai_review_usage_date_idx ON openai_review_usage (attempted_at,succeeded)`,
+    `CREATE INDEX IF NOT EXISTS openai_review_usage_announcement_idx ON openai_review_usage (announcement_id,attempted_at)`,
     `CREATE TABLE IF NOT EXISTS pipeline_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS subscription_interest (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, plan TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'pricing-modal', created_at TEXT NOT NULL, UNIQUE(email, plan))`,
     `CREATE TABLE IF NOT EXISTS user_watchlist (user_id TEXT NOT NULL, stock_code TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (user_id, stock_code))`,
@@ -88,6 +91,10 @@ async function ensureSchema(db: D1Database) {
   if (!names.has("report_date")) await db.prepare("ALTER TABLE announcement ADD COLUMN report_date TEXT").run();
   await db.prepare("UPDATE announcement SET report_date=announce_date WHERE report_date IS NULL OR TRIM(report_date)='' ").run();
   await db.prepare("CREATE INDEX IF NOT EXISTS announcement_report_date_idx ON announcement (report_date)").run();
+  const dailyReportColumns = await db.prepare("PRAGMA table_info(daily_report)").all<{name:string}>();
+  const dailyReportNames = new Set(dailyReportColumns.results.map((column) => column.name));
+  if (!dailyReportNames.has("pending_count")) await db.prepare("ALTER TABLE daily_report ADD COLUMN pending_count INTEGER NOT NULL DEFAULT 0").run();
+  if (!dailyReportNames.has("reconciliation_unresolved")) await db.prepare("ALTER TABLE daily_report ADD COLUMN reconciliation_unresolved INTEGER NOT NULL DEFAULT 0").run();
   await db.prepare("UPDATE announcement SET parse_status=CASE WHEN parse_attempts>=3 THEN 'review' ELSE 'queued' END,last_error=COALESCE(last_error,'解析任务中断，已自动恢复') WHERE parse_status='processing' AND announcement_id IN (SELECT entity_id FROM audit_log WHERE entity_type='announcement' AND action='parse_claim' GROUP BY entity_id HAVING MAX(julianday(created_at))<julianday('now','-5 minutes'))").run();
   const matchCandidateColumns = await db.prepare("PRAGMA table_info(match_candidate)").all<{name:string}>();
   const matchCandidateNames = new Set(matchCandidateColumns.results.map((column) => column.name));
@@ -391,10 +398,47 @@ function normalizeVisionRows(value: unknown, title: string): ParsedPledge[] {
 
 const validateParsedRows = (rows: ParsedPledge[]) => rows.map((row) => validateAndNormalizePledgeRow(row));
 
-type OpenAIParseResult = { rows: ParsedPledge[]; model: string; responseId: string; usage: unknown };
+type OpenAIUsage = {input_tokens?:number;output_tokens?:number;total_tokens?:number;input_tokens_details?:{cached_tokens?:number}};
+type OpenAIErrorCategory = "billing"|"rate_limit"|"transient"|"invalid_request"|"invalid_response";
+type OpenAIParseResult = { rows: ParsedPledge[]; model: string; responseId: string; requestId: string; usage: OpenAIUsage | null; durationMs: number };
+
+class OpenAIReviewError extends Error {
+  constructor(
+    message:string,
+    readonly category:OpenAIErrorCategory,
+    readonly status:number,
+    readonly code:string,
+    readonly requestId:string,
+    readonly retryAfterMs:number|null,
+    readonly durationMs:number,
+  ){super(message);this.name="OpenAIReviewError";}
+}
+
+const parseRetryDelayMs=(response:Response)=>{
+  const retryAfter=response.headers.get("retry-after");
+  if(retryAfter){const seconds=Number(retryAfter);if(Number.isFinite(seconds))return Math.max(1_000,seconds*1_000);const at=Date.parse(retryAfter);if(Number.isFinite(at))return Math.max(1_000,at-Date.now());}
+  const reset=response.headers.get("x-ratelimit-reset-requests")||response.headers.get("x-ratelimit-reset-tokens");
+  if(!reset)return null;
+  const match=reset.match(/([\d.]+)\s*(ms|s|m)?/i);if(!match)return null;
+  const amount=Number(match[1]);const unit=(match[2]||"s").toLowerCase();return Math.max(1_000,amount*(unit==="ms"?1:unit==="m"?60_000:1_000));
+};
+
+function classifyOpenAIError(status:number,code:string,type:string,message:string):OpenAIErrorCategory {
+  const combined=`${code} ${type} ${message}`;
+  if(/insufficient_quota|credit_balance_exhausted|billing|no credits remaining/i.test(combined))return "billing";
+  if(status===429||/rate_limit/i.test(combined))return "rate_limit";
+  if(status>=500||status===408||/timeout|server_error|temporarily_unavailable/i.test(combined))return "transient";
+  return "invalid_request";
+}
+
+async function recordOpenAIReviewUsage(db:D1Database,announcementId:string,result:{succeeded:boolean;model?:string;responseId?:string;requestId?:string;usage?:OpenAIUsage|null;errorCategory?:OpenAIErrorCategory;errorCode?:string;errorMessage?:string;durationMs?:number}) {
+  const usage=result.usage||{};const now=new Date().toISOString();
+  await db.prepare("INSERT INTO openai_review_usage (announcement_id,attempted_at,succeeded,model,response_id,request_id,error_category,error_code,error_message,input_tokens,output_tokens,total_tokens,cached_input_tokens,duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .bind(announcementId,now,result.succeeded?1:0,result.model||null,result.responseId||null,result.requestId||null,result.errorCategory||null,result.errorCode||null,(result.errorMessage||"").slice(0,500)||null,Number(usage.input_tokens||0),Number(usage.output_tokens||0),Number(usage.total_tokens||0),Number(usage.input_tokens_details?.cached_tokens||0),Math.max(0,Math.round(result.durationMs||0))).run();
+}
 
 async function parseWithOpenAI(pdfBase64: string, context: { title:string; stockCode:string; stockName:string; announceDate:string }, env: Env): Promise<OpenAIParseResult> {
-  if (!env.OPENAI_API_KEY) return {rows:[],model:"",responseId:"",usage:null};
+  if (!env.OPENAI_API_KEY) return {rows:[],model:"",responseId:"",requestId:"",usage:null,durationMs:0};
   const model = env.OPENAI_OCR_MODEL || "gpt-5.6-luna";
   const schema = {
     type:"object", additionalProperties:false, required:["events"],
@@ -410,7 +454,8 @@ async function parseWithOpenAI(pdfBase64: string, context: { title:string; stock
     }}},
   };
   const prompt = `你是A股股权质押公告的数据审核员。请逐页读取官方公告，只提取公告正文中明确披露的本次质押、补充质押、解除质押记录。\n股票：${context.stockCode} ${context.stockName}\n公告日期：${context.announceDate}\n标题：${context.title}\n要求：1）表格每一行对应一个事件，不合并不同股东、质权人或日期；2）股份数量保留公告原始单位和文本；3）比例、日期、用途没有披露时返回空字符串；4）股东、质权人或数量无法从公告确认时保留空字符串，严禁推测；5）不要把表头、合计行、说明文字识别为主体名称。`;
-  const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json" }, body:JSON.stringify({
+  const startedAt=Date.now();const clientRequestId=crypto.randomUUID();
+  const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json", "x-client-request-id":clientRequestId }, body:JSON.stringify({
     model,
     reasoning:{effort:"low"},
     max_output_tokens:5000,
@@ -421,18 +466,23 @@ async function parseWithOpenAI(pdfBase64: string, context: { title:string; stock
     text:{format:{type:"json_schema",name:"a_share_pledge_events",strict:true,schema}},
   }) },1);
   if (!response.ok) {
-    const detail = (await response.text()).slice(0,500);
-    throw new Error(`OpenAI review failed: ${response.status}${detail ? ` ${detail}` : ""}`);
+    const raw=(await response.text()).slice(0,2_000);let detail:{error?:{code?:string;type?:string;message?:string}}={};
+    try{detail=JSON.parse(raw) as typeof detail;}catch{}
+    const code=String(detail.error?.code||"");const type=String(detail.error?.type||"");const message=String(detail.error?.message||raw||`HTTP ${response.status}`);
+    throw new OpenAIReviewError(message,classifyOpenAIError(response.status,code,type,message),response.status,code,response.headers.get("x-request-id")||clientRequestId,parseRetryDelayMs(response),Date.now()-startedAt);
   }
   const payload = await response.json<Record<string, unknown>>();
   const outputText = String(payload.output_text || ((payload.output as Array<{content?:Array<{text?:string}>}> | undefined)?.flatMap((item) => item.content || []).map((item) => item.text || "").join("") || ""));
-  if (!outputText.trim()) throw new Error("OpenAI review returned no structured output");
+  if (!outputText.trim()) throw new OpenAIReviewError("OpenAI review returned no structured output","invalid_response",200,"empty_output",response.headers.get("x-request-id")||clientRequestId,null,Date.now()-startedAt);
   const jsonText = outputText.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
+  let structured:unknown;try{structured=JSON.parse(jsonText);}catch{throw new OpenAIReviewError("OpenAI review returned invalid JSON","invalid_response",200,"invalid_json",response.headers.get("x-request-id")||clientRequestId,null,Date.now()-startedAt);}
   return {
-    rows:validateParsedRows(normalizeVisionRows(JSON.parse(jsonText),context.title)),
+    rows:validateParsedRows(normalizeVisionRows(structured,context.title)),
     model:String(payload.model || model),
     responseId:String(payload.id || ""),
-    usage:payload.usage || null,
+    requestId:response.headers.get("x-request-id")||clientRequestId,
+    usage:(payload.usage as OpenAIUsage|undefined) || null,
+    durationMs:Date.now()-startedAt,
   };
 }
 
@@ -518,7 +568,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
   let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.4"; let confidence = rows.length > 1 ? 0.9 : 0.86;
   const localIncomplete = !rows.length || rows.some((row) => row.missing.length > 0);
-  let openaiMeta: {model:string;responseId:string;usage:unknown} | null = null;
+  let openaiMeta: {model:string;responseId:string;requestId:string;usage:OpenAIUsage|null;durationMs:number} | null = null;
   let openaiError = "";
   const quotaState = localIncomplete && env?.OPENAI_API_KEY && options.forceOpenAI !== true
     ? await db.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>()
@@ -534,14 +584,23 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
         rows = reviewed.rows;
         parserVersion = `openai-${reviewed.model}-pledge-v1`;
         confidence = 0.94;
-        openaiMeta = {model:reviewed.model,responseId:reviewed.responseId,usage:reviewed.usage};
+        openaiMeta = {model:reviewed.model,responseId:reviewed.responseId,requestId:reviewed.requestId,usage:reviewed.usage,durationMs:reviewed.durationMs};
       }
+      await recordOpenAIReviewUsage(db,id,{succeeded:true,model:reviewed.model,responseId:reviewed.responseId,requestId:reviewed.requestId,usage:reviewed.usage,durationMs:reviewed.durationMs});
+      await db.batch([
+        db.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('openai_quota_blocked_until',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(new Date(0).toISOString(),new Date().toISOString()),
+        db.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('openai_review_last_success',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify({announcementId:id,model:reviewed.model,responseId:reviewed.responseId,requestId:reviewed.requestId}),new Date().toISOString()),
+      ]);
     } catch (error) {
       openaiError = error instanceof Error ? error.message : "OpenAI review failed";
-      if (/credit_balance_exhausted|insufficient_quota|no credits remaining/i.test(openaiError)) {
-        const blockedUntil = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-        await db.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('openai_quota_blocked_until',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(blockedUntil,new Date().toISOString()).run();
-      }
+      const failure=error instanceof OpenAIReviewError?error:new OpenAIReviewError(openaiError,"transient",0,"client_error","",120_000,0);
+      const blockMs=failure.category==="billing"?60*60*1000:failure.category==="rate_limit"?Math.min(Math.max(failure.retryAfterMs||60_000,30_000),15*60*1000):failure.category==="transient"?2*60*1000:0;
+      const now=new Date().toISOString();const blockedUntil=blockMs?new Date(Date.now()+blockMs).toISOString():new Date(0).toISOString();
+      await recordOpenAIReviewUsage(db,id,{succeeded:false,requestId:failure.requestId,errorCategory:failure.category,errorCode:failure.code,errorMessage:failure.message,durationMs:failure.durationMs});
+      await db.batch([
+        db.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('openai_quota_blocked_until',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(blockedUntil,now),
+        db.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('openai_review_last_error',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify({announcementId:id,category:failure.category,code:failure.code,status:failure.status,requestId:failure.requestId,blockedUntil:blockMs?blockedUntil:null}),now),
+      ]);
     }
   }
   const completeRows = rows.filter((row) => !row.missing.length); const parsed = rows[0]; const now = new Date().toISOString();
@@ -906,7 +965,13 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
     const reviews:unknown[]=[];
     for(const row of reviewCandidates.results){try{reviews.push(await withDeadline(processAnnouncement(env.DB,env.DOCUMENTS,row.id,env),25_000,`review ${row.id}`));}catch(error){reviews.push({id:row.id,status:"failed",error:error instanceof Error?error.message:"review failed"});}}
     const closingSnapshot=await dailyReportSnapshot(env.DB,date);
-    const closing=closingSnapshot.ready&&closingSnapshot.cutoffPassed?await publishDailyReport(env,date,"automatic-production","自动关账：三所对账、公告分类与事件核验均已完成"):null;
+    const announcement=closingSnapshot.announcement as {total?:number;pending?:number};const event=closingSnapshot.event as {total?:number};const reconciliationState=closingSnapshot.reconciliation as {unresolved?:number};const saved=closingSnapshot.published as {status?:string;announcementCount?:number;eventCount?:number;pendingCount?:number;reconciliationUnresolved?:number}|null;
+    const provisionalChanged=!saved||saved.status!=="provisional"||Number(saved.announcementCount||0)!==Number(announcement.total||0)||Number(saved.eventCount||0)!==Number(event.total||0)||Number(saved.pendingCount||0)!==Number(announcement.pending||0)||Number(saved.reconciliationUnresolved||0)!==Number(reconciliationState.unresolved||0);
+    const closing=closingSnapshot.ready&&closingSnapshot.cutoffPassed
+      ?await publishDailyReport(env,date,"automatic-production","自动关账：三所对账、公告分类与事件核验均已完成","final")
+      :closingSnapshot.publicationDue&&provisionalChanged
+        ?await publishDailyReport(env,date,"automatic-production","21:00自动临时发布：仅包含已核验事件，未决公告完成后自动升级最终版","provisional")
+        :null;
     const finishedAt=new Date().toISOString();
     const result={date,ingestion,reconciliation:{found:reconciliation.found,failures:reconciliation.failures,results:reconciliation.results},processing,reviews,closing,startedAt,finishedAt};
     await env.DB.batch([
@@ -1030,7 +1095,7 @@ async function dailyReportSnapshot(db:D1Database,date:string) {
     db.prepare("SELECT SUM(CASE WHEN p.verification_status='human_verified' THEN 1 ELSE 0 END) AS humanVerified,SUM(CASE WHEN p.verification_status='ai_reviewed' THEN 1 ELSE 0 END) AS aiReviewed,SUM(CASE WHEN p.verification_status='rules_validated' THEN 1 ELSE 0 END) AS rulesValidated FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=?").bind(date).first(),
     db.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,message FROM sync_run WHERE source='exchange-reconciliation' AND json_valid(message) AND json_extract(message,'$.date')=? ORDER BY id DESC LIMIT 1").bind(date).first<{id:number;startedAt:string;finishedAt:string;status:string;message:string}>(),
     db.prepare("SELECT COUNT(*) AS total FROM exchange_observation WHERE announce_date=? AND ((match_status IN ('likely','ambiguous') AND review_status='pending') OR (match_status='missing_primary' AND review_status='pending'))").bind(date).first<{total:number}>(),
-    db.prepare("SELECT date,cutoff_at AS cutoffAt,status,announcement_count AS announcementCount,event_count AS eventCount,company_count AS companyCount,reconciliation_status AS reconciliationStatus,report_version AS reportVersion,published_at AS publishedAt,notes FROM daily_report WHERE date=?").bind(date).first(),
+    db.prepare("SELECT date,cutoff_at AS cutoffAt,status,announcement_count AS announcementCount,event_count AS eventCount,company_count AS companyCount,pending_count AS pendingCount,reconciliation_unresolved AS reconciliationUnresolved,reconciliation_status AS reconciliationStatus,report_version AS reportVersion,published_at AS publishedAt,notes FROM daily_report WHERE date=?").bind(date).first(),
   ]);
   const reconciliationMessage=reconciliationRun?JSON.parse(reconciliationRun.message||"{}"):{};
   const sourceRuns=(Array.isArray(reconciliationMessage.results)?reconciliationMessage.results:[]) as Array<{source:string;status:string;observed?:number;exact?:number;likely?:number;missing?:number}>;
@@ -1041,9 +1106,11 @@ async function dailyReportSnapshot(db:D1Database,date:string) {
   const cutoffAt=`${date}T20:00:00+08:00`;
   const publicationDeadlineAt=`${date}T21:00:00+08:00`;
   const cutoffPassed=Date.now()>=Date.parse(cutoffAt);
-  const publicationOverdue=Date.now()>=Date.parse(publicationDeadlineAt)&&!published;
-  const status=(published as {status?:string}|null)?.status==="published"?"published":ready?"ready_to_close":cutoffPassed?"reviewing":"collecting";
-  return {date,cutoffAt,publicationDeadlineAt,publicationOverdue,status,ready,cutoffPassed,announcement:announcement||{total:0,classified:0,pending:0},event:event||{total:0,companies:0,releases:0,supplemental:0},verification:verification||{},reconciliation:{complete:reconciliationComplete,successfulSources,requiredSources:3,unresolved:Number(unresolved?.total||0),sourceRuns,lastRun:reconciliationRun||null},published:published||null};
+  const publicationDue=Date.now()>=Date.parse(publicationDeadlineAt);
+  const savedStatus=(published as {status?:string}|null)?.status;
+  const publicationOverdue=publicationDue&&savedStatus!=="published"&&savedStatus!=="provisional";
+  const status=savedStatus==="published"?"published":savedStatus==="provisional"?"provisional":ready?"ready_to_close":cutoffPassed?"reviewing":"collecting";
+  return {date,cutoffAt,publicationDeadlineAt,publicationDue,publicationOverdue,status,ready,cutoffPassed,announcement:announcement||{total:0,classified:0,pending:0},event:event||{total:0,companies:0,releases:0,supplemental:0},verification:verification||{},reconciliation:{complete:reconciliationComplete,successfulSources,requiredSources:3,unresolved:Number(unresolved?.total||0),sourceRuns,lastRun:reconciliationRun||null},published:published||null};
 }
 
 type DailyArtifactEvent={announcementId:string;code:string;name:string;shareholder:string;pledgee:string;amount:string;ratio:string;type:string;verificationStatus:string};
@@ -1051,7 +1118,7 @@ const xmlEscape=(value:unknown)=>String(value??"").replaceAll("&","&amp;").repla
 const compactArtifactText=(value:unknown,limit:number)=>{const text=String(value??"—").replace(/\s+/g," ").trim()||"—";return text.length>limit?`${text.slice(0,Math.max(1,limit-1))}…`:text;};
 const dailyArtifactKey=(date:string,version:number,extension:"png"|"pdf")=>`daily-reports/${date}/HBF-A-share-pledge-daily-v${version}.${extension}`;
 
-function renderDailyReportSvg(date:string,version:number,events:DailyArtifactEvent[]){
+function renderDailyReportSvg(date:string,version:number,events:DailyArtifactEvent[],publicationKind:"provisional"|"final",pendingCount=0){
   const width=1500,rowHeight=112,top=458,height=Math.max(920,top+events.length*rowHeight+160);
   const highRatio=events.filter((row)=>Number.parseFloat(row.ratio)>=50).length;
   const companies=new Set(events.map((row)=>row.code)).size;
@@ -1061,7 +1128,9 @@ function renderDailyReportSvg(date:string,version:number,events:DailyArtifactEve
   const metricSvg=metrics.map(([label,value],index)=>{const x=70+index*350;return `<g><rect x="${x}" y="280" width="310" height="115" rx="8" fill="#fff"/><text x="${x+24}" y="322" class="metricLabel">${label}</text><text x="${x+24}" y="374" class="metricValue">${value}</text></g>`;}).join("");
   const rows=events.map((row,index)=>{const y=top+index*rowHeight;return `<g>${index%2===0?`<rect x="50" y="${y-10}" width="1400" height="${rowHeight}" fill="#ebe6dc"/>`:""}<text x="${cells[0]}" y="${y+30}" class="rowStrong">${xmlEscape(compactArtifactText(`${row.name} ${row.code}`,14))}</text><text x="${cells[1]}" y="${y+30}" class="row">${xmlEscape(compactArtifactText(row.shareholder,15))}</text><text x="${cells[2]}" y="${y+30}" class="row">${xmlEscape(compactArtifactText(row.pledgee,18))}</text><text x="${cells[3]}" y="${y+30}" class="rowStrong">${xmlEscape(compactArtifactText(row.amount,16))}</text><text x="${cells[4]}" y="${y+30}" class="rowStrong">${xmlEscape(row.ratio||"—")}</text><text x="${cells[5]}" y="${y+30}" class="row">${xmlEscape(compactArtifactText(row.type,8))}</text><text x="${cells[0]}" y="${y+70}" class="evidence">公告 ${xmlEscape(compactArtifactText(row.announcementId,38))} · ${xmlEscape(row.verificationStatus||"已核验")}</text></g>`;}).join("");
   const headers=["股票","质押股东","质权人","股份数量","占个人持股","事件"].map((label,index)=>`<text x="${cells[index]}" y="440" class="tableHead">${label}</text>`).join("");
-  return {width,height,svg:`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><style>text{font-family:'Noto Sans CJK SC','Microsoft YaHei',sans-serif}.brand{font-size:32px;font-weight:700;fill:#fff}.date{font-size:62px;font-weight:700;fill:#fff}.subtitle{font-size:24px;fill:#b9c9e4}.metricLabel{font-size:22px;fill:#65728a}.metricValue{font-size:42px;font-weight:700;fill:#0b1f3a}.tableHead{font-size:21px;font-weight:700;fill:#0b1f3a}.row{font-size:21px;fill:#12213a}.rowStrong{font-size:22px;font-weight:700;fill:#12213a}.evidence{font-size:17px;fill:#718096}.footer{font-size:20px;fill:#0b1f3a}.watermark{font-size:46px;font-weight:700;fill:#0b1f3a;opacity:.22}</style><rect width="${width}" height="${height}" fill="#f4f0e8"/><rect width="${width}" height="250" fill="#0b1f3a"/><text x="70" y="72" class="brand">HBF · A股质押日报</text><text x="70" y="158" class="date">${date}</text><text x="70" y="207" class="subtitle">20:00截止｜21:00目标发布｜三所交叉核验｜正式版本 V${version}</text>${metricSvg}${headers}${rows}<text x="70" y="${height-72}" class="footer">已关账发布｜事件 ${events.length} 条｜PNG 与 PDF 生成自同一份锁定数据</text><text x="1430" y="${height-62}" text-anchor="end" class="watermark">HBF</text></svg>`};
+  const releaseLabel=publicationKind==="final"?`正式版本 V${version}`:`临时版本 V${version}｜${pendingCount} 份公告/差异未决`;
+  const footer=publicationKind==="final"?`已关账发布｜事件 ${events.length} 条｜PNG 与 PDF 生成自同一份锁定数据`:`临时发布｜已核验事件 ${events.length} 条｜未决 ${pendingCount} 份｜完成后自动升级最终版`;
+  return {width,height,svg:`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><style>text{font-family:'Noto Sans CJK SC','Microsoft YaHei',sans-serif}.brand{font-size:32px;font-weight:700;fill:#fff}.date{font-size:62px;font-weight:700;fill:#fff}.subtitle{font-size:24px;fill:#b9c9e4}.metricLabel{font-size:22px;fill:#65728a}.metricValue{font-size:42px;font-weight:700;fill:#0b1f3a}.tableHead{font-size:21px;font-weight:700;fill:#0b1f3a}.row{font-size:21px;fill:#12213a}.rowStrong{font-size:22px;font-weight:700;fill:#12213a}.evidence{font-size:17px;fill:#718096}.footer{font-size:20px;fill:#0b1f3a}.watermark{font-size:46px;font-weight:700;fill:#0b1f3a;opacity:.22}</style><rect width="${width}" height="${height}" fill="#f4f0e8"/><rect width="${width}" height="250" fill="#0b1f3a"/><text x="70" y="72" class="brand">HBF · A股质押日报</text><text x="70" y="158" class="date">${date}</text><text x="70" y="207" class="subtitle">20:00截止｜21:00发布｜三所交叉核验｜${releaseLabel}</text>${metricSvg}${headers}${rows}<text x="70" y="${height-72}" class="footer">${footer}</text><text x="1430" y="${height-62}" text-anchor="end" class="watermark">HBF</text></svg>`};
 }
 
 function pdfFromJpeg(jpeg:ArrayBuffer,width:number,height:number){
@@ -1076,14 +1145,14 @@ function pdfFromJpeg(jpeg:ArrayBuffer,width:number,height:number){
   const result=new Uint8Array(size);let cursor=0;for(const chunk of chunks){result.set(chunk,cursor);cursor+=chunk.byteLength;}return result;
 }
 
-async function generateDailyReportArtifacts(env:Env,date:string,version:number){
+async function generateDailyReportArtifacts(env:Env,date:string,version:number,publicationKind:"provisional"|"final"="final",pendingCount=0){
   const eventResult=await env.DB.prepare("SELECT p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.type,p.verification_status AS verificationStatus FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? ORDER BY CASE WHEN p.type LIKE '%补充%' THEN 0 WHEN p.type NOT LIKE '%解除%' THEN 1 ELSE 2 END,p.id DESC").bind(date).all<DailyArtifactEvent>();
-  const rendered=renderDailyReportSvg(date,version,eventResult.results);const makeStream=()=>new Response(rendered.svg,{headers:{"content-type":"image/svg+xml; charset=utf-8"}}).body!;
+  const rendered=renderDailyReportSvg(date,version,eventResult.results,publicationKind,pendingCount);const makeStream=()=>new Response(rendered.svg,{headers:{"content-type":"image/svg+xml; charset=utf-8"}}).body!;
   const [pngResponse,jpegResponse]=await Promise.all([env.IMAGES.input(makeStream()).transform({width:rendered.width}).output({format:"image/png",quality:100}).response(),env.IMAGES.input(makeStream()).transform({width:rendered.width}).output({format:"image/jpeg",quality:94}).response()]);
   if(!pngResponse.ok||!jpegResponse.ok)throw new Error(`artifact rendering failed: PNG ${pngResponse.status}, JPEG ${jpegResponse.status}`);
   const [png,jpeg]=await Promise.all([pngResponse.arrayBuffer(),jpegResponse.arrayBuffer()]);const pdf=pdfFromJpeg(jpeg,rendered.width,rendered.height);
   const pngKey=dailyArtifactKey(date,version,"png"),pdfKey=dailyArtifactKey(date,version,"pdf");
-  await Promise.all([env.DOCUMENTS.put(pngKey,png,{httpMetadata:{contentType:"image/png"},customMetadata:{date,version:String(version),source:"locked-daily-report"}}),env.DOCUMENTS.put(pdfKey,pdf,{httpMetadata:{contentType:"application/pdf"},customMetadata:{date,version:String(version),source:"locked-daily-report"}})]);
+  await Promise.all([env.DOCUMENTS.put(pngKey,png,{httpMetadata:{contentType:"image/png"},customMetadata:{date,version:String(version),source:"locked-daily-report",publicationKind,pendingCount:String(pendingCount)}}),env.DOCUMENTS.put(pdfKey,pdf,{httpMetadata:{contentType:"application/pdf"},customMetadata:{date,version:String(version),source:"locked-daily-report",publicationKind,pendingCount:String(pendingCount)}})]);
   return {pngKey,pdfKey,pngBytes:png.byteLength,pdfBytes:pdf.byteLength};
 }
 
@@ -1092,17 +1161,19 @@ async function dailyArtifactLinks(env:Env,date:string,version:number){
   return {png:png?`/api/documents/${encodeURIComponent(pngKey)}`:null,pdf:pdf?`/api/documents/${encodeURIComponent(pdfKey)}`:null,locked:Boolean(png&&pdf)};
 }
 
-async function publishDailyReport(env:Env,date:string,viewer:string,notes="") {
+async function publishDailyReport(env:Env,date:string,viewer:string,notes="",publicationKind:"provisional"|"final"="final") {
   const db=env.DB;const snapshot=await dailyReportSnapshot(db,date);
-  if(!snapshot.ready)return {ok:false as const,status:"not_ready",snapshot};
-  const now=new Date().toISOString();const announcement=snapshot.announcement as {total?:number};const event=snapshot.event as {total?:number;companies?:number};
+  if(publicationKind==="final"&&!snapshot.ready)return {ok:false as const,status:"not_ready",snapshot};
+  if(publicationKind==="provisional"&&!snapshot.publicationDue)return {ok:false as const,status:"before_publication_deadline",snapshot};
+  const now=new Date().toISOString();const announcement=snapshot.announcement as {total?:number;pending?:number};const event=snapshot.event as {total?:number;companies?:number};const reconciliation=snapshot.reconciliation as {complete?:boolean;unresolved?:number};
+  const pendingCount=Number(announcement.pending||0)+Number(reconciliation.unresolved||0);const savedStatus=publicationKind==="final"?"published":"provisional";
   await db.batch([
-    db.prepare("INSERT INTO daily_report (date,cutoff_at,status,announcement_count,event_count,company_count,reconciliation_status,report_version,published_at,published_by,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET status='published',announcement_count=excluded.announcement_count,event_count=excluded.event_count,company_count=excluded.company_count,reconciliation_status=excluded.reconciliation_status,report_version=CASE WHEN daily_report.status='published' THEN daily_report.report_version ELSE daily_report.report_version+1 END,published_at=excluded.published_at,published_by=excluded.published_by,notes=excluded.notes").bind(date,snapshot.cutoffAt,"published",Number(announcement.total||0),Number(event.total||0),Number(event.companies||0),"verified",1,now,viewer,notes.trim().slice(0,500)||null),
-    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"published",JSON.stringify({announcements:announcement.total||0,events:event.total||0,companies:event.companies||0}),viewer,now),
+    db.prepare("INSERT INTO daily_report (date,cutoff_at,status,announcement_count,event_count,company_count,pending_count,reconciliation_unresolved,reconciliation_status,report_version,published_at,published_by,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET status=excluded.status,announcement_count=excluded.announcement_count,event_count=excluded.event_count,company_count=excluded.company_count,pending_count=excluded.pending_count,reconciliation_unresolved=excluded.reconciliation_unresolved,reconciliation_status=excluded.reconciliation_status,report_version=daily_report.report_version+1,published_at=excluded.published_at,published_by=excluded.published_by,notes=excluded.notes").bind(date,snapshot.cutoffAt,savedStatus,Number(announcement.total||0),Number(event.total||0),Number(event.companies||0),Number(announcement.pending||0),Number(reconciliation.unresolved||0),publicationKind==="final"?"verified":"partial",1,now,viewer,notes.trim().slice(0,500)||null),
+    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,publicationKind==="final"?"published":"provisional_published",JSON.stringify({announcements:announcement.total||0,events:event.total||0,companies:event.companies||0,pendingCount,publicationKind}),viewer,now),
   ]);
   const saved=await db.prepare("SELECT report_version AS reportVersion FROM daily_report WHERE date=?").bind(date).first<{reportVersion:number}>();const version=Number(saved?.reportVersion||1);
-  try{const artifacts=await generateDailyReportArtifacts(env,date,version);await db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"artifacts_generated",JSON.stringify(artifacts),viewer,new Date().toISOString()).run();return {ok:true as const,date,status:"published",publishedAt:now,reportVersion:version,artifacts};}
-  catch(error){const artifactError=error instanceof Error?error.message:"artifact generation failed";await db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"artifacts_failed",JSON.stringify({artifactError}),viewer,new Date().toISOString()).run();return {ok:true as const,date,status:"published",publishedAt:now,reportVersion:version,artifactError};}
+  try{const artifacts=await generateDailyReportArtifacts(env,date,version,publicationKind,pendingCount);await db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"artifacts_generated",JSON.stringify({...artifacts,publicationKind,pendingCount}),viewer,new Date().toISOString()).run();return {ok:true as const,date,status:savedStatus,publicationKind,pendingCount,publishedAt:now,reportVersion:version,artifacts};}
+  catch(error){const artifactError=error instanceof Error?error.message:"artifact generation failed";await db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"artifacts_failed",JSON.stringify({artifactError,publicationKind,pendingCount}),viewer,new Date().toISOString()).run();return {ok:true as const,date,status:savedStatus,publicationKind,pendingCount,publishedAt:now,reportVersion:version,artifactError};}
 }
 
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -1151,13 +1222,16 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const requested=url.searchParams.get("date");
     const latest=await env.DB.prepare("SELECT MAX(announce_date) AS date FROM announcement").first<{date:string}>();
     const date=requested&&/^\d{4}-\d{2}-\d{2}$/.test(requested)?requested:latest?.date||latestTradingDate();
-    const [snapshot,events,quotaState]=await Promise.all([
+    const [snapshot,events,quotaState,openaiErrorState,openaiUsage]=await Promise.all([
       dailyReportSnapshot(env.DB,date),
       env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,a.report_date AS date,p.announce_date AS officialDate,p.verification_status AS verificationStatus,a.pdf_url AS pdfUrl FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? ORDER BY CASE WHEN p.type LIKE '%补充%' THEN 0 WHEN p.type NOT LIKE '%解除%' THEN 1 ELSE 2 END,p.id DESC").bind(date).all(),
       env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
+      env.DB.prepare("SELECT value,updated_at AS updatedAt FROM pipeline_state WHERE key='openai_review_last_error'").first<{value:string;updatedAt:string}>(),
+      env.DB.prepare("SELECT COUNT(*) AS calls,SUM(succeeded) AS successes,SUM(input_tokens) AS inputTokens,SUM(output_tokens) AS outputTokens,SUM(total_tokens) AS totalTokens,SUM(cached_input_tokens) AS cachedInputTokens FROM openai_review_usage u JOIN announcement a ON a.announcement_id=u.announcement_id WHERE a.report_date=?").bind(date).first(),
     ]);
-    const blockedUntil=quotaState?.value&&Date.parse(quotaState.value)>Date.now()?quotaState.value:null;const version=Number((snapshot.published as {reportVersion?:number}|null)?.reportVersion||1);const artifacts=snapshot.status==="published"?await dailyArtifactLinks(env,date,version):{png:null,pdf:null,locked:false};
-    return json({...snapshot,events:events.results,automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),available:Boolean(env.OPENAI_API_KEY)&&!blockedUntil,blockedUntil},artifacts,clock:{shanghaiDate:shanghaiDate(),productionTargetDate:automaticProduction.targetDate,cutoffHour:20,publicationDeadlineHour:21},methodology:"每日20:00固定当日日报范围；20:00后的官方公告顺延到下一自然日日报，周末照常运行，公网自动化继续完成三所对账、公告分类、事件核验和关账发布",deliverables:{image:"关账后从锁定数据生成并归档PNG长图",pdf:"关账后从同一锁定数据生成并归档PDF"},generatedAt:new Date().toISOString()});
+    const blockedUntil=quotaState?.value&&Date.parse(quotaState.value)>Date.now()?quotaState.value:null;let lastError:null|Record<string,unknown>=null;try{lastError=openaiErrorState?.value?JSON.parse(openaiErrorState.value):null;}catch{}
+    const version=Number((snapshot.published as {reportVersion?:number}|null)?.reportVersion||1);const artifacts=["published","provisional"].includes(snapshot.status)?await dailyArtifactLinks(env,date,version):{png:null,pdf:null,locked:false};
+    return json({...snapshot,events:events.results,automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),available:Boolean(env.OPENAI_API_KEY)&&!blockedUntil,blockedUntil,lastError,lastErrorAt:openaiErrorState?.updatedAt||null,usage:openaiUsage||{calls:0,successes:0,inputTokens:0,outputTokens:0,totalTokens:0,cachedInputTokens:0}},artifacts,clock:{shanghaiDate:shanghaiDate(),productionTargetDate:automaticProduction.targetDate,cutoffHour:20,publicationDeadlineHour:21},methodology:"每日20:00固定当日日报范围；20:00后的官方公告顺延到下一自然日日报，周末照常运行；21:00即使仍有未决公告也先发布明确标注的临时版，后台继续补齐并在差异清零后自动升级最终版",deliverables:{image:"临时版或最终版均从对应锁定版本生成并归档PNG长图",pdf:"与PNG使用同一版本数据生成并归档PDF"},generatedAt:new Date().toISOString()});
   }
   if(url.pathname==="/api/daily-reports"&&request.method==="GET"){
     const rows=await env.DB.prepare("SELECT a.date,a.announcements,a.events,a.companies,a.pending,COALESCE(r.status,'draft') AS savedStatus,r.published_at AS publishedAt FROM (SELECT d.report_date AS date,COUNT(DISTINCT d.announcement_id) AS announcements,COUNT(DISTINCT p.id) AS events,COUNT(DISTINCT p.stock_code) AS companies,COUNT(DISTINCT CASE WHEN d.parse_status NOT IN ('parsed','ignored','rejected') THEN d.announcement_id END) AS pending FROM announcement d LEFT JOIN pledge p ON p.announcement_id=d.announcement_id GROUP BY d.report_date ORDER BY d.report_date DESC LIMIT 90) a LEFT JOIN daily_report r ON r.date=a.date ORDER BY a.date DESC").all<{date:string}>();
@@ -1172,14 +1246,17 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json(result);
   }
   if (url.pathname === "/api/health") {
-    const [stats,quotaState,automaticProduction,automaticMaintenance] = await Promise.all([
+    const [stats,quotaState,openaiErrorState,openaiUsage,automaticProduction,automaticMaintenance] = await Promise.all([
       env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews, (SELECT COUNT(*) FROM announcement WHERE parse_status='ignored') ignored_announcements").first(),
       env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
+      env.DB.prepare("SELECT value,updated_at AS updatedAt FROM pipeline_state WHERE key='openai_review_last_error'").first<{value:string;updatedAt:string}>(),
+      env.DB.prepare("SELECT COUNT(*) AS calls,SUM(succeeded) AS successes,SUM(CASE WHEN succeeded=0 THEN 1 ELSE 0 END) AS failures,SUM(input_tokens) AS inputTokens,SUM(output_tokens) AS outputTokens,SUM(total_tokens) AS totalTokens,SUM(cached_input_tokens) AS cachedInputTokens FROM openai_review_usage WHERE attempted_at>=datetime('now','-24 hours')").first(),
       maybeStartAutomaticProduction(env,ctx),
       maybeStartAutomaticMaintenance(env,ctx),
     ]);
     const quotaBlocked = Boolean(quotaState?.value && Date.parse(quotaState.value) > Date.now());
-    return json({ status: "ok", storage: { d1: true, r2: true }, scheduler:{handlerReady:true,secureHttpTriggerConfigured:Boolean(env.PRODUCTION_CRON_SECRET),productionTargetDate:automaticProduction.targetDate}, automaticSync:automaticProduction, automaticMaintenance, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
+    let lastError:null|Record<string,unknown>=null;try{lastError=openaiErrorState?.value?JSON.parse(openaiErrorState.value):null;}catch{}
+    return json({ status: "ok", storage: { d1: true, r2: true }, scheduler:{handlerReady:true,secureHttpTriggerConfigured:Boolean(env.PRODUCTION_CRON_SECRET),productionTargetDate:automaticProduction.targetDate}, automaticSync:automaticProduction, automaticMaintenance, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, circuitState:quotaBlocked?String(lastError?.category||"blocked"):"closed", blockedUntil: quotaBlocked ? quotaState?.value : null, quotaBlockedUntil:quotaBlocked?quotaState?.value:null, lastError,lastErrorAt:openaiErrorState?.updatedAt||null,maxAutomaticAttempts: 2,usage24h:openaiUsage||{} }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
