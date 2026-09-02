@@ -884,9 +884,10 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
     const ingestion=await ingestCninfo(env.DB,date);
     const beforeReconciliation=await dailyReportSnapshot(env.DB,date);
     const lastReconciliationAt=Date.parse(String(beforeReconciliation.reconciliation.lastRun?.finishedAt||""));
-    const recentReconciliation=beforeReconciliation.reconciliation.complete&&Number.isFinite(lastReconciliationAt)&&Date.now()-lastReconciliationAt<30*60*1000;
+    const closedTradingDate=date<shanghaiDate();
+    const recentReconciliation=beforeReconciliation.reconciliation.complete&&(closedTradingDate||(Number.isFinite(lastReconciliationAt)&&Date.now()-lastReconciliationAt<30*60*1000));
     const reconciliation=recentReconciliation
-      ?{found:0,failures:0,results:beforeReconciliation.reconciliation.sourceRuns,skipped:true,reason:"最近30分钟三所对账已完成且差异为零"}
+      ?{found:0,failures:0,results:beforeReconciliation.reconciliation.sourceRuns,skipped:true,reason:closedTradingDate?"历史交易日三所对账已完成且差异为零":"最近30分钟三所对账已完成且差异为零"}
       :await runExchangeReconciliation(env.DB,date,["sse","szse","bse"]);
     // Keep each invocation bounded; report polling advances the queue in later
     // idempotent runs instead of risking one oversized Worker execution.
