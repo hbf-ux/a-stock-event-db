@@ -54,7 +54,7 @@ export function validateAndNormalizePledgeRow<T extends ValidatablePledgeRow>(in
   const invalidShareholder = row.shareholder.length < 2
     || /^(股东|名称|合计|本次|质押|融资|借款)$/.test(row.shareholder)
     || /(补充流动资金|融资资金用途|偿还借款|质押用途)/.test(row.shareholder)
-    || /^(?:科技|投资|资产管理|控股)?(?:有限责任|股份)?公司$/.test(row.shareholder);
+    || /^(?:科技|投资|资产管理|控股)?(?:有限责任|股份|有限)?公司$/.test(row.shareholder);
   const invalidPledgee = row.pledgee.length < 3
     || /^(占其|占公司|质押数量|比例|本次|股东|名称|合计|上表|本表|根据)/.test(row.pledgee)
     || /证券登记结算/.test(row.pledgee)

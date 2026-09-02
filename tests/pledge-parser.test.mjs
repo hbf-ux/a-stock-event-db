@@ -53,6 +53,8 @@ test("normalizes safe OCR residue and rejects generic or contaminated entities",
 
   const generic = validateAndNormalizePledgeRow({shareholder:"补充流动资金东大针织",pledgee:"信托有限公司",amount:1000,amountText:"1,000 股",pledgeRatio:"00%",totalRatio:"",type:"新增质押",missing:[]});
   assert.deepEqual(generic.missing,["股东","质权人","质押比例"]);
+  const truncated = validateAndNormalizePledgeRow({shareholder:"控股有限公司",pledgee:"兴业银行股份有限公司",amount:10000000,amountText:"10,000,000 股",pledgeRatio:"7.44%",totalRatio:"2.10%",type:"新增质押",missing:[]});
+  assert.deepEqual(truncated.missing,["股东"]);
 });
 
 test("rejects malformed grouped share amounts", () => {
