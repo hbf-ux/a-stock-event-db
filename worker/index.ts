@@ -14,6 +14,8 @@ interface Env {
   /** Request-driven production catch-up. Disable explicitly with "false". */
   AUTO_SYNC_ENABLED?: string;
   AUTO_SYNC_INTERVAL_MINUTES?: string;
+  /** Shared bearer token for a lightweight external Cloudflare Cron caller. */
+  PRODUCTION_CRON_SECRET?: string;
   /** Comma-separated Sites account user IDs and/or emails allowed to mutate production data. */
   ADMIN_USER_IDS?: string;
   ADMIN_EMAILS?: string;
@@ -24,6 +26,7 @@ interface Env {
   STRIPE_PRICE_GLOBAL_MONTHLY?: string;
 }
 interface ExecutionContext { waitUntil(promise: Promise<unknown>): void; passThroughOnException(): void; }
+interface ScheduledController { cron:string; scheduledTime:number; }
 
 const json = (data: unknown, init: ResponseInit = {}) => new Response(JSON.stringify(data), { ...init, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...(init.headers || {}) } });
 const viewerId = (request: Request) => request.headers.get("oai-authenticated-user-id")?.trim() || null;
@@ -935,7 +938,7 @@ async function activeDailyProductionRun(db:D1Database,targetDate?:string) {
   return active;
 }
 
-async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext):Promise<AutomaticSyncState> {
+async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext,reason="daily-report-request"):Promise<AutomaticSyncState> {
   const enabled=env.AUTO_SYNC_ENABLED?.trim().toLowerCase()!=="false";
   const configuredInterval=Number(env.AUTO_SYNC_INTERVAL_MINUTES||5);
   const intervalMinutes=Number.isFinite(configuredInterval)?Math.min(Math.max(Math.round(configuredInterval),3),360):5;
@@ -947,15 +950,15 @@ async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext):Promi
   const startedAt=new Date().toISOString();
   const lockCutoff=new Date(Date.now()-intervalMinutes*60000).toISOString();
   const triggerKey=`automatic_production_trigger:${targetDate}`;
-  const lock=await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE pipeline_state.updated_at<=? RETURNING updated_at AS updatedAt").bind(triggerKey,JSON.stringify({targetDate,reason:"daily-report-request",status:"starting"}),startedAt,lockCutoff).first<{updatedAt:string}>();
+  const lock=await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE pipeline_state.updated_at<=? RETURNING updated_at AS updatedAt").bind(triggerKey,JSON.stringify({targetDate,reason,status:"starting"}),startedAt,lockCutoff).first<{updatedAt:string}>();
   if(!lock){
     const existing=await env.DB.prepare("SELECT updated_at AS updatedAt FROM pipeline_state WHERE key=?").bind(triggerKey).first<{updatedAt:string}>();
     return {enabled:true,status:"fresh",targetDate,intervalMinutes,lastTriggeredAt:existing?.updatedAt||null};
   }
-  const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("daily-production-cycle",startedAt,"running",`automatic production catch-up ${targetDate}`).first<{id:number}>();
+  const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("daily-production-cycle",startedAt,"running",`${reason} ${targetDate}`).first<{id:number}>();
   if(!run?.id)return {enabled:true,status:"fresh",targetDate,intervalMinutes,lastTriggeredAt:startedAt};
-  await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(triggerKey,JSON.stringify({targetDate,runId:run.id,reason:"daily-report-request"}),startedAt).run();
-  ctx.waitUntil(runDailyProductionCycle(env,targetDate,run.id,"automatic-production").catch(()=>undefined));
+  await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(triggerKey,JSON.stringify({targetDate,runId:run.id,reason}),startedAt).run();
+  ctx.waitUntil(runDailyProductionCycle(env,targetDate,run.id,reason).catch(()=>undefined));
   return {enabled:true,status:"started",targetDate,intervalMinutes,runId:run.id,lastTriggeredAt:startedAt};
 }
 
@@ -1093,6 +1096,13 @@ async function publishDailyReport(env:Env,date:string,viewer:string,notes="") {
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   await ensureSchema(env.DB);
   const url = new URL(request.url);
+  if(url.pathname==="/api/internal/production-tick"&&request.method==="POST"){
+    if(!env.PRODUCTION_CRON_SECRET)return json({error:"生产调度密钥尚未配置"},{status:503});
+    const supplied=(request.headers.get("authorization")||"").replace(/^Bearer\s+/i,"").trim();
+    if(!supplied||!constantTimeHexEqual(supplied,env.PRODUCTION_CRON_SECRET))return json({error:"invalid production scheduler credential"},{status:401});
+    const automaticProduction=await maybeStartAutomaticProduction(env,ctx,"secure-cron-http");
+    return json({ok:true,automaticProduction,serverTime:new Date().toISOString(),shanghaiDate:shanghaiDate()});
+  }
   if(url.pathname==="/api/billing/webhook"&&request.method==="POST"){
     if(!env.STRIPE_WEBHOOK_SECRET)return json({error:"Stripe webhook 未配置"},{status:503});
     const rawBody=await request.text();const valid=await verifyStripeSignature(rawBody,request.headers.get("stripe-signature"),env.STRIPE_WEBHOOK_SECRET);
@@ -1135,7 +1145,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
     ]);
     const blockedUntil=quotaState?.value&&Date.parse(quotaState.value)>Date.now()?quotaState.value:null;const version=Number((snapshot.published as {reportVersion?:number}|null)?.reportVersion||1);const artifacts=snapshot.status==="published"?await dailyArtifactLinks(env,date,version):{png:null,pdf:null,locked:false};
-    return json({...snapshot,events:events.results,automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),available:Boolean(env.OPENAI_API_KEY)&&!blockedUntil,blockedUntil},artifacts,methodology:"交易日20:00停止纳入新公告；三所对账、公告分类和全部事件核验完成后方可关账发布",deliverables:{image:"关账后从锁定数据生成并归档PNG长图",pdf:"关账后从同一锁定数据生成并归档PDF"},generatedAt:new Date().toISOString()});
+    return json({...snapshot,events:events.results,automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),available:Boolean(env.OPENAI_API_KEY)&&!blockedUntil,blockedUntil},artifacts,clock:{shanghaiDate:shanghaiDate(),productionTargetDate:automaticProduction.targetDate,cutoffHour:20},methodology:"交易日20:00停止纳入新公告；三所对账、公告分类和全部事件核验完成后方可关账发布",deliverables:{image:"关账后从锁定数据生成并归档PNG长图",pdf:"关账后从同一锁定数据生成并归档PDF"},generatedAt:new Date().toISOString()});
   }
   if(url.pathname==="/api/daily-reports"&&request.method==="GET"){
     const rows=await env.DB.prepare("SELECT a.date,a.announcements,a.events,a.companies,a.pending,COALESCE(r.status,'draft') AS savedStatus,r.published_at AS publishedAt FROM (SELECT d.announce_date AS date,COUNT(DISTINCT d.announcement_id) AS announcements,COUNT(DISTINCT p.id) AS events,COUNT(DISTINCT p.stock_code) AS companies,COUNT(DISTINCT CASE WHEN d.parse_status NOT IN ('parsed','ignored','rejected') THEN d.announcement_id END) AS pending FROM announcement d LEFT JOIN pledge p ON p.announcement_id=d.announcement_id GROUP BY d.announce_date ORDER BY d.announce_date DESC LIMIT 90) a LEFT JOIN daily_report r ON r.date=a.date ORDER BY a.date DESC").all<{date:string}>();
@@ -1157,7 +1167,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       maybeStartAutomaticMaintenance(env,ctx),
     ]);
     const quotaBlocked = Boolean(quotaState?.value && Date.parse(quotaState.value) > Date.now());
-    return json({ status: "ok", storage: { d1: true, r2: true }, automaticSync, automaticMaintenance, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
+    return json({ status: "ok", storage: { d1: true, r2: true }, scheduler:{handlerReady:true,secureHttpTriggerConfigured:Boolean(env.PRODUCTION_CRON_SECRET),productionTargetDate:automaticProduction.targetDate}, automaticSync, automaticMaintenance, automatedReview: { configured: Boolean(env.OPENAI_API_KEY), available: Boolean(env.OPENAI_API_KEY) && !quotaBlocked, mode: env.OPENAI_API_KEY ? "rules-then-openai" : "rules-only", model: env.OPENAI_API_KEY ? (env.OPENAI_OCR_MODEL || "gpt-5.6-luna") : null, quotaBlockedUntil: quotaBlocked ? quotaState?.value : null, maxAutomaticAttempts: 2 }, billing:{provider:"stripe",configured:Boolean(env.STRIPE_SECRET_KEY&&env.STRIPE_WEBHOOK_SECRET&&Object.values(stripePlanPrices(env)).every(Boolean)),mode:env.STRIPE_SECRET_KEY?.startsWith("sk_live_")?"live":env.STRIPE_SECRET_KEY?"test":"disabled"}, stats, timestamp: new Date().toISOString() });
   }
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
@@ -1814,6 +1824,12 @@ const worker = {
       return handleImageOptimization(request, { fetchAsset: (path) => env.ASSETS.fetch(new Request(new URL(path, request.url))), transformImage: async (body, { width, format, quality }) => { const result = await env.IMAGES.input(body).transform(width > 0 ? { width } : {}).output({ format, quality }); return result.response(); } }, allowedWidths);
     }
     return handler.fetch(request, env, ctx);
+  },
+  async scheduled(controller:ScheduledController,env:Env,ctx:ExecutionContext):Promise<void>{
+    await ensureSchema(env.DB);
+    const automaticProduction=await maybeStartAutomaticProduction(env,ctx,"cloudflare-cron");
+    const now=new Date().toISOString();
+    await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('cloudflare_cron_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify({cron:controller.cron,scheduledTime:controller.scheduledTime,automaticProduction}),now).run();
   },
 };
 export default worker;

@@ -18,6 +18,9 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(daily,/下载归档 PNG/);
   assert.match(daily,/下载归档 PDF/);
   assert.match(daily,/AI 自动复核暂缓/);
+  assert.match(daily,/当前北京时间/);
+  assert.match(daily,/正在关账/);
+  assert.match(daily,/日报将在20:00截止后进入关账/);
   assert.match(daily,/三所公告对账/);
   assert.match(daily,/未关账，不标注完整清单/);
   assert.match(daily,/提交撮合需求/);
@@ -83,6 +86,10 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /https:\/\/api\.openai\.com\/v1\/responses/);
   assert.match(worker, /rules-then-openai/);
   assert.match(worker, /maxAutomaticAttempts: 2/);
+  assert.match(worker, /\/api\/internal\/production-tick/);
+  assert.match(worker, /PRODUCTION_CRON_SECRET/);
+  assert.match(worker, /async scheduled\(/);
+  assert.match(worker, /cloudflare_cron_last/);
   assert.match(worker, /parseSectionPledgeRows/);
   assert.match(worker, /unpdf-table-rules-v2\.4/);
   assert.match(worker, /const nextCursor=failures\?cursor:dates\[dates\.length-1\]/);

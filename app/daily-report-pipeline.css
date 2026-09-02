@@ -10,6 +10,21 @@
   font-size: 9px;
 }
 
+.dailyClock {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 18px;
+  padding: 10px 14px;
+  border-left: 3px solid #1d5fba;
+  background: #edf4fc;
+  color: #50647c;
+  font-size: 9px;
+}
+
+.dailyClock b { color: #17304f; }
+.dailyClock em { margin-left: auto; color: #1d5fba; font-style: normal; }
+
 .dailyPipeline > span {
   width: 7px;
   height: 7px;
@@ -63,11 +78,13 @@
 }
 
 @media (max-width: 560px) {
+  .dailyClock { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .dailyClock em { margin-left: 0; }
   .dailyPipeline { align-items: flex-start; flex-wrap: wrap; }
   .dailyPipeline small { width: 100%; margin-left: 16px; }
   .dailyReviewPause { align-items: flex-start; flex-direction: column; gap: 4px; }
 }
 
 @media print {
-  .dailyPipeline, .dailyReviewPause { display: none !important; }
+  .dailyClock, .dailyPipeline, .dailyReviewPause { display: none !important; }
 }
