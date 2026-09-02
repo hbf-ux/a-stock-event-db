@@ -2,7 +2,7 @@
 
 独立 Cloudflare Durable Object Worker，仅调用质押日报的受保护生产接口，不绑定或修改 OTC Filing Watch 主站。
 
-使用 Durable Object Alarm 每5分钟自唤醒，不占用账户 Cron Trigger 配额。调度器全天候调用轻量生产检查：20:00后处理当天公告，次日20:00前继续处理上一交易日；日报一旦发布，生产接口立即返回已发布状态，不重复抓取或解析。
+使用 Durable Object Alarm 每5分钟自唤醒，不占用账户 Cron Trigger 配额。调度器全天候调用轻量生产检查：每天20:00固定日报范围，之后披露的公告进入下一自然日，周末也持续运行；日报一旦发布，生产接口立即返回已发布状态，不重复抓取或解析。
 
 `PRODUCTION_CRON_SECRET` 必须通过 Wrangler secret 配置，禁止写入源码。
 
