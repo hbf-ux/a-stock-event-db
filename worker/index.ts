@@ -93,8 +93,13 @@ async function ensureSchema(db: D1Database) {
   await db.prepare("CREATE INDEX IF NOT EXISTS announcement_report_date_idx ON announcement (report_date)").run();
   const dailyReportColumns = await db.prepare("PRAGMA table_info(daily_report)").all<{name:string}>();
   const dailyReportNames = new Set(dailyReportColumns.results.map((column) => column.name));
-  if (!dailyReportNames.has("pending_count")) await db.prepare("ALTER TABLE daily_report ADD COLUMN pending_count INTEGER NOT NULL DEFAULT 0").run();
-  if (!dailyReportNames.has("reconciliation_unresolved")) await db.prepare("ALTER TABLE daily_report ADD COLUMN reconciliation_unresolved INTEGER NOT NULL DEFAULT 0").run();
+  const addDailyReportColumn=async(name:string,definition:string)=>{
+    if(dailyReportNames.has(name))return;
+    try{await db.prepare(`ALTER TABLE daily_report ADD COLUMN ${name} ${definition}`).run();}
+    catch(error){if(!/duplicate column name/i.test(error instanceof Error?error.message:String(error)))throw error;}
+  };
+  await addDailyReportColumn("pending_count","INTEGER NOT NULL DEFAULT 0");
+  await addDailyReportColumn("reconciliation_unresolved","INTEGER NOT NULL DEFAULT 0");
   await db.prepare("UPDATE announcement SET parse_status=CASE WHEN parse_attempts>=3 THEN 'review' ELSE 'queued' END,last_error=COALESCE(last_error,'解析任务中断，已自动恢复') WHERE parse_status='processing' AND announcement_id IN (SELECT entity_id FROM audit_log WHERE entity_type='announcement' AND action='parse_claim' GROUP BY entity_id HAVING MAX(julianday(created_at))<julianday('now','-5 minutes'))").run();
   const matchCandidateColumns = await db.prepare("PRAGMA table_info(match_candidate)").all<{name:string}>();
   const matchCandidateNames = new Set(matchCandidateColumns.results.map((column) => column.name));
