@@ -37,6 +37,9 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /human_verified/);
   assert.match(worker, /body\.action/);
   assert.match(worker, /人工审核队列已清零，自动升级最终关账版本/);
+  assert.match(worker, /manual_validation_override/);
+  assert.match(worker, /自动质量规则仅作提示，人工审核结论优先/);
+  assert.doesNotMatch(worker, /人工审核数据未通过严格校验/);
   assert.match(worker, /key\.startsWith\(\"announcements\/\"\)/);
   assert.match(worker, /review already completed/);
   assert.match(worker, /completed_with_errors/);
@@ -277,6 +280,9 @@ test("manual review desk supports PDF-side-by-side multi-event verification", as
   assert.match(workbench,/确认入库/);
   assert.match(workbench,/非质押事件 \/ 排除/);
   assert.match(workbench,/重新规则解析/);
+  assert.match(workbench,/人工结论优先/);
+  assert.match(workbench,/不会阻止提交/);
+  assert.match(workbench,/按人工结论入库/);
   assert.match(workbench,/Ctrl/);
   assert.match(workbench,/signin-with-chatgpt/);
   assert.match(styles,/grid-template-columns:280px minmax\(420px,1\.25fr\) minmax\(450px,1fr\)/);

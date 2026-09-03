@@ -1,0 +1,14 @@
+.reviewAuthority {
+  display: flex;
+  gap: 8px;
+  padding: 9px 13px;
+  border-bottom: 1px solid #b9ddc8;
+  background: #eaf7ef;
+  color: #285f45;
+  font-size: 8px;
+  line-height: 1.5;
+}
+
+.reviewAuthority b {
+  white-space: nowrap;
+}

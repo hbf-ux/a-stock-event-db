@@ -1878,24 +1878,24 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
         env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("review_queue",String(id),"requeue",JSON.stringify(before),JSON.stringify(body),viewer,now),
       ]);ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,1,env,before.reportDate).catch(()=>undefined));return json({ok:true,status:"requeued",reportDate:before.reportDate});
     }
-    const finalStatus=action==="approve"?"approved":"rejected";const statements: D1PreparedStatement[] = [
+    const finalStatus=action==="approve"?"approved":"rejected";const manualWarnings:string[]=[];const statements: D1PreparedStatement[] = [
       env.DB.prepare("UPDATE review_queue SET status=?,resolution=?,reviewed_at=?,reviewer=? WHERE announcement_id=? AND status='pending'").bind(finalStatus,body.resolution || "",now,viewer,before.announcement_id),
       env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("review_queue",String(id),"review",JSON.stringify(before),JSON.stringify({...body,action}),viewer,now),
     ];
     if (action === "approve") {
       const announcement = await env.DB.prepare("SELECT stock_code AS stockCode,stock_name AS stockName,announce_date AS announceDate FROM announcement WHERE announcement_id=?").bind(before.announcement_id).first<{stockCode:string;stockName:string;announceDate:string}>();
       const inputs=body.events?.length?body.events:[body];if(!announcement||!inputs.length||inputs.length>30)return json({error:"每份公告需提交1至30条事件"},{status:400});
-      const rows=inputs.map((row)=>validateAndNormalizePledgeRow({shareholder:String(row.shareholder||"").trim(),pledgee:String(row.pledgee||"").trim(),amount:Number(row.amount||amountNumber(String(row.amountText||""))),amountText:String(row.amountText||row.amount||""),pledgeRatio:String(row.pledgeRatio||""),totalRatio:String(row.totalRatio||""),startDate:String(row.startDate||""),endDate:String(row.endDate||""),purpose:String(row.purpose||""),type:String(row.type||"新增质押"),missing:[]}) as ParsedPledge);
-      const invalid=rows.find((row)=>row.missing.length);if(invalid)return json({error:`人工审核数据未通过严格校验：${invalid.missing.join("、")}`},{status:400});
+      const rows=inputs.map((row,index)=>{const manualRow={shareholder:String(row.shareholder||"").trim(),pledgee:String(row.pledgee||"").trim(),amount:Number(row.amount||amountNumber(String(row.amountText||""))),amountText:String(row.amountText||row.amount||"").trim(),pledgeRatio:String(row.pledgeRatio||"").trim(),totalRatio:String(row.totalRatio||"").trim(),startDate:String(row.startDate||"").trim(),endDate:String(row.endDate||"").trim(),purpose:String(row.purpose||"").trim(),type:String(row.type||"新增质押"),missing:[]} as ParsedPledge;const advisory=validateAndNormalizePledgeRow({...manualRow});advisory.missing.forEach((warning)=>manualWarnings.push(`事件${index+1}：${warning}`));return manualRow;});
       statements.push(env.DB.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(before.announcement_id));
       for(let index=0;index<rows.length;index++){const row=rows[index];const eventFingerprint=await fingerprint(before.announcement_id,row,index);statements.push(env.DB.prepare("INSERT INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint,verification_status,verified_at,verified_by,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(before.announcement_id,announcement.stockCode,announcement.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,announcement.announceDate,1,"manual-review-v3",now,eventFingerprint,"human_verified",now,viewer,eventEvidence(before.announcement_id,[],row,"human")));}
+      if(manualWarnings.length)statements.push(env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("announcement",before.announcement_id,"manual_validation_override",null,JSON.stringify({warnings:manualWarnings,note:"自动质量规则仅作提示，人工审核结论优先"}),viewer,now));
       statements.push(env.DB.prepare("UPDATE announcement SET parse_status='parsed',last_error=NULL WHERE announcement_id=?").bind(before.announcement_id));
     } else {
       statements.push(env.DB.prepare("UPDATE announcement SET parse_status='rejected' WHERE announcement_id=?").bind(before.announcement_id));
     }
     await env.DB.batch(statements);
     const snapshot=await dailyReportSnapshot(env.DB,before.reportDate);const closing=snapshot.ready&&snapshot.cutoffPassed&&snapshot.status!=="published"?await publishDailyReport(env,before.reportDate,viewer,"人工审核队列已清零，自动升级最终关账版本","final"):null;
-    return json({ ok: true, status: finalStatus,reportDate:before.reportDate,snapshot,closing });
+    return json({ ok: true, status: finalStatus,reportDate:before.reportDate,snapshot,closing,warnings:manualWarnings });
   }
   if (url.pathname.startsWith("/api/review-documents/") && request.method === "GET") {
     if(!adminViewer(request,env))return adminRequired();const id=decodeURIComponent(url.pathname.split("/").pop()||"");
