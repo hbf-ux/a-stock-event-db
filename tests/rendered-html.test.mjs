@@ -31,7 +31,13 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /from "unpdf"/);
   assert.match(worker, /async function processAnnouncement/);
   assert.match(worker, /parse_status='parsed'/);
-  assert.match(worker, /manual-review-v2/);
+  assert.match(worker, /manual-review-v3/);
+  assert.match(worker, /\/api\/review-documents\//);
+  assert.match(worker, /events\?:ManualEventInput\[\]/);
+  assert.match(worker, /human_verified/);
+  assert.match(worker, /body\.action/);
+  assert.match(worker, /人工审核队列已清零，自动升级最终关账版本/);
+  assert.match(worker, /key\.startsWith\(\"announcements\/\"\)/);
   assert.match(worker, /review already completed/);
   assert.match(worker, /completed_with_errors/);
   assert.match(worker, /application\/vnd\.ms-excel/);
@@ -255,4 +261,23 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(reviewMigration, /review_status/);
   assert.match(reviewMigration, /review_note/);
   assert.match(await readFile(new URL("drizzle/0013_rare_purifiers.sql",root),"utf8"),/CREATE TABLE `daily_report`/);
+});
+
+test("manual review desk supports PDF-side-by-side multi-event verification", async()=>{
+  const [page,workbench,styles]=await Promise.all([
+    readFile(new URL("app/review/page.tsx",root),"utf8"),
+    readFile(new URL("app/review/review-workbench.tsx",root),"utf8"),
+    readFile(new URL("app/review/review-workbench.css",root),"utf8"),
+  ]);
+  assert.match(page,/ReviewWorkbench/);
+  assert.match(workbench,/\/api\/reviews\?/);
+  assert.match(workbench,/archivedPdfUrl/);
+  assert.match(workbench,/官方PDF/);
+  assert.match(workbench,/新增一行/);
+  assert.match(workbench,/确认入库/);
+  assert.match(workbench,/非质押事件 \/ 排除/);
+  assert.match(workbench,/重新规则解析/);
+  assert.match(workbench,/Ctrl/);
+  assert.match(workbench,/signin-with-chatgpt/);
+  assert.match(styles,/grid-template-columns:280px minmax\(420px,1\.25fr\) minmax\(450px,1fr\)/);
 });

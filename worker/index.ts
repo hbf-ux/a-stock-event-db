@@ -1848,38 +1848,61 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   }
   if (url.pathname === "/api/reviews" && request.method === "GET") {
     if(!adminViewer(request,env))return adminRequired();
-    const result = await env.DB.prepare("SELECT r.id,r.announcement_id AS announcementId,r.event_type AS eventType,r.reason,r.payload,r.status,r.created_at AS createdAt,r.reviewed_at AS reviewedAt,r.resolution,a.stock_code AS stockCode,a.stock_name AS stockName,a.title,a.announce_date AS announceDate,a.pdf_url AS pdfUrl FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id ORDER BY CASE WHEN r.status='pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 200").all();
-    return json({ data: result.results });
+    const requestedDate=url.searchParams.get("date");const date=requestedDate&&/^\d{4}-\d{2}-\d{2}$/.test(requestedDate)?requestedDate:null;
+    const status=["pending","approved","rejected"].includes(url.searchParams.get("status")||"")?String(url.searchParams.get("status")):"pending";
+    const latest=date?{date}:await env.DB.prepare("SELECT MAX(a.report_date) AS date FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE r.status='pending'").first<{date:string}>();
+    const reportDate=latest?.date||automaticProductionTargetDate();
+    const [result,existing,counts]=await Promise.all([
+      env.DB.prepare("SELECT r.id,r.announcement_id AS announcementId,r.event_type AS eventType,r.reason,r.payload,r.status,r.created_at AS createdAt,r.reviewed_at AS reviewedAt,r.resolution,a.stock_code AS stockCode,a.stock_name AS stockName,a.title,a.announce_date AS announceDate,a.report_date AS reportDate,a.pdf_url AS pdfUrl,a.r2_key AS r2Key,a.parse_status AS parseStatus,a.parse_attempts AS parseAttempts,a.last_error AS lastError FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE a.report_date=? AND r.status=? ORDER BY CASE WHEN a.last_error IS NOT NULL THEN 0 ELSE 1 END,a.parse_attempts DESC,COALESCE(r.reviewed_at,r.created_at) ASC LIMIT 200").bind(reportDate,status).all(),
+      env.DB.prepare("SELECT p.announcement_id AS announcementId,p.shareholder,p.pledgee,p.pledge_amount AS amount,p.pledge_amount_text AS amountText,p.pledge_ratio AS pledgeRatio,p.total_ratio AS totalRatio,p.start_date AS startDate,p.end_date AS endDate,p.purpose,p.type FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? ORDER BY p.id").bind(reportDate).all(),
+      env.DB.prepare("SELECT SUM(CASE WHEN r.status='pending' THEN 1 ELSE 0 END) AS pending,SUM(CASE WHEN r.status='approved' THEN 1 ELSE 0 END) AS approved,SUM(CASE WHEN r.status='rejected' THEN 1 ELSE 0 END) AS rejected FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE a.report_date=?").bind(reportDate).first(),
+    ]);
+    const eventsByAnnouncement=new Map<string,unknown[]>();for(const row of existing.results as Array<Record<string,unknown>>){const id=String(row.announcementId);const values=eventsByAnnouncement.get(id)||[];values.push(row);eventsByAnnouncement.set(id,values);}
+    return json({date:reportDate,status,counts:counts||{pending:0,approved:0,rejected:0},data:(result.results as Array<Record<string,unknown>>).map((row)=>({...row,archivedPdfUrl:`/api/review-documents/${encodeURIComponent(String(row.announcementId))}`,existingEvents:eventsByAnnouncement.get(String(row.announcementId))||[]})),generatedAt:new Date().toISOString()});
   }
   if (url.pathname.startsWith("/api/reviews/") && request.method === "PATCH") {
     const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const id = Number(url.pathname.split("/").pop());
-    const body = await request.json<{status?:string;resolution?:string;shareholder?:string;pledgee?:string;amount?:number;amountText?:string;pledgeRatio?:string;totalRatio?:string;type?:string}>();
-    if (!id || !["approved","rejected"].includes(body.status || "")) return json({ error: "invalid review update" }, { status: 400 });
-    const before = await env.DB.prepare("SELECT * FROM review_queue WHERE id=?").bind(id).first<{announcement_id:string;status:string;payload:string}>();
+    type ManualEventInput={shareholder?:string;pledgee?:string;amount?:number;amountText?:string;pledgeRatio?:string;totalRatio?:string;startDate?:string;endDate?:string;purpose?:string;type?:string};
+    const body = await request.json<{action?:"approve"|"reject"|"requeue";status?:string;resolution?:string;events?:ManualEventInput[];shareholder?:string;pledgee?:string;amount?:number;amountText?:string;pledgeRatio?:string;totalRatio?:string;type?:string}>();
+    const action=body.action||(body.status==="approved"?"approve":body.status==="rejected"?"reject":"");
+    if (!id || !["approve","reject","requeue"].includes(action)) return json({ error: "invalid review update" }, { status: 400 });
+    const before = await env.DB.prepare("SELECT r.*,a.report_date AS reportDate FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE r.id=?").bind(id).first<{announcement_id:string;status:string;payload:string;reportDate:string}>();
     if (!before) return json({ error: "review not found" }, { status: 404 });
-    if (before.status !== "pending") return json({ error: "review already completed" }, { status: 409 });
+    if (before.status !== "pending"&&action!=="requeue") return json({ error: "review already completed" }, { status: 409 });
     const now = new Date().toISOString();
-    const statements: D1PreparedStatement[] = [
-      env.DB.prepare("UPDATE review_queue SET status=?,resolution=?,reviewed_at=?,reviewer=? WHERE id=?").bind(body.status,body.resolution || "",now,viewer,id),
-      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("review_queue",String(id),"review",JSON.stringify(before),JSON.stringify(body),viewer,now),
+    if(action==="requeue"){
+      await env.DB.batch([
+        env.DB.prepare("UPDATE review_queue SET status='pending',reason='审核员要求重新执行规则解析',resolution=?,reviewed_at=?,reviewer=? WHERE announcement_id=?").bind(body.resolution||"",now,viewer,before.announcement_id),
+        env.DB.prepare("UPDATE announcement SET parse_status='queued',parse_attempts=0,last_error=NULL WHERE announcement_id=?").bind(before.announcement_id),
+        env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("review_queue",String(id),"requeue",JSON.stringify(before),JSON.stringify(body),viewer,now),
+      ]);ctx.waitUntil(processPendingQueue(env.DB,env.DOCUMENTS,1,env,before.reportDate).catch(()=>undefined));return json({ok:true,status:"requeued",reportDate:before.reportDate});
+    }
+    const finalStatus=action==="approve"?"approved":"rejected";const statements: D1PreparedStatement[] = [
+      env.DB.prepare("UPDATE review_queue SET status=?,resolution=?,reviewed_at=?,reviewer=? WHERE announcement_id=? AND status='pending'").bind(finalStatus,body.resolution || "",now,viewer,before.announcement_id),
+      env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("review_queue",String(id),"review",JSON.stringify(before),JSON.stringify({...body,action}),viewer,now),
     ];
-    if (body.status === "approved") {
+    if (action === "approve") {
       const announcement = await env.DB.prepare("SELECT stock_code AS stockCode,stock_name AS stockName,announce_date AS announceDate FROM announcement WHERE announcement_id=?").bind(before.announcement_id).first<{stockCode:string;stockName:string;announceDate:string}>();
-      if (!announcement || !body.shareholder?.trim() || !body.pledgee?.trim() || !Number(body.amount)) return json({ error: "股东、质权人和质押数量为必填项" }, { status: 400 });
-      const manualRow=validateAndNormalizePledgeRow({shareholder:body.shareholder.trim(),pledgee:body.pledgee.trim(),amount:Number(body.amount),amountText:body.amountText||String(body.amount),pledgeRatio:body.pledgeRatio||"",totalRatio:body.totalRatio||"",startDate:"",endDate:"",purpose:"",type:body.type||"新增质押",missing:[]}) as ParsedPledge;
-      if(manualRow.missing.length)return json({error:`人工审核数据未通过严格校验：${manualRow.missing.join("、")}`},{status:400});
-      const eventFingerprint=await fingerprint(before.announcement_id,manualRow,0);
-      statements.push(
-        env.DB.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(before.announcement_id),
-        env.DB.prepare("INSERT INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint,verification_status,verified_at,verified_by,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(before.announcement_id,announcement.stockCode,announcement.stockName,manualRow.shareholder,manualRow.pledgee,manualRow.amount,manualRow.amountText,manualRow.pledgeRatio||null,manualRow.totalRatio||null,manualRow.type,announcement.announceDate,1,"manual-review-v2",now,eventFingerprint,"human_verified",now,viewer,eventEvidence(before.announcement_id,[],manualRow,"human")),
-        env.DB.prepare("UPDATE announcement SET parse_status='parsed' WHERE announcement_id=?").bind(before.announcement_id),
-      );
+      const inputs=body.events?.length?body.events:[body];if(!announcement||!inputs.length||inputs.length>30)return json({error:"每份公告需提交1至30条事件"},{status:400});
+      const rows=inputs.map((row)=>validateAndNormalizePledgeRow({shareholder:String(row.shareholder||"").trim(),pledgee:String(row.pledgee||"").trim(),amount:Number(row.amount||amountNumber(String(row.amountText||""))),amountText:String(row.amountText||row.amount||""),pledgeRatio:String(row.pledgeRatio||""),totalRatio:String(row.totalRatio||""),startDate:String(row.startDate||""),endDate:String(row.endDate||""),purpose:String(row.purpose||""),type:String(row.type||"新增质押"),missing:[]}) as ParsedPledge);
+      const invalid=rows.find((row)=>row.missing.length);if(invalid)return json({error:`人工审核数据未通过严格校验：${invalid.missing.join("、")}`},{status:400});
+      statements.push(env.DB.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(before.announcement_id));
+      for(let index=0;index<rows.length;index++){const row=rows[index];const eventFingerprint=await fingerprint(before.announcement_id,row,index);statements.push(env.DB.prepare("INSERT INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint,verification_status,verified_at,verified_by,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(before.announcement_id,announcement.stockCode,announcement.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,announcement.announceDate,1,"manual-review-v3",now,eventFingerprint,"human_verified",now,viewer,eventEvidence(before.announcement_id,[],row,"human")));}
+      statements.push(env.DB.prepare("UPDATE announcement SET parse_status='parsed',last_error=NULL WHERE announcement_id=?").bind(before.announcement_id));
     } else {
       statements.push(env.DB.prepare("UPDATE announcement SET parse_status='rejected' WHERE announcement_id=?").bind(before.announcement_id));
     }
     await env.DB.batch(statements);
-    return json({ ok: true, status: body.status });
+    const snapshot=await dailyReportSnapshot(env.DB,before.reportDate);const closing=snapshot.ready&&snapshot.cutoffPassed&&snapshot.status!=="published"?await publishDailyReport(env,before.reportDate,viewer,"人工审核队列已清零，自动升级最终关账版本","final"):null;
+    return json({ ok: true, status: finalStatus,reportDate:before.reportDate,snapshot,closing });
+  }
+  if (url.pathname.startsWith("/api/review-documents/") && request.method === "GET") {
+    if(!adminViewer(request,env))return adminRequired();const id=decodeURIComponent(url.pathname.split("/").pop()||"");
+    const item=await env.DB.prepare("SELECT r2_key AS r2Key,pdf_url AS pdfUrl FROM announcement WHERE announcement_id=?").bind(id).first<{r2Key?:string;pdfUrl?:string}>();if(!item)return json({error:"announcement not found"},{status:404});
+    if(item.r2Key){const object=await env.DOCUMENTS.get(item.r2Key);if(object)return new Response(object.body,{headers:{"content-type":object.httpMetadata?.contentType||"application/pdf","content-disposition":`inline; filename=\"${id}.pdf\"`,etag:object.httpEtag}});}
+    if(item.pdfUrl){const response=await fetchWithRetry(item.pdfUrl,{headers:{referer:"https://www.cninfo.com.cn/","user-agent":"Mozilla/5.0 (compatible; HBF-ManualReview/1.0)"}},2);if(response.ok)return new Response(response.body,{headers:{"content-type":"application/pdf","content-disposition":`inline; filename=\"${id}.pdf\"`}});}
+    return json({error:"official PDF unavailable"},{status:404});
   }
   if (url.pathname === "/api/export" && request.method === "GET") {
     const format = url.searchParams.get("format") || "csv";
@@ -1902,7 +1925,9 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return new Response(csv, { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=pledge-events.csv" } });
   }
   if (url.pathname.startsWith("/api/documents/") && request.method === "GET") {
-    const key = decodeURIComponent(url.pathname.slice("/api/documents/".length)); const object = await env.DOCUMENTS.get(key);
+    const key = decodeURIComponent(url.pathname.slice("/api/documents/".length));
+    if (key.startsWith("announcements/") && !adminViewer(request,env)) return adminRequired();
+    const object = await env.DOCUMENTS.get(key);
     if (!object) return json({ error: "document not found" }, { status: 404 });
     return new Response(object.body, { headers: { "content-type": object.httpMetadata?.contentType || "application/pdf", etag: object.httpEtag } });
   }
