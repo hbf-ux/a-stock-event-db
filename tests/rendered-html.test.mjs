@@ -138,7 +138,7 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /evidence_backfill_attempt/);
   assert.match(worker, /runHistoricalBackfillBatch/);
   assert.match(worker, /runParserUpgradeRetry/);
-  assert.match(worker, /parser_upgrade_v2_4_attempt/);
+  assert.match(worker, /parser_upgrade_v2_5_six_fields_attempt/);
   assert.match(worker, /maybeStartAutomaticMaintenance/);
   assert.match(worker, /\/api\/maintenance/);
   assert.match(worker, /\/api\/daily-report/);
