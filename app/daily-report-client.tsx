@@ -52,14 +52,10 @@ function drawEventCard(ctx:CanvasRenderingContext2D,row:EventRow,index:number,y:
   ctx.fillStyle="#1769e0";ctx.font="700 22px Arial";ctx.fillText("→",margin+450,y+82);ctx.fillStyle="#7a8799";ctx.font='18px "Microsoft YaHei", sans-serif';ctx.fillText("质权人",margin+495,y+82);ctx.fillStyle="#1c2e47";ctx.font='22px "Microsoft YaHei", sans-serif';ctx.fillText(fitText(ctx,row.pledgee,width-760),margin+580,y+82);
   ctx.fillStyle="#7a8799";ctx.font='18px "Microsoft YaHei", sans-serif';ctx.fillText(`质押日期 ${safe(row.pledgeDate)}`,margin+25,y+119);
 }
-function drawFooter(ctx:CanvasRenderingContext2D,report:Snapshot,y:number,width:number,qr:HTMLImageElement){
-  ctx.fillStyle="#071a34";ctx.fillRect(0,y,width,300);ctx.fillStyle="#fff";ctx.font='700 23px "Microsoft YaHei", sans-serif';ctx.fillText(`${statusMap[report.status].label}｜仅收录新增质押｜报告日期 ${report.date}`,48,y+52);
-  ctx.fillStyle="#aebfd5";ctx.font='18px "Microsoft YaHei", sans-serif';ctx.fillText("事件=新增质押明细行｜公司=股票代码去重",48,y+96);ctx.fillText("股东/质权人=名称去重",48,y+130);
-  ctx.fillText("数据源：交易所与上市公司官方公告",48,y+174);ctx.fillText("仅供信息参考，不构成投资或授信建议",48,y+208);
-  ctx.fillStyle="rgba(255,255,255,.12)";ctx.font="900 70px Arial";ctx.fillText("HBF",48,y+278);
-  const crop=Math.min(qr.naturalWidth*.66,qr.naturalHeight*.66),sx=qr.naturalWidth*.17,sy=qr.naturalHeight*.11,qrSize=208,cardX=width-274,cardY=y+22;
-  ctx.fillStyle="#fff";ctx.fillRect(cardX,cardY,234,256);ctx.drawImage(qr,sx,sy,crop,crop,cardX+13,cardY+12,qrSize,qrSize);
-  ctx.fillStyle="#071a34";ctx.font='700 17px "Microsoft YaHei", sans-serif';ctx.textAlign="center";ctx.fillText("扫码关注宏博财策",cardX+117,cardY+240);ctx.textAlign="left";
+function drawFooter(ctx:CanvasRenderingContext2D,y:number,width:number,qr:HTMLImageElement){
+  ctx.fillStyle="#071a34";ctx.fillRect(0,y,width,220);ctx.fillStyle="#d4e0ef";ctx.font='20px "Microsoft YaHei", sans-serif';ctx.fillText("数据来源：交易所与上市公司官方公告",48,y+112);
+  const crop=Math.min(qr.naturalWidth*.68,qr.naturalHeight*.68),sx=qr.naturalWidth*.16,sy=qr.naturalHeight*.10,qrSize=180,cardX=width-228,cardY=y+12;
+  ctx.fillStyle="#fff";ctx.fillRect(cardX,cardY,196,196);ctx.drawImage(qr,sx,sy,crop,crop,cardX+8,cardY+8,qrSize,qrSize);
 }
 
 export default function DailyReportClient(){
@@ -67,7 +63,7 @@ export default function DailyReportClient(){
   const load=useCallback(async()=>{setLoading(true);setError("");try{const response=await fetch("/api/daily-report",{cache:"no-store"});if(!response.ok)throw new Error("今日日报暂不可用");setReport(await response.json() as Snapshot);}catch(reason){setError(reason instanceof Error?reason.message:"今日日报暂不可用");}finally{setLoading(false);}},[]);
   useEffect(()=>{void load();},[load]);
   const rows=report?.events||[];const shareholderCount=useMemo(()=>new Set(rows.map(row=>row.shareholder).filter(Boolean)).size,[rows]);const pledgeeCount=useMemo(()=>new Set(rows.map(row=>row.pledgee).filter(Boolean)).size,[rows]);
-  const downloadDailyImage=async()=>{if(!report||!rows.length)return;try{const qr=await loadQrImage();const width=1080,firstY=468,rowStep=154,footerY=firstY+rows.length*rowStep+28,height=Math.max(1590,footerY+300);const canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;const ctx=canvas.getContext("2d");if(!ctx)return;ctx.fillStyle="#fff";ctx.fillRect(0,0,width,height);drawHeader(ctx,report,width);drawSummary(ctx,report,rows,shareholderCount,pledgeeCount,328,width);rows.forEach((row,index)=>drawEventCard(ctx,row,index,firstY+index*rowStep,width));drawFooter(ctx,report,height-300,width,qr);saveCanvas(canvas,`HBF-A股新增质押日报-${report.date}.png`);}catch{setError("公众号二维码加载失败，请刷新页面后重试");}};
+  const downloadDailyImage=async()=>{if(!report||!rows.length)return;try{const qr=await loadQrImage();const width=1080,firstY=468,rowStep=154,footerY=firstY+rows.length*rowStep+28,height=Math.max(1510,footerY+220);const canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;const ctx=canvas.getContext("2d");if(!ctx)return;ctx.fillStyle="#fff";ctx.fillRect(0,0,width,height);drawHeader(ctx,report,width);drawSummary(ctx,report,rows,shareholderCount,pledgeeCount,328,width);rows.forEach((row,index)=>drawEventCard(ctx,row,index,firstY+index*rowStep,width));drawFooter(ctx,height-220,width,qr);saveCanvas(canvas,`HBF-A股新增质押日报-${report.date}.png`);}catch{setError("公众号二维码加载失败，请刷新页面后重试");}};
   return <main className="dailyPage"><header className="dailyHeader"><a className="dailyBrand" href="/"><span>HBF</span><b>质押日报<small>SHAREHOLDER FINANCE INTELLIGENCE</small></b></a><nav><a className="active" href="/">今日日报</a><a href="/match">撮合服务</a><a href="/match/desk">我的撮合</a></nav><a className="dailyEn" href="/en">EN</a></header>
     <div className="dailyShell">{loading?<div className="dailyState">正在生成今日日报…</div>:error?<div className="dailyState error">{error}<button onClick={()=>void load()}>重试</button></div>:report&&<>
       <section className="dailyMasthead"><div><p className="eyebrow">ONE DAY · ONE VERIFIED IMAGE</p><h1>{report.date}<br/>新增质押日报</h1><p>不做实时消息流，不堆叠历史页面。每天完成官方公告核验后，只发布一份轻量、清晰、可直接传播的新增质押日报图。</p></div><aside><span className={`closingStatus ${report.status}`}>{statusMap[report.status].label}</span><b>{statusMap[report.status].note}</b><small>公告口径：当日 20:00 截止</small><small>数据范围：仅新增质押</small><small>品牌发布：HBF</small></aside></section>
