@@ -1086,12 +1086,14 @@ async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext,reason
 
 async function maybeStartAutomaticMaintenance(env:Env,ctx:ExecutionContext) {
   const enabled=env.AUTO_SYNC_ENABLED?.trim().toLowerCase()!=="false";if(!enabled)return {enabled:false,status:"disabled"};
-  const startedAt=new Date().toISOString();const lockCutoff=new Date(Date.now()-24*60*60*1000).toISOString();
+  // Small, frequent batches let deterministic parser upgrades drain review
+  // backlog without a burst of PDF work or OpenAI calls.
+  const intervalMinutes=30;const startedAt=new Date().toISOString();const lockCutoff=new Date(Date.now()-intervalMinutes*60*1000).toISOString();
   const lock=await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('automatic_maintenance_trigger',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE pipeline_state.updated_at<=? RETURNING updated_at AS updatedAt").bind(JSON.stringify({reason:"public-health-check",status:"starting"}),startedAt,lockCutoff).first<{updatedAt:string}>();
-  if(!lock){const existing=await env.DB.prepare("SELECT updated_at AS updatedAt FROM pipeline_state WHERE key='automatic_maintenance_trigger'").first<{updatedAt:string}>();return {enabled:true,status:"fresh",lastTriggeredAt:existing?.updatedAt||null};}
+  if(!lock){const existing=await env.DB.prepare("SELECT updated_at AS updatedAt FROM pipeline_state WHERE key='automatic_maintenance_trigger'").first<{updatedAt:string}>();return {enabled:true,status:"fresh",intervalMinutes,lastTriggeredAt:existing?.updatedAt||null};}
   await env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('automatic_maintenance_trigger',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify({reason:"public-health-check",status:"running"}),startedAt).run();
   ctx.waitUntil(runMaintenanceCycle(env,"automatic-daily-maintenance").catch(()=>undefined));
-  return {enabled:true,status:"started",lastTriggeredAt:startedAt};
+  return {enabled:true,status:"started",intervalMinutes,lastTriggeredAt:startedAt};
 }
 
 const stripePlanPrices=(env:Env)=>({pro:env.STRIPE_PRICE_PRO_MONTHLY,team:env.STRIPE_PRICE_TEAM_MONTHLY,global:env.STRIPE_PRICE_GLOBAL_MONTHLY});

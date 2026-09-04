@@ -55,6 +55,7 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /pledge-v2-six-fields/);
   assert.match(worker, /parser_upgrade_v2_5_six_fields_attempt/);
   assert.match(worker, /allowFreshVersionAttempt/);
+  assert.match(worker, /const intervalMinutes=30/);
   assert.doesNotMatch(worker, /人工审核数据未通过严格校验/);
   assert.match(worker, /key\.startsWith\(\"announcements\/\"\)/);
   assert.match(worker, /review already completed/);
