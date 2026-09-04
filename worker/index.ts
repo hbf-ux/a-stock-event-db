@@ -209,6 +209,21 @@ const automaticProductionTargetDate = () => {
   if(hour<20)date=addDays(date,-1);
   return date;
 };
+const automaticProcessingDeadlineAt = (date:string) => `${date}T20:30:00+08:00`;
+const automaticProcessingDeadlinePassed = (date:string) => Date.now() >= Date.parse(automaticProcessingDeadlineAt(date));
+async function handoffOverdueAutomaticWork(db:D1Database,date:string,actor:string){
+  const deadlineAt=automaticProcessingDeadlineAt(date);
+  if(!automaticProcessingDeadlinePassed(date))return {deadlineAt,deadlinePassed:false,moved:0};
+  const pending=await db.prepare("SELECT COUNT(*) AS total FROM announcement WHERE report_date=? AND parse_status IN ('queued','archived','processing')").bind(date).first<{total:number}>();
+  const moved=Number(pending?.total||0);if(!moved)return {deadlineAt,deadlinePassed:true,moved:0};
+  const now=new Date().toISOString();
+  await db.batch([
+    db.prepare("UPDATE announcement SET parse_status='review',last_error=COALESCE(last_error,'20:30自动处理截止，已转人工审核') WHERE report_date=? AND parse_status IN ('queued','archived','processing')").bind(date),
+    db.prepare("UPDATE review_queue SET reason='20:30自动处理截止，未完成公告已自动转入人工审核',reviewed_at=?,reviewer=? WHERE status='pending' AND announcement_id IN (SELECT announcement_id FROM announcement WHERE report_date=? AND parse_status='review')").bind(now,actor,date),
+    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("daily_report",date,"automatic_processing_deadline_handoff",JSON.stringify({deadlineAt,moved}),actor,now),
+  ]);
+  return {deadlineAt,deadlinePassed:true,moved};
+}
 const hex = (buffer: ArrayBuffer) => [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
 type MatchRequestRecord = { id:number;role:string;amountMin:number;amountMax:number;termMonths:number|null;preference:string|null;purpose:string|null;riskSnapshot:string|null;viewerId:string|null };
 async function refreshMatchCandidates(db:D1Database,requestId:number) {
@@ -588,8 +603,12 @@ async function legacyProcessAnnouncement(db: D1Database, documents: R2Bucket, id
 }
 
 async function processAnnouncement(db: D1Database, documents: R2Bucket, id: string, env?: Env, options: {forceOpenAI?:boolean;allowFreshVersionAttempt?:boolean} = {}) {
-  const item = await db.prepare("SELECT announcement_id AS id,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,r2_key AS r2Key,sha256,parse_attempts AS parseAttempts FROM announcement WHERE announcement_id=?").bind(id).first<{id:string;stockCode:string;stockName:string;title:string;announceDate:string;pdfUrl:string;r2Key?:string;sha256?:string;parseAttempts:number}>();
+  const item = await db.prepare("SELECT announcement_id AS id,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,report_date AS reportDate,pdf_url AS pdfUrl,r2_key AS r2Key,sha256,parse_attempts AS parseAttempts FROM announcement WHERE announcement_id=?").bind(id).first<{id:string;stockCode:string;stockName:string;title:string;announceDate:string;reportDate:string;pdfUrl:string;r2Key?:string;sha256?:string;parseAttempts:number}>();
   if (!item) throw new Error("announcement not found");
+  if(automaticProcessingDeadlinePassed(item.reportDate)){
+    const handoff=await handoffOverdueAutomaticWork(db,item.reportDate,"automatic-deadline");
+    return {id,status:"review",reason:"automatic_processing_deadline",...handoff,event_count:0};
+  }
   let bytes: ArrayBuffer; let r2Key = item.r2Key; let sha256 = item.sha256;
   if (r2Key) { const object = await documents.get(r2Key); if (!object) throw new Error("archived PDF not found"); bytes = await object.arrayBuffer(); }
   else {
@@ -1011,8 +1030,14 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
     // idempotent runs instead of risking one oversized Worker execution.
     // Five sequential documents keeps memory bounded while clearing the daily
     // close queue in fewer scheduler cycles than the previous batch of three.
-    const processing=await processPendingQueue(env.DB,env.DOCUMENTS,5,env,date);
-    const reviewCandidates=await env.DB.prepare("SELECT r.announcement_id AS id FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE r.status='pending' AND a.report_date=? AND a.parse_status='review' AND a.parse_attempts<3 ORDER BY COALESCE(r.reviewed_at,r.created_at) ASC LIMIT 2").bind(date).all<{id:string}>();
+    const deadlineHandoffBefore=await handoffOverdueAutomaticWork(env.DB,date,"automatic-production");
+    const processing=deadlineHandoffBefore.deadlinePassed
+      ?{run_id:null,processed:0,events_created:0,failures:0,results:[]}
+      :await processPendingQueue(env.DB,env.DOCUMENTS,5,env,date);
+    const deadlineHandoffAfter=await handoffOverdueAutomaticWork(env.DB,date,"automatic-production");
+    const reviewCandidates=deadlineHandoffAfter.deadlinePassed
+      ?{results:[] as Array<{id:string}>}
+      :await env.DB.prepare("SELECT r.announcement_id AS id FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE r.status='pending' AND a.report_date=? AND a.parse_status='review' AND a.parse_attempts<3 ORDER BY COALESCE(r.reviewed_at,r.created_at) ASC LIMIT 2").bind(date).all<{id:string}>();
     const reviews:unknown[]=[];
     for(const row of reviewCandidates.results){try{reviews.push(await withDeadline(processAnnouncement(env.DB,env.DOCUMENTS,row.id,env),25_000,`review ${row.id}`));}catch(error){reviews.push({id:row.id,status:"failed",error:error instanceof Error?error.message:"review failed"});}}
     const closingSnapshot=await dailyReportSnapshot(env.DB,date);
@@ -1024,7 +1049,7 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
         ?await publishDailyReport(env,date,"automatic-production","21:00自动临时发布：仅包含已核验事件，未决公告完成后自动升级最终版","provisional")
         :null;
     const finishedAt=new Date().toISOString();
-    const result={date,ingestion,scopePolicy,reconciliation:{found:reconciliation.found,failures:reconciliation.failures,results:reconciliation.results},processing,reviews,closing,startedAt,finishedAt};
+    const result={date,ingestion,scopePolicy,reconciliation:{found:reconciliation.found,failures:reconciliation.failures,results:reconciliation.results},automaticProcessingDeadline:{before:deadlineHandoffBefore,after:deadlineHandoffAfter},processing,reviews,closing,startedAt,finishedAt};
     await env.DB.batch([
       env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(finishedAt,(reconciliation.failures||processing.failures)?"completed_with_errors":"completed",ingestion.found,processing.events_created,reconciliation.failures+processing.failures,JSON.stringify(result),runId),
       env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('daily_production_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify(result),finishedAt),
@@ -1157,13 +1182,15 @@ async function dailyReportSnapshot(db:D1Database,date:string) {
   const contentComplete=Number(announcement?.total||0)>0&&Number(announcement?.pending||0)===0;
   const ready=reconciliationComplete&&contentComplete;
   const cutoffAt=`${date}T20:00:00+08:00`;
+  const processingDeadlineAt=automaticProcessingDeadlineAt(date);
   const publicationDeadlineAt=`${date}T21:00:00+08:00`;
   const cutoffPassed=Date.now()>=Date.parse(cutoffAt);
+  const processingDeadlinePassed=Date.now()>=Date.parse(processingDeadlineAt);
   const publicationDue=Date.now()>=Date.parse(publicationDeadlineAt);
   const savedStatus=(published as {status?:string}|null)?.status;
   const publicationOverdue=publicationDue&&savedStatus!=="published"&&savedStatus!=="provisional";
   const status=savedStatus==="published"?"published":savedStatus==="provisional"?"provisional":ready?"ready_to_close":cutoffPassed?"reviewing":"collecting";
-  return {date,cutoffAt,publicationDeadlineAt,publicationDue,publicationOverdue,status,ready,cutoffPassed,announcement:announcement||{total:0,classified:0,pending:0},event:event||{total:0,companies:0,releases:0,supplemental:0},verification:verification||{},reconciliation:{complete:reconciliationComplete,successfulSources,requiredSources:3,unresolved:Number(unresolved?.total||0),sourceRuns,lastRun:reconciliationRun||null},published:published||null};
+  return {date,cutoffAt,processingDeadlineAt,processingDeadlinePassed,publicationDeadlineAt,publicationDue,publicationOverdue,status,ready,cutoffPassed,announcement:announcement||{total:0,classified:0,pending:0},event:event||{total:0,companies:0,releases:0,supplemental:0},verification:verification||{},reconciliation:{complete:reconciliationComplete,successfulSources,requiredSources:3,unresolved:Number(unresolved?.total||0),sourceRuns,lastRun:reconciliationRun||null},published:published||null};
 }
 
 type DailyArtifactEvent={announcementId:string;code:string;name:string;shareholder:string;pledgee:string;amount:string;pledgeDate:string};
@@ -1284,7 +1311,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     ]);
     const blockedUntil=quotaState?.value&&Date.parse(quotaState.value)>Date.now()?quotaState.value:null;let lastError:null|Record<string,unknown>=null;try{lastError=openaiErrorState?.value?JSON.parse(openaiErrorState.value):null;}catch{}
     const openaiEnabled=Boolean(env.OPENAI_API_KEY)&&env.OPENAI_REVIEW_ENABLED?.trim().toLowerCase()==="true";
-    return json({...snapshot,events:events.results,automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),enabled:openaiEnabled,available:openaiEnabled&&!blockedUntil,mode:openaiEnabled?"rules-then-openai":"rules-then-manual",blockedUntil,lastError,lastErrorAt:openaiErrorState?.updatedAt||null,usage:openaiUsage||{calls:0,successes:0,inputTokens:0,outputTokens:0,totalTokens:0,cachedInputTokens:0}},clock:{shanghaiDate:shanghaiDate(),productionTargetDate:automaticProduction.targetDate,cutoffHour:20,publicationDeadlineHour:21},methodology:"仅收录新增质押，解除质押、解除再质押、补充质押及展期全部排除；新增质押按结构化事件行计数，涉及公司按股票代码去重，质押股东和质权人按名称文本去重；每日20:00固定当日日报范围；20:00后的官方公告顺延到下一自然日日报；后台持续补齐并在三所差异清零后升级最终版",deliverables:{dailyImage:"1080像素HBF新增质押日报图片，由浏览器按当期数据即时生成"},generatedAt:new Date().toISOString()});
+    return json({...snapshot,events:events.results,automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),enabled:openaiEnabled,available:openaiEnabled&&!blockedUntil,mode:openaiEnabled?"rules-then-openai":"rules-then-manual",blockedUntil,lastError,lastErrorAt:openaiErrorState?.updatedAt||null,usage:openaiUsage||{calls:0,successes:0,inputTokens:0,outputTokens:0,totalTokens:0,cachedInputTokens:0}},clock:{shanghaiDate:shanghaiDate(),productionTargetDate:automaticProduction.targetDate,cutoffHour:20,automaticProcessingDeadlineHour:20,automaticProcessingDeadlineMinute:30,publicationDeadlineHour:21},methodology:"仅收录新增质押，解除质押、解除再质押、补充质押及展期全部排除；新增质押按结构化事件行计数，涉及公司按股票代码去重，质押股东和质权人按名称文本去重；每日20:00固定当日日报范围；20:30自动处理截止，未完成公告全部转入人工审核；20:00后的官方公告顺延到下一自然日日报；人工审核完成且三所差异清零后升级最终版",deliverables:{dailyImage:"1080像素HBF新增质押日报图片，由浏览器按当期数据即时生成"},generatedAt:new Date().toISOString()});
   }
   if(url.pathname==="/api/daily-report/close"&&request.method==="POST"){
     const viewer=adminViewer(request,env);if(!viewer)return adminRequired();

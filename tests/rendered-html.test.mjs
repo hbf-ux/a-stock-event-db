@@ -21,6 +21,7 @@ test("public product is a daily closing report backed by the production workflow
   assert.doesNotMatch(daily,/历史日报/);
   assert.doesNotMatch(daily,/打印 \/ 保存 PDF/);
   assert.match(daily,/三所公告对账/);
+  assert.match(daily,/自动处理：20:30 截止，未完成转人工/);
   assert.match(daily,/提交撮合需求/);
   assert.match(daily,/当日新增质押清单/);
   assert.match(daily,/股票名称/);
@@ -151,7 +152,10 @@ test("public product is a daily closing report backed by the production workflow
   assert.doesNotMatch(worker, /url\.pathname==="\/api\/daily-reports"/);
   assert.match(worker, /dailyReportSnapshot/);
   assert.match(worker, /T20:00:00\+08:00/);
+  assert.match(worker, /T20:30:00\+08:00/);
   assert.match(worker, /T21:00:00\+08:00/);
+  assert.match(worker, /automatic_processing_deadline_handoff/);
+  assert.match(worker, /20:30自动处理截止，未完成公告已自动转入人工审核/);
   assert.match(worker, /publicationDeadlineAt/);
   assert.match(worker, /automaticProductionTargetDate/);
   assert.match(worker, /reportDateForDisclosure/);
