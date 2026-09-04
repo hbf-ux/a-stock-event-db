@@ -19,6 +19,7 @@ type ValidatablePledgeRow = {
   amountText: string;
   pledgeRatio?: string;
   totalRatio?: string;
+  startDate?: string;
   type: string;
   missing: string[];
 };
@@ -62,7 +63,6 @@ export function validateAndNormalizePledgeRow<T extends ValidatablePledgeRow>(in
     || !institutionSuffix.test(row.pledgee);
   const compactAmount = row.amountText.replace(/\s+/g,"");
   const invalidAmountText = !/^(?:\d+(?:\.\d+)?(?:万|亿)?股?|\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:万|亿)?股?)$/.test(compactAmount);
-  const invalidRatio = [row.pledgeRatio,row.totalRatio].some((value) => value && (!/^\d{1,3}(?:\.\d+)?%$/.test(value) || Number(value.slice(0,-1)) > 100 || /^0\d/.test(value)));
   const disclosedRatio = Number((row.pledgeRatio || "").replace("%",""));
   const implausibleAmountRatio = row.amount < 10000 && Number.isFinite(disclosedRatio) && disclosedRatio >= 1;
   const invalidType = !["新增质押","补充质押","解除质押","解除后再质押","质押展期"].includes(row.type);
@@ -70,7 +70,6 @@ export function validateAndNormalizePledgeRow<T extends ValidatablePledgeRow>(in
     (!row.shareholder || invalidShareholder) && "股东",
     (!row.pledgee || invalidPledgee) && "质权人",
     (!row.amount || !Number.isFinite(row.amount) || row.amount <= 0 || invalidAmountText || implausibleAmountRatio) && "质押数量",
-    invalidRatio && "质押比例",
     invalidType && "事件类型",
   ].filter(Boolean) as string[];
   return row;

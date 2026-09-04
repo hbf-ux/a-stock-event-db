@@ -138,16 +138,22 @@ async function ensureSchema(db: D1Database) {
     db.prepare("UPDATE pledge SET shareholder=REPLACE(REPLACE(shareholder,' ',''),'　',''),pledgee=REPLACE(REPLACE(pledgee,' ',''),'　','') WHERE shareholder LIKE '% %' OR shareholder LIKE '%　%' OR pledgee LIKE '% %' OR pledgee LIKE '%　%'"),
     db.prepare("UPDATE pledge SET pledgee=SUBSTR(pledgee,2) WHERE pledgee LIKE '日%' AND (pledgee LIKE '%有限公司' OR pledgee LIKE '%支行')"),
   ]);
-  const existingEvents = await db.prepare("SELECT id,announcement_id,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,type FROM pledge").all<{id:number;announcement_id:string;shareholder:string;pledgee:string;pledge_amount:number;pledge_amount_text:string;pledge_ratio:string;total_ratio:string;type:string}>();
-  const normalizedEvents = existingEvents.results.map((event) => ({event,normalized:validateAndNormalizePledgeRow({shareholder:event.shareholder,pledgee:event.pledgee,amount:Number(event.pledge_amount),amountText:event.pledge_amount_text,pledgeRatio:event.pledge_ratio || "",totalRatio:event.total_ratio || "",type:event.type,missing:[]})}));
+  const existingEvents = await db.prepare("SELECT id,announcement_id,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,type,parser_version,verification_status FROM pledge").all<{id:number;announcement_id:string;shareholder:string;pledgee:string;pledge_amount:number;pledge_amount_text:string;pledge_ratio:string;total_ratio:string;start_date:string;type:string;parser_version:string;verification_status:string}>();
+  const normalizedEvents = existingEvents.results.map((event) => {
+    const normalized=validateForAutomaticPublication({shareholder:event.shareholder,pledgee:event.pledgee,amount:Number(event.pledge_amount),amountText:event.pledge_amount_text,pledgeRatio:event.pledge_ratio || "",totalRatio:event.total_ratio || "",startDate:event.start_date || "",type:event.type,missing:[]} as ParsedPledge);
+    const humanVerified=event.verification_status==="human_verified"||event.parser_version.startsWith("manual-");
+    return {event,normalized,humanVerified};
+  });
   const entityUpdates = normalizedEvents.filter(({event,normalized}) => !normalized.missing.length && (event.shareholder !== normalized.shareholder || event.pledgee !== normalized.pledgee));
   if (entityUpdates.length) await db.batch(entityUpdates.map(({event,normalized}) => db.prepare("UPDATE pledge SET shareholder=?,pledgee=? WHERE id=?").bind(normalized.shareholder,normalized.pledgee,event.id)));
-  const ids = [...new Set(normalizedEvents.filter(({normalized}) => normalized.missing.length).map(({event}) => event.announcement_id))];
+  // Human verification is authoritative. Automated quality rules may annotate a
+  // manually confirmed row, but must never delete it or reopen its review.
+  const ids = [...new Set(normalizedEvents.filter(({normalized,humanVerified}) => !humanVerified&&normalized.missing.length).map(({event}) => event.announcement_id))];
   if (ids.length) {
     for (const id of ids) await db.batch([
       db.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(id),
       db.prepare("UPDATE announcement SET parse_status='review',last_error='strict data quality validation rejected parser output' WHERE announcement_id=?").bind(id),
-      db.prepare("UPDATE review_queue SET status='pending',reviewed_at=NULL,reviewer=NULL,reason='严格数据校验未通过：实体、数量或比例需要复核' WHERE announcement_id=?").bind(id),
+      db.prepare("UPDATE review_queue SET status='pending',reviewed_at=NULL,reviewer=NULL,reason='自动发布校验未通过：股东、质权人、数量或质押日期需要复核' WHERE announcement_id=?").bind(id),
     ]);
   }
   await db.prepare("DELETE FROM pledge WHERE id NOT IN (SELECT MIN(id) FROM pledge GROUP BY announcement_id,shareholder,pledgee,pledge_amount_text,pledge_ratio,total_ratio,type,announce_date)").run();
@@ -415,13 +421,19 @@ function normalizeVisionRows(value: unknown, title: string): ParsedPledge[] {
   const source = Array.isArray(value) ? value : (value && typeof value === "object" && Array.isArray((value as {events?:unknown[]}).events) ? (value as {events:unknown[]}).events : []);
   return source.map((entry) => {
     const row = entry as Record<string, unknown>; const amountText = String(row.pledge_amount ?? row.amount ?? "");
-    const parsed = { shareholder:String(row.shareholder ?? "").trim(), pledgee:String(row.pledgee ?? "").trim(), amount:amountNumber(amountText), amountText, pledgeRatio:String(row.pledge_ratio ?? ""), totalRatio:String(row.total_ratio ?? ""), startDate:String(row.start_date ?? ""), endDate:String(row.end_date ?? ""), purpose:String(row.purpose ?? ""), type:String(row.type ?? pledgeType(title)), missing:[] as unknown[] };
+    const parsed = { shareholder:String(row.shareholder ?? "").trim(), pledgee:String(row.pledgee ?? "").trim(), amount:amountNumber(amountText), amountText, pledgeRatio:"", totalRatio:"", startDate:String(row.pledge_date ?? row.start_date ?? ""), endDate:"", purpose:"", type:String(row.type ?? pledgeType(title)), missing:[] as unknown[] };
     parsed.missing = [!parsed.shareholder && "股东", !parsed.pledgee && "质权人", !parsed.amount && "质押数量"].filter(Boolean);
     return parsed as ParsedPledge;
   });
 }
 
-const validateParsedRows = (rows: ParsedPledge[]) => rows.map((row) => validateAndNormalizePledgeRow(row));
+const validPledgeDate=(value:string)=>/^\d{4}-\d{2}-\d{2}$/.test(value)&&!Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+const validateForAutomaticPublication=(input:ParsedPledge)=>{
+  const row=validateAndNormalizePledgeRow(input);
+  if(row.type===NEW_PLEDGE_TYPE&&!validPledgeDate(row.startDate)&&!row.missing.includes("质押日期"))row.missing.push("质押日期");
+  return row;
+};
+const validateParsedRows = (rows: ParsedPledge[]) => rows.map(validateForAutomaticPublication);
 
 type OpenAIUsage = {input_tokens?:number;output_tokens?:number;total_tokens?:number;input_tokens_details?:{cached_tokens?:number}};
 type OpenAIErrorCategory = "billing"|"rate_limit"|"transient"|"invalid_request"|"invalid_response";
@@ -469,16 +481,15 @@ async function parseWithOpenAI(pdfBase64: string, context: { title:string; stock
     type:"object", additionalProperties:false, required:["events"],
     properties:{events:{type:"array",maxItems:50,items:{
       type:"object", additionalProperties:false,
-      required:["shareholder","pledgee","pledge_amount","pledge_ratio","total_ratio","start_date","end_date","purpose","type"],
+      required:["shareholder","pledgee","pledge_amount","pledge_date","type"],
       properties:{
         shareholder:{type:"string"}, pledgee:{type:"string"}, pledge_amount:{type:"string"},
-        pledge_ratio:{type:"string"}, total_ratio:{type:"string"}, start_date:{type:"string"},
-        end_date:{type:"string"}, purpose:{type:"string"},
+        pledge_date:{type:"string"},
         type:{type:"string",enum:["新增质押"]},
       },
     }}},
   };
-  const prompt = `你是A股新增质押公告的数据审核员。请逐页读取官方公告，只提取公告正文中明确披露的新增股份质押记录。解除质押、解除后再质押、再质押、补充质押、质押展期或延期购回全部忽略，不得输出。\n股票：${context.stockCode} ${context.stockName}\n公告日期：${context.announceDate}\n标题：${context.title}\n要求：1）表格每一行对应一笔新增质押，不合并不同股东、质权人或质押日期；2）股份数量保留公告原始单位和文本；3）质押日期没有披露时返回空字符串；4）股东、质权人或数量无法从公告确认时保留空字符串，严禁推测；5）不要把表头、合计行、说明文字识别为主体名称；6）type固定返回“新增质押”。`;
+  const prompt = `你是A股新增质押公告的数据审核员。请逐页读取官方公告，只提取公告正文中明确披露的新增股份质押记录。解除质押、解除后再质押、再质押、补充质押、质押展期或延期购回全部忽略，不得输出。\n股票：${context.stockCode} ${context.stockName}\n公告日期：${context.announceDate}\n标题：${context.title}\n只输出五个事件字段：shareholder、pledgee、pledge_amount、pledge_date、type。要求：1）表格每一行对应一笔新增质押，不合并不同股东、质权人或质押日期；2）股份数量保留公告原始单位和文本；3）质押日期统一为YYYY-MM-DD，没有披露时返回空字符串；4）任何字段无法从公告确认时保留空字符串，严禁推测；5）不要把表头、合计行、说明文字识别为主体名称；6）type固定返回“新增质押”。`;
   const startedAt=Date.now();const clientRequestId=crypto.randomUUID();
   const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json", "x-client-request-id":clientRequestId }, body:JSON.stringify({
     model,
@@ -574,7 +585,7 @@ async function legacyProcessAnnouncement(db: D1Database, documents: R2Bucket, id
   return { id, status: "parsed", event: parsed };
 }
 
-async function processAnnouncement(db: D1Database, documents: R2Bucket, id: string, env?: Env, options: {forceOpenAI?:boolean} = {}) {
+async function processAnnouncement(db: D1Database, documents: R2Bucket, id: string, env?: Env, options: {forceOpenAI?:boolean;allowFreshVersionAttempt?:boolean} = {}) {
   const item = await db.prepare("SELECT announcement_id AS id,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,r2_key AS r2Key,sha256,parse_attempts AS parseAttempts FROM announcement WHERE announcement_id=?").bind(id).first<{id:string;stockCode:string;stockName:string;title:string;announceDate:string;pdfUrl:string;r2Key?:string;sha256?:string;parseAttempts:number}>();
   if (!item) throw new Error("announcement not found");
   let bytes: ArrayBuffer; let r2Key = item.r2Key; let sha256 = item.sha256;
@@ -591,7 +602,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
   const pages = Array.isArray(extracted.text) ? extracted.text.map((page)=>String(page)) : [String(extracted.text||"")];
   const text = pages.join("\n\f\n");
   await documents.put(`announcements/${id}.txt`,text,{httpMetadata:{contentType:"text/plain; charset=utf-8"}});
-  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.4"; let confidence = rows.length > 1 ? 0.9 : 0.86;
+  let rows = validateParsedRows(parsePledgeRows(text,item.title)); let parserVersion = "unpdf-table-rules-v2.5-six-fields"; let confidence = rows.length > 1 ? 0.9 : 0.86;
   const localIncomplete = !rows.length || rows.some((row) => row.missing.length > 0);
   let openaiMeta: {model:string;responseId:string;requestId:string;usage:OpenAIUsage|null;durationMs:number} | null = null;
   let openaiError = "";
@@ -599,7 +610,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
     ? await db.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>()
     : null;
   const quotaBlocked = Boolean(quotaState?.value && Date.parse(quotaState.value) > Date.now());
-  const openaiAllowed = Boolean(env?.OPENAI_API_KEY) && !quotaBlocked && ((item.parseAttempts || 0) < 3 || options.forceOpenAI === true);
+  const openaiAllowed = Boolean(env?.OPENAI_API_KEY) && !quotaBlocked && ((item.parseAttempts || 0) < 3 || options.forceOpenAI === true || options.allowFreshVersionAttempt === true);
   let openaiAttempted = false;
   if (localIncomplete && openaiAllowed && env) {
     openaiAttempted = true;
@@ -607,7 +618,7 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
       const reviewed = await parseWithOpenAI(arrayBufferToBase64(bytes),{title:item.title,stockCode:item.stockCode,stockName:item.stockName,announceDate:item.announceDate},env);
       if (reviewed.rows.length) {
         rows = reviewed.rows;
-        parserVersion = `openai-${reviewed.model}-pledge-v1`;
+        parserVersion = `openai-${reviewed.model}-pledge-v2-six-fields`;
         confidence = 0.94;
         openaiMeta = {model:reviewed.model,responseId:reviewed.responseId,requestId:reviewed.requestId,usage:reviewed.usage,durationMs:reviewed.durationMs};
       }
@@ -740,10 +751,10 @@ async function runEvidenceBackfill(env:Env,requestedLimit=5) {
 
 async function runParserUpgradeRetry(env:Env,requestedLimit=3) {
   const limit=Math.min(Math.max(requestedLimit,1),5);const startedAt=new Date().toISOString();
-  const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("parser-upgrade-retry",startedAt,"running",`使用规则解析器v2.4重试最多 ${limit} 份待审核公告`).first<{id:number}>();
-  const candidates=await env.DB.prepare("SELECT a.announcement_id AS id FROM announcement a JOIN review_queue r ON r.announcement_id=a.announcement_id AND r.status='pending' WHERE a.parse_status='review' AND a.parse_attempts<2 AND NOT EXISTS (SELECT 1 FROM audit_log l WHERE l.entity_type='announcement' AND l.entity_id=a.announcement_id AND l.action='parser_upgrade_v2_4_attempt') GROUP BY a.announcement_id ORDER BY a.announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
+  const run=await env.DB.prepare("INSERT INTO sync_run (source,started_at,status,message) VALUES (?,?,?,?) RETURNING id").bind("parser-upgrade-retry",startedAt,"running",`使用六字段规则解析器v2.5重试最多 ${limit} 份待审核公告`).first<{id:number}>();
+  const candidates=await env.DB.prepare("SELECT a.announcement_id AS id FROM announcement a JOIN review_queue r ON r.announcement_id=a.announcement_id AND r.status='pending' WHERE a.parse_status='review' AND NOT EXISTS (SELECT 1 FROM audit_log l WHERE l.entity_type='announcement' AND l.entity_id=a.announcement_id AND l.action='parser_upgrade_v2_5_six_fields_attempt') GROUP BY a.announcement_id ORDER BY a.announce_date DESC LIMIT ?").bind(limit).all<{id:string}>();
   const results:unknown[]=[];let eventsCreated=0;let unresolved=0;let failures=0;
-  for(const row of candidates.results){try{const result=await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env);eventsCreated+=result.event_count||result.events_created||0;if(result.status!=="parsed")unresolved++;results.push(result);await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",row.id,"parser_upgrade_v2_4_attempt",JSON.stringify(result),"parser-upgrade-worker",new Date().toISOString()).run();}catch(error){failures++;const message=error instanceof Error?error.message:"parser upgrade retry failed";await env.DB.batch([env.DB.prepare("UPDATE announcement SET parse_attempts=parse_attempts+1,last_error=? WHERE announcement_id=?").bind(message,row.id),env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",row.id,"parser_upgrade_v2_4_attempt",JSON.stringify({error:message}),"parser-upgrade-worker",new Date().toISOString())]);results.push({id:row.id,status:"failed",error:message});}}
+  for(const row of candidates.results){try{const result=await processAnnouncement(env.DB,env.DOCUMENTS,row.id,env,{allowFreshVersionAttempt:true});eventsCreated+=result.event_count||result.events_created||0;if(result.status!=="parsed")unresolved++;results.push(result);await env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",row.id,"parser_upgrade_v2_5_six_fields_attempt",JSON.stringify(result),"parser-upgrade-worker",new Date().toISOString()).run();}catch(error){failures++;const message=error instanceof Error?error.message:"parser upgrade retry failed";await env.DB.batch([env.DB.prepare("UPDATE announcement SET parse_attempts=parse_attempts+1,last_error=? WHERE announcement_id=?").bind(message,row.id),env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",row.id,"parser_upgrade_v2_5_six_fields_attempt",JSON.stringify({error:message}),"parser-upgrade-worker",new Date().toISOString())]);results.push({id:row.id,status:"failed",error:message});}}
   const finishedAt=new Date().toISOString();await env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(finishedAt,failures||unresolved?"completed_with_errors":"completed",candidates.results.length,eventsCreated,failures,`重试 ${candidates.results.length} 份，生成 ${eventsCreated} 条事件，仍待审核 ${unresolved} 份，失败 ${failures} 份`,run?.id).run();
   return {runId:run?.id,processed:candidates.results.length,eventsCreated,unresolved,failures,results,finishedAt};
 }

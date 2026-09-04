@@ -49,6 +49,12 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /人工审核队列已清零，自动升级最终关账版本/);
   assert.match(worker, /manual_validation_override/);
   assert.match(worker, /自动质量规则仅作提示，人工审核结论优先/);
+  assert.match(worker, /Human verification is authoritative/);
+  assert.match(worker, /verification_status===\"human_verified\"/);
+  assert.match(worker, /unpdf-table-rules-v2\.5-six-fields/);
+  assert.match(worker, /pledge-v2-six-fields/);
+  assert.match(worker, /parser_upgrade_v2_5_six_fields_attempt/);
+  assert.match(worker, /allowFreshVersionAttempt/);
   assert.doesNotMatch(worker, /人工审核数据未通过严格校验/);
   assert.match(worker, /key\.startsWith\(\"announcements\/\"\)/);
   assert.match(worker, /review already completed/);
@@ -114,7 +120,7 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /async scheduled\(/);
   assert.match(worker, /cloudflare_cron_last/);
   assert.match(worker, /parseSectionPledgeRows/);
-  assert.match(worker, /unpdf-table-rules-v2\.4/);
+  assert.match(worker, /unpdf-table-rules-v2\.5-six-fields/);
   assert.match(worker, /const nextCursor=failures\?cursor:dates\[dates\.length-1\]/);
   assert.match(worker, /successfulQueries/);
   assert.match(worker, /sourceWarnings/);
