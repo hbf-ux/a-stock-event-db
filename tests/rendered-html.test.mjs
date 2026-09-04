@@ -28,10 +28,20 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(daily,/三所公告对账/);
   assert.match(daily,/未关账，不标注完整清单/);
   assert.match(daily,/提交撮合需求/);
+  assert.match(daily,/当日全部新增质押明细/);
+  assert.match(daily,/股票名称/);
+  assert.match(daily,/股票代码/);
+  assert.match(daily,/质押股票数量/);
+  assert.match(daily,/质押日期/);
+  assert.doesNotMatch(daily,/占个人持股/);
   assert.match(worker, /from "unpdf"/);
   assert.match(worker, /async function processAnnouncement/);
   assert.match(worker, /parse_status='parsed'/);
-  assert.match(worker, /manual-review-v3/);
+  assert.match(worker, /manual-review-v4-new-only/);
+  assert.match(worker, /NEW_PLEDGE_TYPE/);
+  assert.match(worker, /enforceNewPledgeOnlyPolicy/);
+  assert.match(worker, /excluded_by_new_pledge_only_policy/);
+  assert.match(worker, /HBF-A-share-new-pledge-daily/);
   assert.match(worker, /\/api\/review-documents\//);
   assert.match(worker, /events\?:ManualEventInput\[\]/);
   assert.match(worker, /human_verified/);
@@ -266,7 +276,7 @@ test("commercial intelligence pages are wired to verified event data", async () 
   assert.match(await readFile(new URL("drizzle/0013_rare_purifiers.sql",root),"utf8"),/CREATE TABLE `daily_report`/);
 });
 
-test("manual review desk supports PDF-side-by-side multi-event verification", async()=>{
+test("manual review desk supports PDF-side-by-side new-pledge verification", async()=>{
   const [page,workbench,styles]=await Promise.all([
     readFile(new URL("app/review/page.tsx",root),"utf8"),
     readFile(new URL("app/review/review-workbench.tsx",root),"utf8"),
@@ -275,14 +285,18 @@ test("manual review desk supports PDF-side-by-side multi-event verification", as
   assert.match(page,/ReviewWorkbench/);
   assert.match(workbench,/\/api\/reviews\?/);
   assert.match(workbench,/archivedPdfUrl/);
-  assert.match(workbench,/官方PDF/);
+  assert.match(workbench,/打开PDF/);
   assert.match(workbench,/新增一行/);
-  assert.match(workbench,/确认入库/);
-  assert.match(workbench,/非质押事件 \/ 排除/);
+  assert.match(workbench,/确认新增质押入库/);
+  assert.match(workbench,/非新增质押 \/ 排除/);
   assert.match(workbench,/重新规则解析/);
   assert.match(workbench,/人工结论优先/);
   assert.match(workbench,/不会阻止提交/);
-  assert.match(workbench,/按人工结论入库/);
+  assert.match(workbench,/只录入新增质押/);
+  assert.match(workbench,/质押股票数量/);
+  assert.match(workbench,/质押日期/);
+  assert.doesNotMatch(workbench,/占个人持股/);
+  assert.doesNotMatch(workbench,/占总股本/);
   assert.match(workbench,/Ctrl/);
   assert.match(workbench,/signin-with-chatgpt/);
   assert.match(styles,/grid-template-columns:280px minmax\(420px,1\.25fr\) minmax\(450px,1fr\)/);

@@ -263,6 +263,26 @@ const firstMatch = (text: string, patterns: RegExp[]) => {
   return "";
 };
 const pledgeType = (title: string) => title.includes("延期") || title.includes("展期") ? "质押展期" : title.includes("解除") && (title.includes("再质押") || title.includes("继续质押")) ? "解除后再质押" : title.includes("解除") ? "解除质押" : title.includes("补充") ? "补充质押" : "新增质押";
+const NEW_PLEDGE_TYPE = "新增质押";
+const isExplicitlyNonNewPledgeTitle = (title:string) => {
+  const compact=String(title||"").replace(/\s+/g,"");
+  if(/补充质押|质押展期|质押延期|延期购回/.test(compact))return true;
+  if(/解除(?:股份)?质押(?:后|并|及|暨)?(?:再|继续)质押|解除后再质押/.test(compact))return true;
+  if(/解除质押|股份解质/.test(compact)&&!/股份质押(?:及|并|暨).*解除质押/.test(compact))return true;
+  return false;
+};
+
+async function enforceNewPledgeOnlyPolicy(db:D1Database,date:string,actor:string){
+  const pending=await db.prepare("SELECT DISTINCT a.announcement_id AS id,a.title FROM announcement a JOIN review_queue r ON r.announcement_id=a.announcement_id WHERE a.report_date=? AND r.status='pending'").bind(date).all<{id:string;title:string}>();
+  const excluded=pending.results.filter((row)=>isExplicitlyNonNewPledgeTitle(row.title));const now=new Date().toISOString();
+  const statements:D1PreparedStatement[]=[db.prepare("DELETE FROM pledge WHERE type<>?").bind(NEW_PLEDGE_TYPE)];
+  for(const row of excluded){statements.push(
+    db.prepare("UPDATE announcement SET parse_status='ignored',last_error=NULL WHERE announcement_id=?").bind(row.id),
+    db.prepare("UPDATE review_queue SET status='rejected',reason='仅保留新增质押，已自动排除非新增类型',reviewed_at=?,reviewer=?,resolution=? WHERE announcement_id=? AND status='pending'").bind(now,actor,"解除、解除后再质押、补充质押及展期不纳入结构化数据",row.id),
+    db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",row.id,"excluded_by_new_pledge_only_policy",JSON.stringify({title:row.title,scope:NEW_PLEDGE_TYPE}),actor,now),
+  );}
+  await db.batch(statements);return {removedLegacyNonNew:true,excludedAnnouncements:excluded.length};
+}
 
 type OfficialCorrectionEvent = {shareholder:string;pledgee:string;amount:number;amountText:string;pledgeRatio:string;totalRatio:string;startDate:string;endDate:string;purpose:string;type:string};
 type OfficialCorrection = {stockCode:string;stockName:string;events:OfficialCorrectionEvent[]};
@@ -454,11 +474,11 @@ async function parseWithOpenAI(pdfBase64: string, context: { title:string; stock
         shareholder:{type:"string"}, pledgee:{type:"string"}, pledge_amount:{type:"string"},
         pledge_ratio:{type:"string"}, total_ratio:{type:"string"}, start_date:{type:"string"},
         end_date:{type:"string"}, purpose:{type:"string"},
-        type:{type:"string",enum:["新增质押","补充质押","解除质押","解除后再质押","质押展期"]},
+        type:{type:"string",enum:["新增质押"]},
       },
     }}},
   };
-  const prompt = `你是A股股权质押公告的数据审核员。请逐页读取官方公告，只提取公告正文中明确披露的本次质押、补充质押、解除质押记录。\n股票：${context.stockCode} ${context.stockName}\n公告日期：${context.announceDate}\n标题：${context.title}\n要求：1）表格每一行对应一个事件，不合并不同股东、质权人或日期；2）股份数量保留公告原始单位和文本；3）比例、日期、用途没有披露时返回空字符串；4）股东、质权人或数量无法从公告确认时保留空字符串，严禁推测；5）不要把表头、合计行、说明文字识别为主体名称。`;
+  const prompt = `你是A股新增质押公告的数据审核员。请逐页读取官方公告，只提取公告正文中明确披露的新增股份质押记录。解除质押、解除后再质押、再质押、补充质押、质押展期或延期购回全部忽略，不得输出。\n股票：${context.stockCode} ${context.stockName}\n公告日期：${context.announceDate}\n标题：${context.title}\n要求：1）表格每一行对应一笔新增质押，不合并不同股东、质权人或质押日期；2）股份数量保留公告原始单位和文本；3）质押日期没有披露时返回空字符串；4）股东、质权人或数量无法从公告确认时保留空字符串，严禁推测；5）不要把表头、合计行、说明文字识别为主体名称；6）type固定返回“新增质押”。`;
   const startedAt=Date.now();const clientRequestId=crypto.randomUUID();
   const response = await fetchWithRetry("https://api.openai.com/v1/responses", { method:"POST", headers:{ authorization:`Bearer ${env.OPENAI_API_KEY}`, "content-type":"application/json", "x-client-request-id":clientRequestId }, body:JSON.stringify({
     model,
@@ -608,7 +628,17 @@ async function processAnnouncement(db: D1Database, documents: R2Bucket, id: stri
       ]);
     }
   }
-  const completeRows = rows.filter((row) => !row.missing.length); const parsed = rows[0]; const now = new Date().toISOString();
+  const excludedRows=rows.filter((row)=>row.type!==NEW_PLEDGE_TYPE);rows=rows.filter((row)=>row.type===NEW_PLEDGE_TYPE);const now = new Date().toISOString();
+  if(!rows.length&&(excludedRows.length||isExplicitlyNonNewPledgeTitle(item.title))){
+    await db.batch([
+      db.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(id),
+      db.prepare("UPDATE announcement SET r2_key=?,sha256=?,parse_status='ignored',last_error=NULL,parse_attempts=0 WHERE announcement_id=?").bind(r2Key,sha256,id),
+      db.prepare("UPDATE review_queue SET status='rejected',reason='仅保留新增质押，已自动排除非新增类型',reviewed_at=?,reviewer='new-pledge-only-policy',resolution=? WHERE announcement_id=? AND status='pending'").bind(now,"解除、解除后再质押、补充质押及展期不纳入结构化数据",id),
+      db.prepare("INSERT INTO audit_log (entity_type,entity_id,action,after_json,actor,created_at) VALUES (?,?,?,?,?,?)").bind("announcement",id,"excluded_by_new_pledge_only_policy",JSON.stringify({title:item.title,excludedTypes:[...new Set(excludedRows.map((row)=>row.type))]}),"new-pledge-only-policy",now),
+    ]);
+    return {id,status:"ignored",reason:"non_new_pledge",excluded_types:[...new Set(excludedRows.map((row)=>row.type))],event_count:0};
+  }
+  const completeRows = rows.filter((row) => !row.missing.length); const parsed = rows[0];
   const verificationStatus = openaiMeta ? "ai_reviewed" : "rules_validated";
   const verifiedAt = openaiMeta ? now : null;
   const verifiedBy = openaiMeta ? "openai" : "rules-engine";
@@ -956,6 +986,7 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
   const startedAt=new Date().toISOString();
   try{
     const ingestion=await ingestCninfo(env.DB,date);
+    const scopePolicy=await enforceNewPledgeOnlyPolicy(env.DB,date,"automatic-production");
     const beforeReconciliation=await dailyReportSnapshot(env.DB,date);
     const lastReconciliationAt=Date.parse(String(beforeReconciliation.reconciliation.lastRun?.finishedAt||""));
     const closedTradingDate=date<shanghaiDate();
@@ -978,7 +1009,7 @@ async function runDailyProductionCycle(env:Env,date:string,runId:number,viewer:s
         ?await publishDailyReport(env,date,"automatic-production","21:00自动临时发布：仅包含已核验事件，未决公告完成后自动升级最终版","provisional")
         :null;
     const finishedAt=new Date().toISOString();
-    const result={date,ingestion,reconciliation:{found:reconciliation.found,failures:reconciliation.failures,results:reconciliation.results},processing,reviews,closing,startedAt,finishedAt};
+    const result={date,ingestion,scopePolicy,reconciliation:{found:reconciliation.found,failures:reconciliation.failures,results:reconciliation.results},processing,reviews,closing,startedAt,finishedAt};
     await env.DB.batch([
       env.DB.prepare("UPDATE sync_run SET finished_at=?,status=?,announcements_found=?,events_created=?,failures=?,message=? WHERE id=?").bind(finishedAt,(reconciliation.failures||processing.failures)?"completed_with_errors":"completed",ingestion.found,processing.events_created,reconciliation.failures+processing.failures,JSON.stringify(result),runId),
       env.DB.prepare("INSERT INTO pipeline_state (key,value,updated_at) VALUES ('daily_production_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify(result),finishedAt),
@@ -1096,8 +1127,8 @@ async function applyStripeEvent(db:D1Database,env:Env,event:StripeEvent,rawBody:
 async function dailyReportSnapshot(db:D1Database,date:string) {
   const [announcement,event,verification,reconciliationRun,unresolved,published] = await Promise.all([
     db.prepare("SELECT COUNT(*) AS total,SUM(CASE WHEN parse_status IN ('parsed','ignored','rejected') THEN 1 ELSE 0 END) AS classified,SUM(CASE WHEN parse_status NOT IN ('parsed','ignored','rejected') THEN 1 ELSE 0 END) AS pending,SUM(CASE WHEN parse_status IN ('queued','archived','processing') THEN 1 ELSE 0 END) AS processing,SUM(CASE WHEN parse_status='review' THEN 1 ELSE 0 END) AS review FROM announcement WHERE report_date=?").bind(date).first<{total:number;classified:number;pending:number;processing:number;review:number}>(),
-    db.prepare("SELECT COUNT(*) AS total,COUNT(DISTINCT p.stock_code) AS companies,SUM(CASE WHEN p.type LIKE '%解除%' THEN 1 ELSE 0 END) AS releases,SUM(CASE WHEN p.type LIKE '%补充%' THEN 1 ELSE 0 END) AS supplemental FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=?").bind(date).first<{total:number;companies:number;releases:number;supplemental:number}>(),
-    db.prepare("SELECT SUM(CASE WHEN p.verification_status='human_verified' THEN 1 ELSE 0 END) AS humanVerified,SUM(CASE WHEN p.verification_status='ai_reviewed' THEN 1 ELSE 0 END) AS aiReviewed,SUM(CASE WHEN p.verification_status='rules_validated' THEN 1 ELSE 0 END) AS rulesValidated FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=?").bind(date).first(),
+    db.prepare("SELECT COUNT(*) AS total,COUNT(DISTINCT p.stock_code) AS companies,0 AS releases,0 AS supplemental FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? AND p.type=?").bind(date,NEW_PLEDGE_TYPE).first<{total:number;companies:number;releases:number;supplemental:number}>(),
+    db.prepare("SELECT SUM(CASE WHEN p.verification_status='human_verified' THEN 1 ELSE 0 END) AS humanVerified,SUM(CASE WHEN p.verification_status='ai_reviewed' THEN 1 ELSE 0 END) AS aiReviewed,SUM(CASE WHEN p.verification_status='rules_validated' THEN 1 ELSE 0 END) AS rulesValidated FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? AND p.type=?").bind(date,NEW_PLEDGE_TYPE).first(),
     db.prepare("SELECT id,started_at AS startedAt,finished_at AS finishedAt,status,message FROM sync_run WHERE source='exchange-reconciliation' AND json_valid(message) AND json_extract(message,'$.date')=? ORDER BY id DESC LIMIT 1").bind(date).first<{id:number;startedAt:string;finishedAt:string;status:string;message:string}>(),
     db.prepare("SELECT COUNT(*) AS total FROM exchange_observation WHERE announce_date=? AND ((match_status IN ('likely','ambiguous') AND review_status='pending') OR (match_status='missing_primary' AND review_status='pending'))").bind(date).first<{total:number}>(),
     db.prepare("SELECT date,cutoff_at AS cutoffAt,status,announcement_count AS announcementCount,event_count AS eventCount,company_count AS companyCount,pending_count AS pendingCount,reconciliation_unresolved AS reconciliationUnresolved,reconciliation_status AS reconciliationStatus,report_version AS reportVersion,published_at AS publishedAt,notes FROM daily_report WHERE date=?").bind(date).first(),
@@ -1118,24 +1149,24 @@ async function dailyReportSnapshot(db:D1Database,date:string) {
   return {date,cutoffAt,publicationDeadlineAt,publicationDue,publicationOverdue,status,ready,cutoffPassed,announcement:announcement||{total:0,classified:0,pending:0},event:event||{total:0,companies:0,releases:0,supplemental:0},verification:verification||{},reconciliation:{complete:reconciliationComplete,successfulSources,requiredSources:3,unresolved:Number(unresolved?.total||0),sourceRuns,lastRun:reconciliationRun||null},published:published||null};
 }
 
-type DailyArtifactEvent={announcementId:string;code:string;name:string;shareholder:string;pledgee:string;amount:string;ratio:string;type:string;verificationStatus:string};
+type DailyArtifactEvent={announcementId:string;code:string;name:string;shareholder:string;pledgee:string;amount:string;pledgeDate:string};
 const xmlEscape=(value:unknown)=>String(value??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&apos;");
 const compactArtifactText=(value:unknown,limit:number)=>{const text=String(value??"—").replace(/\s+/g," ").trim()||"—";return text.length>limit?`${text.slice(0,Math.max(1,limit-1))}…`:text;};
-const dailyArtifactKey=(date:string,version:number,extension:"png"|"pdf")=>`daily-reports/${date}/HBF-A-share-pledge-daily-v${version}.${extension}`;
+const dailyArtifactKey=(date:string,version:number,extension:"png"|"pdf")=>`daily-reports/${date}/HBF-A-share-new-pledge-daily-v${version}.${extension}`;
 
 function renderDailyReportSvg(date:string,version:number,events:DailyArtifactEvent[],publicationKind:"provisional"|"final",pendingCount=0){
   const width=1500,rowHeight=112,top=458,height=Math.max(920,top+events.length*rowHeight+160);
-  const highRatio=events.filter((row)=>Number.parseFloat(row.ratio)>=50).length;
   const companies=new Set(events.map((row)=>row.code)).size;
-  const supplemental=events.filter((row)=>row.type.includes("补充")).length;
-  const cells=[70,230,475,770,1030,1240];
-  const metrics=[["质押事件",events.length],["涉及公司",companies],["补充质押",supplemental],["高比例信号",highRatio]];
+  const shareholders=new Set(events.map((row)=>row.shareholder).filter(Boolean)).size;
+  const pledgees=new Set(events.map((row)=>row.pledgee).filter(Boolean)).size;
+  const cells=[70,245,400,625,930,1210];
+  const metrics=[["新增质押",events.length],["涉及公司",companies],["质押股东",shareholders],["质权人",pledgees]];
   const metricSvg=metrics.map(([label,value],index)=>{const x=70+index*350;return `<g><rect x="${x}" y="280" width="310" height="115" rx="8" fill="#fff"/><text x="${x+24}" y="322" class="metricLabel">${label}</text><text x="${x+24}" y="374" class="metricValue">${value}</text></g>`;}).join("");
-  const rows=events.map((row,index)=>{const y=top+index*rowHeight;return `<g>${index%2===0?`<rect x="50" y="${y-10}" width="1400" height="${rowHeight}" fill="#ebe6dc"/>`:""}<text x="${cells[0]}" y="${y+30}" class="rowStrong">${xmlEscape(compactArtifactText(`${row.name} ${row.code}`,14))}</text><text x="${cells[1]}" y="${y+30}" class="row">${xmlEscape(compactArtifactText(row.shareholder,15))}</text><text x="${cells[2]}" y="${y+30}" class="row">${xmlEscape(compactArtifactText(row.pledgee,18))}</text><text x="${cells[3]}" y="${y+30}" class="rowStrong">${xmlEscape(compactArtifactText(row.amount,16))}</text><text x="${cells[4]}" y="${y+30}" class="rowStrong">${xmlEscape(row.ratio||"—")}</text><text x="${cells[5]}" y="${y+30}" class="row">${xmlEscape(compactArtifactText(row.type,8))}</text><text x="${cells[0]}" y="${y+70}" class="evidence">公告 ${xmlEscape(compactArtifactText(row.announcementId,38))} · ${xmlEscape(row.verificationStatus||"已核验")}</text></g>`;}).join("");
-  const headers=["股票","质押股东","质权人","股份数量","占个人持股","事件"].map((label,index)=>`<text x="${cells[index]}" y="440" class="tableHead">${label}</text>`).join("");
+  const rows=events.map((row,index)=>{const y=top+index*rowHeight;return `<g>${index%2===0?`<rect x="50" y="${y-10}" width="1400" height="${rowHeight}" fill="#ebe6dc"/>`:""}<text x="${cells[0]}" y="${y+42}" class="rowStrong">${xmlEscape(compactArtifactText(row.name,10))}</text><text x="${cells[1]}" y="${y+42}" class="row">${xmlEscape(row.code||"—")}</text><text x="${cells[2]}" y="${y+42}" class="row">${xmlEscape(compactArtifactText(row.shareholder,15))}</text><text x="${cells[3]}" y="${y+42}" class="row">${xmlEscape(compactArtifactText(row.pledgee,18))}</text><text x="${cells[4]}" y="${y+42}" class="rowStrong">${xmlEscape(compactArtifactText(row.amount,16))}</text><text x="${cells[5]}" y="${y+42}" class="row">${xmlEscape(row.pledgeDate||"—")}</text></g>`;}).join("");
+  const headers=["股票名称","股票代码","质押股东","质权人","质押股票数量","质押日期"].map((label,index)=>`<text x="${cells[index]}" y="440" class="tableHead">${label}</text>`).join("");
   const releaseLabel=publicationKind==="final"?`正式版本 V${version}`:`临时版本 V${version}｜${pendingCount} 份公告/差异未决`;
   const footer=publicationKind==="final"?`已关账发布｜事件 ${events.length} 条｜PNG 与 PDF 生成自同一份锁定数据`:`临时发布｜已核验事件 ${events.length} 条｜未决 ${pendingCount} 份｜完成后自动升级最终版`;
-  return {width,height,svg:`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><style>text{font-family:'Noto Sans CJK SC','Microsoft YaHei',sans-serif}.brand{font-size:32px;font-weight:700;fill:#fff}.date{font-size:62px;font-weight:700;fill:#fff}.subtitle{font-size:24px;fill:#b9c9e4}.metricLabel{font-size:22px;fill:#65728a}.metricValue{font-size:42px;font-weight:700;fill:#0b1f3a}.tableHead{font-size:21px;font-weight:700;fill:#0b1f3a}.row{font-size:21px;fill:#12213a}.rowStrong{font-size:22px;font-weight:700;fill:#12213a}.evidence{font-size:17px;fill:#718096}.footer{font-size:20px;fill:#0b1f3a}.watermark{font-size:46px;font-weight:700;fill:#0b1f3a;opacity:.22}</style><rect width="${width}" height="${height}" fill="#f4f0e8"/><rect width="${width}" height="250" fill="#0b1f3a"/><text x="70" y="72" class="brand">HBF · A股质押日报</text><text x="70" y="158" class="date">${date}</text><text x="70" y="207" class="subtitle">20:00截止｜21:00发布｜三所交叉核验｜${releaseLabel}</text>${metricSvg}${headers}${rows}<text x="70" y="${height-72}" class="footer">${footer}</text><text x="1430" y="${height-62}" text-anchor="end" class="watermark">HBF</text></svg>`};
+  return {width,height,svg:`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><style>text{font-family:'Noto Sans CJK SC','Microsoft YaHei',sans-serif}.brand{font-size:32px;font-weight:700;fill:#fff}.date{font-size:62px;font-weight:700;fill:#fff}.subtitle{font-size:24px;fill:#b9c9e4}.metricLabel{font-size:22px;fill:#65728a}.metricValue{font-size:42px;font-weight:700;fill:#0b1f3a}.tableHead{font-size:21px;font-weight:700;fill:#0b1f3a}.row{font-size:21px;fill:#12213a}.rowStrong{font-size:22px;font-weight:700;fill:#12213a}.footer{font-size:20px;fill:#0b1f3a}.watermark{font-size:46px;font-weight:700;fill:#0b1f3a;opacity:.22}</style><rect width="${width}" height="${height}" fill="#f4f0e8"/><rect width="${width}" height="250" fill="#0b1f3a"/><text x="70" y="72" class="brand">HBF · A股新增质押日报</text><text x="70" y="158" class="date">${date}</text><text x="70" y="207" class="subtitle">20:00截止｜21:00发布｜三所交叉核验｜${releaseLabel}</text>${metricSvg}${headers}${rows}<text x="70" y="${height-72}" class="footer">${footer}</text><text x="1430" y="${height-62}" text-anchor="end" class="watermark">HBF</text></svg>`};
 }
 
 function pdfFromJpeg(jpeg:ArrayBuffer,width:number,height:number){
@@ -1151,7 +1182,7 @@ function pdfFromJpeg(jpeg:ArrayBuffer,width:number,height:number){
 }
 
 async function generateDailyReportArtifacts(env:Env,date:string,version:number,publicationKind:"provisional"|"final"="final",pendingCount=0){
-  const eventResult=await env.DB.prepare("SELECT p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.type,p.verification_status AS verificationStatus FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? ORDER BY CASE WHEN p.type LIKE '%补充%' THEN 0 WHEN p.type NOT LIKE '%解除%' THEN 1 ELSE 2 END,p.id DESC").bind(date).all<DailyArtifactEvent>();
+  const eventResult=await env.DB.prepare("SELECT p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.start_date AS pledgeDate FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? AND p.type=? ORDER BY p.id DESC").bind(date,NEW_PLEDGE_TYPE).all<DailyArtifactEvent>();
   const rendered=renderDailyReportSvg(date,version,eventResult.results,publicationKind,pendingCount);const makeStream=()=>new Response(rendered.svg,{headers:{"content-type":"image/svg+xml; charset=utf-8"}}).body!;
   const [pngResponse,jpegResponse]=await Promise.all([env.IMAGES.input(makeStream()).transform({width:rendered.width}).output({format:"image/png",quality:100}).response(),env.IMAGES.input(makeStream()).transform({width:rendered.width}).output({format:"image/jpeg",quality:94}).response()]);
   if(!pngResponse.ok||!jpegResponse.ok)throw new Error(`artifact rendering failed: PNG ${pngResponse.status}, JPEG ${jpegResponse.status}`);
@@ -1227,19 +1258,21 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const requested=url.searchParams.get("date");
     const latest=await env.DB.prepare("SELECT MAX(announce_date) AS date FROM announcement").first<{date:string}>();
     const date=requested&&/^\d{4}-\d{2}-\d{2}$/.test(requested)?requested:latest?.date||latestTradingDate();
+    await enforceNewPledgeOnlyPolicy(env.DB,date,"daily-report");
     const [snapshot,events,quotaState,openaiErrorState,openaiUsage]=await Promise.all([
       dailyReportSnapshot(env.DB,date),
-      env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,a.report_date AS date,p.announce_date AS officialDate,p.verification_status AS verificationStatus,a.pdf_url AS pdfUrl FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? ORDER BY CASE WHEN p.type LIKE '%补充%' THEN 0 WHEN p.type NOT LIKE '%解除%' THEN 1 ELSE 2 END,p.id DESC").bind(date).all(),
+      env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.start_date AS pledgeDate,a.report_date AS date FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? AND p.type=? ORDER BY p.id DESC").bind(date,NEW_PLEDGE_TYPE).all(),
       env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
       env.DB.prepare("SELECT value,updated_at AS updatedAt FROM pipeline_state WHERE key='openai_review_last_error'").first<{value:string;updatedAt:string}>(),
       env.DB.prepare("SELECT COUNT(*) AS calls,SUM(succeeded) AS successes,SUM(input_tokens) AS inputTokens,SUM(output_tokens) AS outputTokens,SUM(total_tokens) AS totalTokens,SUM(cached_input_tokens) AS cachedInputTokens FROM openai_review_usage u JOIN announcement a ON a.announcement_id=u.announcement_id WHERE a.report_date=?").bind(date).first(),
     ]);
     const blockedUntil=quotaState?.value&&Date.parse(quotaState.value)>Date.now()?quotaState.value:null;let lastError:null|Record<string,unknown>=null;try{lastError=openaiErrorState?.value?JSON.parse(openaiErrorState.value):null;}catch{}
     const version=Number((snapshot.published as {reportVersion?:number}|null)?.reportVersion||1);const artifacts=["published","provisional"].includes(snapshot.status)?await dailyArtifactLinks(env,date,version):{png:null,pdf:null,locked:false};
-    return json({...snapshot,events:events.results,automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),available:Boolean(env.OPENAI_API_KEY)&&!blockedUntil,blockedUntil,lastError,lastErrorAt:openaiErrorState?.updatedAt||null,usage:openaiUsage||{calls:0,successes:0,inputTokens:0,outputTokens:0,totalTokens:0,cachedInputTokens:0}},artifacts,clock:{shanghaiDate:shanghaiDate(),productionTargetDate:automaticProduction.targetDate,cutoffHour:20,publicationDeadlineHour:21},methodology:"每日20:00固定当日日报范围；20:00后的官方公告顺延到下一自然日日报，周末照常运行；21:00即使仍有未决公告也先发布明确标注的临时版，后台继续补齐并在差异清零后自动升级最终版",deliverables:{image:"临时版或最终版均从对应锁定版本生成并归档PNG长图",pdf:"与PNG使用同一版本数据生成并归档PDF"},generatedAt:new Date().toISOString()});
+    if(["published","provisional"].includes(snapshot.status)&&!artifacts.locked)ctx.waitUntil(generateDailyReportArtifacts(env,date,version,snapshot.status==="published"?"final":"provisional",Number((snapshot.announcement as {pending?:number}).pending||0)).catch(()=>undefined));
+    return json({...snapshot,events:events.results,automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),available:Boolean(env.OPENAI_API_KEY)&&!blockedUntil,blockedUntil,lastError,lastErrorAt:openaiErrorState?.updatedAt||null,usage:openaiUsage||{calls:0,successes:0,inputTokens:0,outputTokens:0,totalTokens:0,cachedInputTokens:0}},artifacts,clock:{shanghaiDate:shanghaiDate(),productionTargetDate:automaticProduction.targetDate,cutoffHour:20,publicationDeadlineHour:21},methodology:"仅收录新增质押，解除质押、解除再质押、补充质押及展期全部排除；每日20:00固定当日日报范围；20:00后的官方公告顺延到下一自然日日报；后台持续补齐并在三所差异清零后升级最终版",deliverables:{image:"PNG仅包含股票名称、股票代码、质押股东、质权人、质押股票数量、质押日期",pdf:"与PNG使用同一份锁定数据及相同六字段生成"},generatedAt:new Date().toISOString()});
   }
   if(url.pathname==="/api/daily-reports"&&request.method==="GET"){
-    const rows=await env.DB.prepare("SELECT a.date,a.announcements,a.events,a.companies,a.pending,COALESCE(r.status,'draft') AS savedStatus,r.published_at AS publishedAt FROM (SELECT d.report_date AS date,COUNT(DISTINCT d.announcement_id) AS announcements,COUNT(DISTINCT p.id) AS events,COUNT(DISTINCT p.stock_code) AS companies,COUNT(DISTINCT CASE WHEN d.parse_status NOT IN ('parsed','ignored','rejected') THEN d.announcement_id END) AS pending FROM announcement d LEFT JOIN pledge p ON p.announcement_id=d.announcement_id GROUP BY d.report_date ORDER BY d.report_date DESC LIMIT 90) a LEFT JOIN daily_report r ON r.date=a.date ORDER BY a.date DESC").all<{date:string}>();
+    const rows=await env.DB.prepare("SELECT a.date,a.announcements,a.events,a.companies,a.pending,COALESCE(r.status,'draft') AS savedStatus,r.published_at AS publishedAt FROM (SELECT d.report_date AS date,COUNT(DISTINCT d.announcement_id) AS announcements,COUNT(DISTINCT p.id) AS events,COUNT(DISTINCT p.stock_code) AS companies,COUNT(DISTINCT CASE WHEN d.parse_status NOT IN ('parsed','ignored','rejected') THEN d.announcement_id END) AS pending FROM announcement d LEFT JOIN pledge p ON p.announcement_id=d.announcement_id AND p.type='新增质押' GROUP BY d.report_date ORDER BY d.report_date DESC LIMIT 90) a LEFT JOIN daily_report r ON r.date=a.date ORDER BY a.date DESC").all<{date:string}>();
     const data=[];for(const row of rows.results){const snapshot=await dailyReportSnapshot(env.DB,row.date);data.push({...row,status:snapshot.status,ready:snapshot.ready,reconciliation:snapshot.reconciliation});}
     return json({data,scope:"仅展示按交易日生成的关账报告；历史数据库查询不再作为公开产品",generatedAt:new Date().toISOString()});
   }
@@ -1252,7 +1285,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   }
   if (url.pathname === "/api/health") {
     const [stats,quotaState,openaiErrorState,openaiUsage,automaticProduction,automaticMaintenance] = await Promise.all([
-      env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge) events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews, (SELECT COUNT(*) FROM announcement WHERE parse_status='ignored') ignored_announcements").first(),
+      env.DB.prepare("SELECT (SELECT COUNT(*) FROM announcement) announcements, (SELECT COUNT(*) FROM pledge WHERE type='新增质押') events, (SELECT COUNT(*) FROM review_queue WHERE status='pending') pending_reviews, (SELECT COUNT(*) FROM announcement WHERE parse_status='ignored') ignored_announcements").first(),
       env.DB.prepare("SELECT value FROM pipeline_state WHERE key='openai_quota_blocked_until'").first<{value:string}>(),
       env.DB.prepare("SELECT value,updated_at AS updatedAt FROM pipeline_state WHERE key='openai_review_last_error'").first<{value:string;updatedAt:string}>(),
       env.DB.prepare("SELECT COUNT(*) AS calls,SUM(succeeded) AS successes,SUM(CASE WHEN succeeded=0 THEN 1 ELSE 0 END) AS failures,SUM(input_tokens) AS inputTokens,SUM(output_tokens) AS outputTokens,SUM(total_tokens) AS totalTokens,SUM(cached_input_tokens) AS cachedInputTokens FROM openai_review_usage WHERE attempted_at>=datetime('now','-24 hours')").first(),
@@ -1266,8 +1299,8 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (url.pathname === "/api/stats" && request.method === "GET") {
     const [daily,eventTypes,pledgees,statuses] = await Promise.all([
       env.DB.prepare("SELECT announce_date AS date,COUNT(*) AS announcements,SUM(CASE WHEN parse_status='parsed' THEN 1 ELSE 0 END) AS parsed FROM announcement GROUP BY announce_date ORDER BY announce_date DESC LIMIT 14").all(),
-      env.DB.prepare("SELECT type AS name,COUNT(*) AS value FROM pledge GROUP BY type ORDER BY value DESC").all(),
-      env.DB.prepare("SELECT pledgee AS name,COUNT(*) AS value,SUM(pledge_amount) AS amount FROM pledge GROUP BY pledgee ORDER BY value DESC,amount DESC LIMIT 8").all(),
+      env.DB.prepare("SELECT type AS name,COUNT(*) AS value FROM pledge WHERE type='新增质押' GROUP BY type ORDER BY value DESC").all(),
+      env.DB.prepare("SELECT pledgee AS name,COUNT(*) AS value,SUM(pledge_amount) AS amount FROM pledge WHERE type='新增质押' GROUP BY pledgee ORDER BY value DESC,amount DESC LIMIT 8").all(),
       env.DB.prepare("SELECT parse_status AS name,COUNT(*) AS value FROM announcement GROUP BY parse_status ORDER BY value DESC").all(),
     ]);
     return json({ daily:daily.results.reverse(),eventTypes:eventTypes.results,pledgees:pledgees.results,statuses:statuses.results });
@@ -1521,7 +1554,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const hours = Math.min(Math.max(Number(url.searchParams.get("hours")) || 24, 1), 168);
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);
     const since = new Date(Date.now() - hours * 3600000).toISOString();
-    const result = await env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,a.crawl_time AS crawledAt,a.title,a.source,a.pdf_url AS pdfUrl,p.confidence,p.parser_version AS parserVersion,p.verification_status AS verificationStatus,p.verified_at AS verifiedAt,p.verified_by AS verifiedBy,p.evidence_json AS evidenceJson FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.crawl_time >= ? ORDER BY a.crawl_time DESC,p.id DESC LIMIT ?").bind(since, limit).all();
+    const result = await env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.start_date AS pledgeDate,p.announce_date AS date,a.crawl_time AS crawledAt,a.title,a.source,a.pdf_url AS pdfUrl,p.verification_status AS verificationStatus FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.crawl_time >= ? AND p.type=? ORDER BY a.crawl_time DESC,p.id DESC LIMIT ?").bind(since,NEW_PLEDGE_TYPE,limit).all();
     return json({ data: result.results, hours, limit, since, generatedAt: new Date().toISOString(), freshness: "official-announcement-crawl" });
   }
   if (url.pathname === "/api/capital-signals" && request.method === "GET") {
@@ -1529,7 +1562,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const days = Math.min(Math.max(Number(url.searchParams.get("days")) || 365, 30), 3650);
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 100, 10), 300);
     const since = addDays(shanghaiDate(), -days);
-    const result = await env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount AS amount,p.pledge_amount_text AS amountText,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,a.pdf_url AS pdfUrl,a.source FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE p.announce_date>=? ORDER BY p.announce_date DESC,p.id DESC LIMIT 5000").bind(since).all<CapitalEvent>();
+    const result = await env.DB.prepare("SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount AS amount,p.pledge_amount_text AS amountText,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,a.pdf_url AS pdfUrl,a.source FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE p.announce_date>=? AND p.type=? ORDER BY p.announce_date DESC,p.id DESC LIMIT 5000").bind(since,NEW_PLEDGE_TYPE).all<CapitalEvent>();
     const rows = result.results;
     const pct = (value:string) => Number(String(value || "").replace(/[^0-9.]/g,"")) || 0;
     const actorMap = new Map<string,{code:string;name:string;shareholder:string;events:CapitalEvent[]}>();
@@ -1757,7 +1790,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ok:true,requestId:saved?.id,status:saved?.status||"new",message:"需求已进入人工核验队列；联系方式不会公开，双方确认后再安排对接",riskContextAttached:Boolean(riskSnapshot),candidatesCreated});
   }
   if (url.pathname === "/api/events" && request.method === "GET") {
-    const conditions: string[] = []; const values: string[] = [];
+    const conditions: string[] = ["p.type = ?"]; const values: string[] = [NEW_PLEDGE_TYPE];
     const add = (sql: string, value: string | null) => { if (value) { conditions.push(sql); values.push(value); } };
     add("CAST(p.id AS TEXT) = ?", url.searchParams.get("id"));
     add("p.announcement_id = ?", url.searchParams.get("announcement_id"));
@@ -1852,9 +1885,10 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const status=["pending","approved","rejected"].includes(url.searchParams.get("status")||"")?String(url.searchParams.get("status")):"pending";
     const latest=date?{date}:await env.DB.prepare("SELECT MAX(a.report_date) AS date FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE r.status='pending'").first<{date:string}>();
     const reportDate=latest?.date||automaticProductionTargetDate();
+    await enforceNewPledgeOnlyPolicy(env.DB,reportDate,"manual-review-desk");
     const [result,existing,counts]=await Promise.all([
       env.DB.prepare("SELECT r.id,r.announcement_id AS announcementId,r.event_type AS eventType,r.reason,r.payload,r.status,r.created_at AS createdAt,r.reviewed_at AS reviewedAt,r.resolution,a.stock_code AS stockCode,a.stock_name AS stockName,a.title,a.announce_date AS announceDate,a.report_date AS reportDate,a.pdf_url AS pdfUrl,a.r2_key AS r2Key,a.parse_status AS parseStatus,a.parse_attempts AS parseAttempts,a.last_error AS lastError FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE a.report_date=? AND r.status=? ORDER BY CASE WHEN a.last_error IS NOT NULL THEN 0 ELSE 1 END,a.parse_attempts DESC,COALESCE(r.reviewed_at,r.created_at) ASC LIMIT 200").bind(reportDate,status).all(),
-      env.DB.prepare("SELECT p.announcement_id AS announcementId,p.shareholder,p.pledgee,p.pledge_amount AS amount,p.pledge_amount_text AS amountText,p.pledge_ratio AS pledgeRatio,p.total_ratio AS totalRatio,p.start_date AS startDate,p.end_date AS endDate,p.purpose,p.type FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? ORDER BY p.id").bind(reportDate).all(),
+      env.DB.prepare("SELECT p.announcement_id AS announcementId,p.shareholder,p.pledgee,p.pledge_amount_text AS amountText,p.start_date AS pledgeDate FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? AND p.type=? ORDER BY p.id").bind(reportDate,NEW_PLEDGE_TYPE).all(),
       env.DB.prepare("SELECT SUM(CASE WHEN r.status='pending' THEN 1 ELSE 0 END) AS pending,SUM(CASE WHEN r.status='approved' THEN 1 ELSE 0 END) AS approved,SUM(CASE WHEN r.status='rejected' THEN 1 ELSE 0 END) AS rejected FROM review_queue r JOIN announcement a ON a.announcement_id=r.announcement_id WHERE a.report_date=?").bind(reportDate).first(),
     ]);
     const eventsByAnnouncement=new Map<string,unknown[]>();for(const row of existing.results as Array<Record<string,unknown>>){const id=String(row.announcementId);const values=eventsByAnnouncement.get(id)||[];values.push(row);eventsByAnnouncement.set(id,values);}
@@ -1863,7 +1897,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (url.pathname.startsWith("/api/reviews/") && request.method === "PATCH") {
     const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
     const id = Number(url.pathname.split("/").pop());
-    type ManualEventInput={shareholder?:string;pledgee?:string;amount?:number;amountText?:string;pledgeRatio?:string;totalRatio?:string;startDate?:string;endDate?:string;purpose?:string;type?:string};
+    type ManualEventInput={shareholder?:string;pledgee?:string;amountText?:string;pledgeDate?:string;startDate?:string};
     const body = await request.json<{action?:"approve"|"reject"|"requeue";status?:string;resolution?:string;events?:ManualEventInput[];shareholder?:string;pledgee?:string;amount?:number;amountText?:string;pledgeRatio?:string;totalRatio?:string;type?:string}>();
     const action=body.action||(body.status==="approved"?"approve":body.status==="rejected"?"reject":"");
     if (!id || !["approve","reject","requeue"].includes(action)) return json({ error: "invalid review update" }, { status: 400 });
@@ -1884,10 +1918,10 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     ];
     if (action === "approve") {
       const announcement = await env.DB.prepare("SELECT stock_code AS stockCode,stock_name AS stockName,announce_date AS announceDate FROM announcement WHERE announcement_id=?").bind(before.announcement_id).first<{stockCode:string;stockName:string;announceDate:string}>();
-      const inputs=body.events?.length?body.events:[body];if(!announcement||!inputs.length||inputs.length>30)return json({error:"每份公告需提交1至30条事件"},{status:400});
-      const rows=inputs.map((row,index)=>{const manualRow={shareholder:String(row.shareholder||"").trim(),pledgee:String(row.pledgee||"").trim(),amount:Number(row.amount||amountNumber(String(row.amountText||""))),amountText:String(row.amountText||row.amount||"").trim(),pledgeRatio:String(row.pledgeRatio||"").trim(),totalRatio:String(row.totalRatio||"").trim(),startDate:String(row.startDate||"").trim(),endDate:String(row.endDate||"").trim(),purpose:String(row.purpose||"").trim(),type:String(row.type||"新增质押"),missing:[]} as ParsedPledge;const advisory=validateAndNormalizePledgeRow({...manualRow});advisory.missing.forEach((warning)=>manualWarnings.push(`事件${index+1}：${warning}`));return manualRow;});
+      const inputs=body.events?.length?body.events:[body];if(!announcement||!inputs.length||inputs.length>30)return json({error:"每份公告需提交1至30条新增质押记录"},{status:400});
+      const rows=inputs.map((row,index)=>{const amountText=String(row.amountText||"").trim();const manualRow={shareholder:String(row.shareholder||"").trim(),pledgee:String(row.pledgee||"").trim(),amount:amountNumber(amountText),amountText,pledgeRatio:"",totalRatio:"",startDate:String(row.pledgeDate||row.startDate||"").trim(),endDate:"",purpose:"",type:NEW_PLEDGE_TYPE,missing:[]} as ParsedPledge;const advisory=validateAndNormalizePledgeRow({...manualRow});advisory.missing.forEach((warning)=>manualWarnings.push(`记录${index+1}：${warning}`));return manualRow;});
       statements.push(env.DB.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(before.announcement_id));
-      for(let index=0;index<rows.length;index++){const row=rows[index];const eventFingerprint=await fingerprint(before.announcement_id,row,index);statements.push(env.DB.prepare("INSERT INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint,verification_status,verified_at,verified_by,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(before.announcement_id,announcement.stockCode,announcement.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,row.pledgeRatio||null,row.totalRatio||null,row.startDate||null,row.endDate||null,row.purpose||null,row.type,announcement.announceDate,1,"manual-review-v3",now,eventFingerprint,"human_verified",now,viewer,eventEvidence(before.announcement_id,[],row,"human")));}
+      for(let index=0;index<rows.length;index++){const row=rows[index];const eventFingerprint=await fingerprint(before.announcement_id,row,index);statements.push(env.DB.prepare("INSERT INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint,verification_status,verified_at,verified_by,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(before.announcement_id,announcement.stockCode,announcement.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,null,null,row.startDate||null,null,null,NEW_PLEDGE_TYPE,announcement.announceDate,1,"manual-review-v4-new-only",now,eventFingerprint,"human_verified",now,viewer,eventEvidence(before.announcement_id,[],row,"human")));}
       if(manualWarnings.length)statements.push(env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("announcement",before.announcement_id,"manual_validation_override",null,JSON.stringify({warnings:manualWarnings,note:"自动质量规则仅作提示，人工审核结论优先"}),viewer,now));
       statements.push(env.DB.prepare("UPDATE announcement SET parse_status='parsed',last_error=NULL WHERE announcement_id=?").bind(before.announcement_id));
     } else {
@@ -1911,18 +1945,19 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       const account=await env.DB.prepare("SELECT plan,status FROM billing_account WHERE user_id=?").bind(viewer).first<{plan:string;status:string}>();
       if(!account||!entitlementsFor(account.plan,account.status).advancedExport)return json({error:"Excel 与 JSON 导出属于专业版权益",upgrade:"/pricing",requiredEntitlement:"advancedExport"},{status:402});
     }
-    const result = await env.DB.prepare("SELECT announce_date,stock_code,stock_name,shareholder,pledgee,pledge_amount_text,pledge_ratio,total_ratio,type,verification_status FROM pledge ORDER BY announce_date DESC").all<Record<string, unknown>>();
+    const result = await env.DB.prepare("SELECT stock_name,stock_code,shareholder,pledgee,pledge_amount_text,start_date AS pledge_date FROM pledge WHERE type=? ORDER BY announce_date DESC,id DESC").bind(NEW_PLEDGE_TYPE).all<Record<string, unknown>>();
     if (format === "json") return json(result.results, { headers: { "content-disposition": "attachment; filename=pledge-events.json" } });
-    const cols = ["announce_date","stock_code","stock_name","shareholder","pledgee","pledge_amount_text","pledge_ratio","total_ratio","type","verification_status"];
+    const cols = ["stock_name","stock_code","shareholder","pledgee","pledge_amount_text","pledge_date"];
     if (format === "xls") {
       const escapeXml = (value: unknown) => String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
-      const labels = ["公告日期","股票代码","股票名称","股东名称","质权人","质押数量","占其持股","占总股本","事件类型","核验层级"];
+      const labels = ["股票名称","股票代码","质押股东","质权人","质押股票数量","质押日期"];
       const rowXml = (cells: unknown[]) => `<Row>${cells.map((cell) => `<Cell><Data ss:Type="String">${escapeXml(cell)}</Data></Cell>`).join("")}</Row>`;
       const xml = `<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="股权质押"><Table>${rowXml(labels)}${result.results.map((row) => rowXml(cols.map((col) => row[col]))).join("")}</Table></Worksheet></Workbook>`;
       return new Response(xml,{headers:{"content-type":"application/vnd.ms-excel; charset=utf-8","content-disposition":"attachment; filename=pledge-events.xls"}});
     }
-    const csv = "\ufeff" + cols.join(",") + "\n" + result.results.map((r) => cols.map((c) => `"${String(r[c] ?? "").replaceAll('"','""')}"`).join(",")).join("\n");
-    return new Response(csv, { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=pledge-events.csv" } });
+    const csvLabels=["股票名称","股票代码","质押股东","质权人","质押股票数量","质押日期"];
+    const csv = "\ufeff" + csvLabels.join(",") + "\n" + result.results.map((r) => cols.map((c) => `"${String(r[c] ?? "").replaceAll('"','""')}"`).join(",")).join("\n");
+    return new Response(csv, { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=new-pledge-events.csv" } });
   }
   if (url.pathname.startsWith("/api/documents/") && request.method === "GET") {
     const key = decodeURIComponent(url.pathname.slice("/api/documents/".length));
