@@ -115,7 +115,7 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /双方分别确认前不返回对方机构/);
   assert.match(worker, /https:\/\/api\.openai\.com\/v1\/responses/);
   assert.match(worker, /rules-then-openai/);
-  assert.match(worker, /maxAutomaticAttempts: 2/);
+  assert.match(worker, /maxAutomaticAttempts: openaiEnabled\?2:0/);
   assert.match(worker, /\/api\/internal\/production-tick/);
   assert.match(worker, /PRODUCTION_CRON_SECRET/);
   assert.match(worker, /async scheduled\(/);
@@ -126,6 +126,11 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /successfulQueries/);
   assert.match(worker, /sourceWarnings/);
   assert.match(worker, /openai_quota_blocked_until/);
+  assert.match(worker, /OPENAI_REVIEW_ENABLED/);
+  assert.match(worker, /rules-then-manual/);
+  assert.match(worker, /已自动转入人工审核/);
+  assert.match(worker, /if\(!claim\.meta\.changes\)continue/);
+  assert.match(worker, /parse_attempts>=2/);
   assert.match(worker, /openai_review_usage/);
   assert.match(worker, /OpenAIReviewError/);
   assert.match(worker, /x-client-request-id/);
