@@ -354,11 +354,20 @@ const amountNumber = (value: string) => {
   return numeric;
 };
 
+// Share counts are stored and exposed as shares by default. Preserve an
+// explicitly disclosed 万/亿 unit, but treat a bare numeric value as 股.
+const normalizePledgeAmountText = (value: unknown) => {
+  const text=String(value??"").replace(/\s+/g," ").trim();
+  if(!text)return "";
+  if(/股$/.test(text))return text.replace(/\s*股$/, " 股");
+  return /^[\d,.]+\s*(?:万|亿)?$/.test(text)?`${text} 股`:text;
+};
+
 function parsePledgeText(text: string, title: string) {
   const compact = cleanText(text);
   const shareholder = firstMatch(compact, [/(?:股东名称|股东姓名|出质人)[：:]?\s*([^\n]{2,80})/i, /(?:股东|出质人)\s+([^\n]{2,80})/i]);
   const pledgee = firstMatch(compact, [/质押给\s*([^，。]{2,60}?(?:有限责任公司|有限公司))/i, /(?:质权人|质权方|质押权人)[：:]?\s*([^\n]{2,100})/i, /(?:质权人|质押权人)\s+([^\n]{2,100})/i]);
-  const amountText = firstMatch(compact, [/(?:本次质押(?:股数|数量)?|质押股数|质押数量|解除质押(?:股数|数量)?)[：:]?\s*([\d,.]+\s*(?:万|亿)?\s*股)/i, /([\d,.]+\s*(?:万|亿)?\s*股)\s*(?:占其所持股份|占所持股份|占公司总股本)/i]);
+  const amountText = normalizePledgeAmountText(firstMatch(compact, [/(?:本次质押(?:股数|数量)?|质押股数|质押数量|解除质押(?:股数|数量)?)[：:]?\s*([\d,.]+\s*(?:万|亿)?\s*股)/i, /([\d,.]+\s*(?:万|亿)?\s*股)\s*(?:占其所持股份|占所持股份|占公司总股本)/i]));
   const pledgeRatio = firstMatch(compact, [/(?:占其所持股份比例|占所持股份比例)[：:]?\s*([\d.]+%)/i]);
   const totalRatio = firstMatch(compact, [/(?:占公司总股本比例|占总股本比例)[：:]?\s*([\d.]+%)/i]);
   const startDate = firstMatch(compact, [/(?:质押起始日|起始日)[：:]?\s*(\d{4}[年./-]\d{1,2}[月./-]\d{1,2}日?)/i]);
@@ -386,7 +395,7 @@ function parseFlattenedTableRows(text: string, title: string): ParsedPledge[] {
     }
     if ((shareholder.length > 10 || /(借款|质押|融资|用途|证券|银行|信托)/.test(shareholder)) && previousShareholder) shareholder = previousShareholder;
     else if (shareholder.length > 10 || /(借款|质押|融资|用途|证券|银行|信托)/.test(shareholder)) shareholder = "";
-    const amountText = `${match[2]} 股`; const tail = match[5];
+    const amountText = normalizePledgeAmountText(match[2]); const tail = match[5];
     const dates = [...tail.matchAll(/\d{4}\s*[年/.\-]\s*\d{1,2}\s*[月/.\-]\s*\d{1,2}\s*日?/g)].map((item) => item[0].replace(/\s/g,""));
     const compactTail = tail.replace(/\s/g,""); const organizationMatches = [...compactTail.matchAll(/[\u4e00-\u9fff（）()]{2,30}(?:股份有限公司|有限责任公司|有限公司)/g)];
     let pledgee = organizationMatches.at(-1)?.[0] || "";
@@ -408,7 +417,7 @@ function parsePledgeRows(text: string, title: string): ParsedPledge[] {
   const seen = new Set<string>();
   for (const rawLine of text.split(/\r?\n/)) {
     const line = cleanText(rawLine);
-    const amountText = line.match(/[\d,.]+\s*(?:万|亿)?\s*股/)?.[0] || "";
+    const amountText = normalizePledgeAmountText(line.match(/[\d,.]+\s*(?:万|亿)?\s*股/)?.[0] || "");
     const percentages = [...line.matchAll(/[\d.]+%/g)].map((match) => match[0]);
     if (!amountText || percentages.length < 1) continue;
     const cells = rawLine.split(/\t|\s{2,}/).map(cleanText).filter(Boolean);
@@ -437,7 +446,7 @@ const arrayBufferToBase64 = (buffer: ArrayBuffer) => {
 function normalizeVisionRows(value: unknown, title: string): ParsedPledge[] {
   const source = Array.isArray(value) ? value : (value && typeof value === "object" && Array.isArray((value as {events?:unknown[]}).events) ? (value as {events:unknown[]}).events : []);
   return source.map((entry) => {
-    const row = entry as Record<string, unknown>; const amountText = String(row.pledge_amount ?? row.amount ?? "");
+    const row = entry as Record<string, unknown>; const amountText = normalizePledgeAmountText(row.pledge_amount ?? row.amount ?? "");
     const parsed = { shareholder:String(row.shareholder ?? "").trim(), pledgee:String(row.pledgee ?? "").trim(), amount:amountNumber(amountText), amountText, pledgeRatio:"", totalRatio:"", startDate:String(row.pledge_date ?? row.start_date ?? ""), endDate:"", purpose:"", type:String(row.type ?? pledgeType(title)), missing:[] as unknown[] };
     parsed.missing = [!parsed.shareholder && "股东", !parsed.pledgee && "质权人", !parsed.amount && "质押数量"].filter(Boolean);
     return parsed as ParsedPledge;
@@ -1212,7 +1221,7 @@ function renderDailyReportSvg(date:string,version:number,events:DailyArtifactEve
   const metrics=[["新增质押",events.length],["涉及公司",companies],["质押股东",shareholders],["质权人",pledgees]];
   const metricSvg=metrics.map(([label,value],index)=>{const x=70+index*350;return `<g><rect x="${x}" y="280" width="310" height="115" rx="8" fill="#fff"/><text x="${x+24}" y="322" class="metricLabel">${label}</text><text x="${x+24}" y="374" class="metricValue">${value}</text></g>`;}).join("");
   const rows=events.map((row,index)=>{const y=top+index*rowHeight;return `<g>${index%2===0?`<rect x="50" y="${y-10}" width="1400" height="${rowHeight}" fill="#ebe6dc"/>`:""}<text x="${cells[0]}" y="${y+42}" class="rowStrong">${xmlEscape(compactArtifactText(row.name,10))}</text><text x="${cells[1]}" y="${y+42}" class="row">${xmlEscape(row.code||"—")}</text><text x="${cells[2]}" y="${y+42}" class="row">${xmlEscape(compactArtifactText(row.shareholder,15))}</text><text x="${cells[3]}" y="${y+42}" class="row">${xmlEscape(compactArtifactText(row.pledgee,18))}</text><text x="${cells[4]}" y="${y+42}" class="rowStrong">${xmlEscape(compactArtifactText(row.amount,16))}</text><text x="${cells[5]}" y="${y+42}" class="row">${xmlEscape(row.pledgeDate||"—")}</text></g>`;}).join("");
-  const headers=["股票名称","股票代码","质押股东","质权人","质押股票数量","质押日期"].map((label,index)=>`<text x="${cells[index]}" y="440" class="tableHead">${label}</text>`).join("");
+  const headers=["股票名称","股票代码","质押股东","质权人","质押股数（股）","质押日期"].map((label,index)=>`<text x="${cells[index]}" y="440" class="tableHead">${label}</text>`).join("");
   const releaseLabel=publicationKind==="final"?`正式版本 V${version}`:`临时版本 V${version}｜${pendingCount} 份公告/差异未决`;
   const footer=publicationKind==="final"?`已关账发布｜事件 ${events.length} 条｜PNG 与 PDF 生成自同一份锁定数据`:`临时发布｜已核验事件 ${events.length} 条｜未决 ${pendingCount} 份｜完成后自动升级最终版`;
   return {width,height,svg:`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><style>text{font-family:'Noto Sans CJK SC','Microsoft YaHei',sans-serif}.brand{font-size:32px;font-weight:700;fill:#fff}.date{font-size:62px;font-weight:700;fill:#fff}.subtitle{font-size:24px;fill:#b9c9e4}.metricLabel{font-size:22px;fill:#65728a}.metricValue{font-size:42px;font-weight:700;fill:#0b1f3a}.tableHead{font-size:21px;font-weight:700;fill:#0b1f3a}.row{font-size:21px;fill:#12213a}.rowStrong{font-size:22px;font-weight:700;fill:#12213a}.footer{font-size:20px;fill:#0b1f3a}.watermark{font-size:46px;font-weight:700;fill:#0b1f3a;opacity:.22}</style><rect width="${width}" height="${height}" fill="#f4f0e8"/><rect width="${width}" height="250" fill="#0b1f3a"/><text x="70" y="72" class="brand">HBF · A股新增质押日报</text><text x="70" y="158" class="date">${date}</text><text x="70" y="207" class="subtitle">20:00截止｜21:00发布｜三所交叉核验｜${releaseLabel}</text>${metricSvg}${headers}${rows}<text x="70" y="${height-72}" class="footer">${footer}</text><text x="1430" y="${height-62}" text-anchor="end" class="watermark">HBF</text></svg>`};
@@ -1232,7 +1241,8 @@ function pdfFromJpeg(jpeg:ArrayBuffer,width:number,height:number){
 
 async function generateDailyReportArtifacts(env:Env,date:string,version:number,publicationKind:"provisional"|"final"="final",pendingCount=0){
   const eventResult=await env.DB.prepare("SELECT p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.start_date AS pledgeDate FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id WHERE a.report_date=? AND p.type=? ORDER BY p.id DESC").bind(date,NEW_PLEDGE_TYPE).all<DailyArtifactEvent>();
-  const rendered=renderDailyReportSvg(date,version,eventResult.results,publicationKind,pendingCount);const makeStream=()=>new Response(rendered.svg,{headers:{"content-type":"image/svg+xml; charset=utf-8"}}).body!;
+  const normalizedEvents=eventResult.results.map((row)=>({...row,amount:normalizePledgeAmountText(row.amount)}));
+  const rendered=renderDailyReportSvg(date,version,normalizedEvents,publicationKind,pendingCount);const makeStream=()=>new Response(rendered.svg,{headers:{"content-type":"image/svg+xml; charset=utf-8"}}).body!;
   const [pngResponse,jpegResponse]=await Promise.all([env.IMAGES.input(makeStream()).transform({width:rendered.width}).output({format:"image/png",quality:100}).response(),env.IMAGES.input(makeStream()).transform({width:rendered.width}).output({format:"image/jpeg",quality:94}).response()]);
   if(!pngResponse.ok||!jpegResponse.ok)throw new Error(`artifact rendering failed: PNG ${pngResponse.status}, JPEG ${jpegResponse.status}`);
   const [png,jpeg]=await Promise.all([pngResponse.arrayBuffer(),jpegResponse.arrayBuffer()]);const pdf=pdfFromJpeg(jpeg,rendered.width,rendered.height);
@@ -1316,7 +1326,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     ]);
     const blockedUntil=quotaState?.value&&Date.parse(quotaState.value)>Date.now()?quotaState.value:null;let lastError:null|Record<string,unknown>=null;try{lastError=openaiErrorState?.value?JSON.parse(openaiErrorState.value):null;}catch{}
     const openaiEnabled=Boolean(env.OPENAI_API_KEY)&&env.OPENAI_REVIEW_ENABLED?.trim().toLowerCase()==="true";
-    return json({...snapshot,events:events.results,automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),enabled:openaiEnabled,available:openaiEnabled&&!blockedUntil,mode:openaiEnabled?"rules-then-openai":"rules-then-manual",blockedUntil,lastError,lastErrorAt:openaiErrorState?.updatedAt||null,usage:openaiUsage||{calls:0,successes:0,inputTokens:0,outputTokens:0,totalTokens:0,cachedInputTokens:0}},clock:{shanghaiDate:shanghaiDate(),productionTargetDate:automaticProduction.targetDate,cutoffHour:20,automaticProcessingDeadlineHour:20,automaticProcessingDeadlineMinute:30,publicationDeadlineHour:21},methodology:"仅收录新增质押，解除质押、解除再质押、补充质押及展期全部排除；新增质押按结构化事件行计数，涉及公司按股票代码去重，质押股东和质权人按名称文本去重；每日20:00固定当日日报范围；20:30自动处理截止，未完成公告全部转入人工审核；20:00后的官方公告顺延到下一自然日日报；人工审核完成且三所差异清零后升级最终版",deliverables:{dailyImage:"1080像素HBF新增质押日报图片，由浏览器按当期数据即时生成"},generatedAt:new Date().toISOString()});
+    return json({...snapshot,events:events.results.map((row)=>({...row,amount:normalizePledgeAmountText((row as {amount?:unknown}).amount)})),automaticProduction,automatedReview:{configured:Boolean(env.OPENAI_API_KEY),enabled:openaiEnabled,available:openaiEnabled&&!blockedUntil,mode:openaiEnabled?"rules-then-openai":"rules-then-manual",blockedUntil,lastError,lastErrorAt:openaiErrorState?.updatedAt||null,usage:openaiUsage||{calls:0,successes:0,inputTokens:0,outputTokens:0,totalTokens:0,cachedInputTokens:0}},clock:{shanghaiDate:shanghaiDate(),productionTargetDate:automaticProduction.targetDate,cutoffHour:20,automaticProcessingDeadlineHour:20,automaticProcessingDeadlineMinute:30,publicationDeadlineHour:21},methodology:"仅收录新增质押，质押股数默认单位为股；解除质押、解除再质押、补充质押及展期全部排除；新增质押按结构化事件行计数，涉及公司按股票代码去重，质押股东和质权人按名称文本去重；每日20:00固定当日日报范围；20:30自动处理截止，未完成公告全部转入人工审核；20:00后的官方公告顺延到下一自然日日报；人工审核完成且三所差异清零后升级最终版",deliverables:{dailyImage:"1080像素HBF新增质押日报图片，由浏览器按当期数据即时生成"},generatedAt:new Date().toISOString()});
   }
   if(url.pathname==="/api/daily-report/close"&&request.method==="POST"){
     const viewer=adminViewer(request,env);if(!viewer)return adminRequired();
@@ -1847,7 +1857,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 100, 1), 500); const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
     const sql = `SELECT p.id,p.announcement_id AS announcementId,p.stock_code AS code,p.stock_name AS name,p.shareholder,p.pledgee,p.pledge_amount_text AS amount,p.pledge_ratio AS ratio,p.total_ratio AS total,p.type,p.announce_date AS date,p.confidence,p.parser_version AS parserVersion,p.verification_status AS verificationStatus,p.verified_at AS verifiedAt,p.verified_by AS verifiedBy,p.evidence_json AS evidenceJson,a.source,a.pdf_url AS pdfUrl,a.md5,a.sha256 FROM pledge p JOIN announcement a ON a.announcement_id=p.announcement_id ${where} ORDER BY p.announce_date DESC,p.id DESC LIMIT ? OFFSET ?`;
     const [result,count] = await Promise.all([env.DB.prepare(sql).bind(...values,limit,offset).all(),env.DB.prepare(`SELECT COUNT(*) AS total FROM pledge p ${where}`).bind(...values).first<{total:number}>()]);
-    return json({ data: result.results, total: count?.total || 0, limit, offset, traceable: true });
+    return json({ data: result.results.map((row)=>({...row,amount:normalizePledgeAmountText((row as {amount?:unknown}).amount)})), total: count?.total || 0, limit, offset, traceable: true });
   }
   if (url.pathname === "/api/announcements" && request.method === "GET") {
     const result = await env.DB.prepare("SELECT announcement_id AS announcementId,stock_code AS stockCode,stock_name AS stockName,title,announce_date AS announceDate,pdf_url AS pdfUrl,source,crawl_time AS crawlTime,md5,sha256,parse_status AS parseStatus,parse_attempts AS parseAttempts,last_error AS lastError FROM announcement ORDER BY announce_date DESC LIMIT 500").all();
@@ -1965,7 +1975,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     if (action === "approve") {
       const announcement = await env.DB.prepare("SELECT stock_code AS stockCode,stock_name AS stockName,announce_date AS announceDate FROM announcement WHERE announcement_id=?").bind(before.announcement_id).first<{stockCode:string;stockName:string;announceDate:string}>();
       const inputs=body.events?.length?body.events:[body];if(!announcement||!inputs.length||inputs.length>30)return json({error:"每份公告需提交1至30条新增质押记录"},{status:400});
-      const rows=inputs.map((row,index)=>{const amountText=String(row.amountText||"").trim();const manualRow={shareholder:String(row.shareholder||"").trim(),pledgee:String(row.pledgee||"").trim(),amount:amountNumber(amountText),amountText,pledgeRatio:"",totalRatio:"",startDate:String(row.pledgeDate||row.startDate||"").trim(),endDate:"",purpose:"",type:NEW_PLEDGE_TYPE,missing:[]} as ParsedPledge;const advisory=validateAndNormalizePledgeRow({...manualRow});advisory.missing.forEach((warning)=>manualWarnings.push(`记录${index+1}：${warning}`));return manualRow;});
+      const rows=inputs.map((row,index)=>{const amountText=normalizePledgeAmountText(row.amountText||"");const manualRow={shareholder:String(row.shareholder||"").trim(),pledgee:String(row.pledgee||"").trim(),amount:amountNumber(amountText),amountText,pledgeRatio:"",totalRatio:"",startDate:String(row.pledgeDate||row.startDate||"").trim(),endDate:"",purpose:"",type:NEW_PLEDGE_TYPE,missing:[]} as ParsedPledge;const advisory=validateAndNormalizePledgeRow({...manualRow});advisory.missing.forEach((warning)=>manualWarnings.push(`记录${index+1}：${warning}`));return manualRow;});
       statements.push(env.DB.prepare("DELETE FROM pledge WHERE announcement_id=?").bind(before.announcement_id));
       for(let index=0;index<rows.length;index++){const row=rows[index];const eventFingerprint=await fingerprint(before.announcement_id,row,index);statements.push(env.DB.prepare("INSERT INTO pledge (announcement_id,stock_code,stock_name,shareholder,pledgee,pledge_amount,pledge_amount_text,pledge_ratio,total_ratio,start_date,end_date,purpose,type,announce_date,confidence,parser_version,parsed_at,event_fingerprint,verification_status,verified_at,verified_by,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(before.announcement_id,announcement.stockCode,announcement.stockName,row.shareholder,row.pledgee,row.amount,row.amountText,null,null,row.startDate||null,null,null,NEW_PLEDGE_TYPE,announcement.announceDate,1,"manual-review-v4-new-only",now,eventFingerprint,"human_verified",now,viewer,eventEvidence(before.announcement_id,[],row,"human")));}
       if(manualWarnings.length)statements.push(env.DB.prepare("INSERT INTO audit_log (entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES (?,?,?,?,?,?,?)").bind("announcement",before.announcement_id,"manual_validation_override",null,JSON.stringify({warnings:manualWarnings,note:"自动质量规则仅作提示，人工审核结论优先"}),viewer,now));
@@ -1996,12 +2006,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     const cols = ["stock_name","stock_code","shareholder","pledgee","pledge_amount_text","pledge_date"];
     if (format === "xls") {
       const escapeXml = (value: unknown) => String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
-      const labels = ["股票名称","股票代码","质押股东","质权人","质押股票数量","质押日期"];
+      const labels = ["股票名称","股票代码","质押股东","质权人","质押股数（股）","质押日期"];
       const rowXml = (cells: unknown[]) => `<Row>${cells.map((cell) => `<Cell><Data ss:Type="String">${escapeXml(cell)}</Data></Cell>`).join("")}</Row>`;
       const xml = `<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="股权质押"><Table>${rowXml(labels)}${result.results.map((row) => rowXml(cols.map((col) => row[col]))).join("")}</Table></Worksheet></Workbook>`;
       return new Response(xml,{headers:{"content-type":"application/vnd.ms-excel; charset=utf-8","content-disposition":"attachment; filename=pledge-events.xls"}});
     }
-    const csvLabels=["股票名称","股票代码","质押股东","质权人","质押股票数量","质押日期"];
+    const csvLabels=["股票名称","股票代码","质押股东","质权人","质押股数（股）","质押日期"];
     const csv = "\ufeff" + csvLabels.join(",") + "\n" + result.results.map((r) => cols.map((c) => `"${String(r[c] ?? "").replaceAll('"','""')}"`).join(",")).join("\n");
     return new Response(csv, { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": "attachment; filename=new-pledge-events.csv" } });
   }

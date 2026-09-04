@@ -26,7 +26,9 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(daily,/当日新增质押清单/);
   assert.match(daily,/股票名称/);
   assert.match(daily,/股票代码/);
-  assert.match(daily,/质押股票数量/);
+  assert.match(daily,/质押股数（股）/);
+  assert.match(worker,/normalizePledgeAmountText/);
+  assert.match(worker,/质押股数默认单位为股/);
   assert.match(daily,/质押日期/);
   assert.match(daily,/事件行/);
   assert.match(daily,/代码去重/);
@@ -316,7 +318,7 @@ test("manual review desk supports PDF-side-by-side new-pledge verification", asy
   assert.match(workbench,/自动处理中/);
   assert.match(workbench,/确需人工/);
   assert.match(workbench,/自动处理中的公告不会在此显示/);
-  assert.match(workbench,/质押股票数量/);
+  assert.match(workbench,/质押股数（股）/);
   assert.match(workbench,/质押日期/);
   assert.doesNotMatch(workbench,/占个人持股/);
   assert.doesNotMatch(workbench,/占总股本/);
