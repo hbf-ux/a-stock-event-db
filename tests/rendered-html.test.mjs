@@ -13,10 +13,10 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(page, /DailyReportClient/);
   const daily=await readFile(new URL("app/daily-report-client.tsx",root),"utf8");
   assert.match(daily,/每天完成官方公告核验后/);
-  assert.match(daily,/下载公众号长图/);
-  assert.match(daily,/下载小红书 3:4 图/);
+  assert.match(daily,/下载日报图片/);
   assert.match(daily,/1080/);
-  assert.match(daily,/1440/);
+  assert.doesNotMatch(daily,/小红书/);
+  assert.doesNotMatch(daily,/公众号长图/);
   assert.match(daily,/HBF SHAREHOLDER FINANCE INTELLIGENCE/);
   assert.doesNotMatch(daily,/历史日报/);
   assert.doesNotMatch(daily,/打印 \/ 保存 PDF/);
@@ -27,6 +27,9 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(daily,/股票代码/);
   assert.match(daily,/质押股票数量/);
   assert.match(daily,/质押日期/);
+  assert.match(daily,/事件行/);
+  assert.match(daily,/代码去重/);
+  assert.match(daily,/名称去重/);
   assert.doesNotMatch(daily,/占个人持股/);
   assert.match(worker, /from "unpdf"/);
   assert.match(worker, /async function processAnnouncement/);
