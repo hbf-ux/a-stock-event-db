@@ -30,6 +30,8 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(daily,/事件行/);
   assert.match(daily,/代码去重/);
   assert.match(daily,/名称去重/);
+  assert.match(daily,/hbf-wechat-qr\.jpg/);
+  assert.match(daily,/扫码关注宏博财策/);
   assert.doesNotMatch(daily,/占个人持股/);
   assert.match(worker, /from "unpdf"/);
   assert.match(worker, /async function processAnnouncement/);
