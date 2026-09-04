@@ -12,3 +12,17 @@
 .reviewAuthority b {
   white-space: nowrap;
 }
+
+.reviewSummary {
+  grid-template-columns: repeat(4, 140px) minmax(320px, 1fr);
+}
+
+@media (max-width: 1100px) {
+  .reviewSummary {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
+  .reviewSummary p {
+    grid-column: 1 / -1;
+  }
+}

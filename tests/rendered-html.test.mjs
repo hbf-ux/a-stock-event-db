@@ -97,6 +97,7 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /\/api\/reconciliation\/batch/);
   assert.match(worker, /\/api\/operations\/daily/);
   assert.match(worker, /runDailyProductionCycle/);
+  assert.match(worker, /processPendingQueue\(env\.DB,env\.DOCUMENTS,5,env,date\)/);
   assert.match(worker, /daily_production_last/);
   assert.match(worker, /ADMIN_USER_IDS/);
   assert.match(worker, /adminViewer/);
@@ -298,6 +299,9 @@ test("manual review desk supports PDF-side-by-side new-pledge verification", asy
   assert.match(workbench,/人工结论优先/);
   assert.match(workbench,/不会阻止提交/);
   assert.match(workbench,/只录入新增质押/);
+  assert.match(workbench,/自动处理中/);
+  assert.match(workbench,/确需人工/);
+  assert.match(workbench,/自动处理中的公告不会在此显示/);
   assert.match(workbench,/质押股票数量/);
   assert.match(workbench,/质押日期/);
   assert.doesNotMatch(workbench,/占个人持股/);
