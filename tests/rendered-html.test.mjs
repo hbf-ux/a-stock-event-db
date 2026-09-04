@@ -156,6 +156,11 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(worker, /T21:00:00\+08:00/);
   assert.match(worker, /automatic_processing_deadline_handoff/);
   assert.match(worker, /20:30自动处理截止，未完成公告已自动转入人工审核/);
+  assert.ok(
+    worker.indexOf('handoffOverdueAutomaticWork(env.DB,targetDate,"automatic-production-trigger")') <
+      worker.indexOf('const activeRun=await activeDailyProductionRun(env.DB,targetDate)'),
+    "deadline handoff must occur before checking a potentially stale active production run",
+  );
   assert.match(worker, /publicationDeadlineAt/);
   assert.match(worker, /automaticProductionTargetDate/);
   assert.match(worker, /reportDateForDisclosure/);

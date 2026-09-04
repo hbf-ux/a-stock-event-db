@@ -1093,6 +1093,11 @@ async function maybeStartAutomaticProduction(env:Env,ctx:ExecutionContext,reason
   const targetDate=automaticProductionTargetDate();
   if(!enabled)return {enabled:false,status:"disabled",targetDate,intervalMinutes};
 
+  // The 20:30 handoff is a hard operational boundary. Perform it before
+  // checking an existing run or starting any network-bound ingestion so a
+  // slow or stale production cycle cannot keep items processing past it.
+  await handoffOverdueAutomaticWork(env.DB,targetDate,"automatic-production-trigger");
+
   const published=await env.DB.prepare("SELECT status,published_at AS publishedAt FROM daily_report WHERE date=? AND status='published'").bind(targetDate).first<{status:string;publishedAt:string}>();
   if(published)return {enabled:true,status:"published",targetDate,intervalMinutes,lastTriggeredAt:published.publishedAt};
 
