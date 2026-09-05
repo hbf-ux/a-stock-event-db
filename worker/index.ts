@@ -1213,7 +1213,7 @@ const compactArtifactText=(value:unknown,limit:number)=>{const text=String(value
 const dailyArtifactKey=(date:string,version:number,extension:"png"|"pdf")=>`daily-reports/${date}/HBF-A-share-new-pledge-daily-v${version}.${extension}`;
 
 function renderDailyReportSvg(date:string,version:number,events:DailyArtifactEvent[],publicationKind:"provisional"|"final",pendingCount=0){
-  const width=1500,rowHeight=112,top=458,height=Math.max(920,top+events.length*rowHeight+160);
+  const width=1500,height=1500,top=458,tableBottom=1370,rowHeight=Math.min(80,(tableBottom-top)/Math.max(events.length,1));
   const companies=new Set(events.map((row)=>row.code)).size;
   const shareholders=new Set(events.map((row)=>row.shareholder).filter(Boolean)).size;
   const pledgees=new Set(events.map((row)=>row.pledgee).filter(Boolean)).size;

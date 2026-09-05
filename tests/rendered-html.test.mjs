@@ -15,6 +15,7 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(daily,/每天完成官方公告核验后/);
   assert.match(daily,/下载日报图片/);
   assert.match(daily,/1080/);
+  assert.match(daily,/const width=1080,height=1080/);
   assert.doesNotMatch(daily,/小红书/);
   assert.doesNotMatch(daily,/公众号长图/);
   assert.match(daily,/HBF SHAREHOLDER FINANCE INTELLIGENCE/);
@@ -29,6 +30,7 @@ test("public product is a daily closing report backed by the production workflow
   assert.match(daily,/质押股数（股）/);
   assert.match(worker,/normalizePledgeAmountText/);
   assert.match(worker,/质押股数默认单位为股/);
+  assert.match(worker,/const width=1500,height=1500/);
   assert.match(daily,/质押日期/);
   assert.match(daily,/事件行/);
   assert.match(daily,/代码去重/);

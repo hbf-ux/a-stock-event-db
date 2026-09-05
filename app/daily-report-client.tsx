@@ -31,31 +31,31 @@ function loadQrImage(){
   return new Promise<HTMLImageElement>((resolve,reject)=>{const image=new Image();image.onload=()=>resolve(image);image.onerror=()=>reject(new Error("二维码加载失败"));image.src="/hbf-wechat-qr.jpg";});
 }
 function drawHeader(ctx:CanvasRenderingContext2D,report:Snapshot,width:number,page?:{current:number;total:number}){
-  ctx.fillStyle="#071a34";ctx.fillRect(0,0,width,300);ctx.fillStyle="#1769e0";ctx.fillRect(0,0,18,300);
-  ctx.fillStyle="#fff";ctx.fillRect(58,48,92,92);ctx.fillStyle="#071a34";ctx.font="900 34px Arial";ctx.textAlign="center";ctx.fillText("HBF",104,106);ctx.textAlign="left";
-  ctx.fillStyle="#91baf7";ctx.font="700 22px Arial";ctx.fillText("HBF SHAREHOLDER FINANCE INTELLIGENCE",180,73);
-  ctx.fillStyle="#fff";ctx.font='700 47px "Microsoft YaHei", sans-serif';ctx.fillText("A股新增质押日报",180,132);
-  ctx.fillStyle="#aec3df";ctx.font='24px "Microsoft YaHei", sans-serif';ctx.fillText("每日一图 · 官方公告整理 · 三所交叉核验",180,177);
-  ctx.fillStyle="#fff";ctx.font="700 48px Georgia, serif";ctx.fillText(report.date,58,250);
-  ctx.textAlign="right";ctx.fillStyle="#aec3df";ctx.font='22px "Microsoft YaHei", sans-serif';ctx.fillText(page?`HBF 日报｜${page.current}/${page.total}`:"HBF 日报｜完整清单",width-58,238);ctx.textAlign="left";
+  ctx.fillStyle="#071a34";ctx.fillRect(0,0,width,210);ctx.fillStyle="#1769e0";ctx.fillRect(0,0,16,210);
+  ctx.fillStyle="#fff";ctx.fillRect(48,36,70,70);ctx.fillStyle="#071a34";ctx.font="900 27px Arial";ctx.textAlign="center";ctx.fillText("HBF",83,81);ctx.textAlign="left";
+  ctx.fillStyle="#91baf7";ctx.font="700 17px Arial";ctx.fillText("HBF SHAREHOLDER FINANCE INTELLIGENCE",145,55);
+  ctx.fillStyle="#fff";ctx.font='700 39px "Microsoft YaHei", sans-serif';ctx.fillText("A股新增质押日报",145,101);
+  ctx.fillStyle="#aec3df";ctx.font='19px "Microsoft YaHei", sans-serif';ctx.fillText("官方公告整理 · 三所交叉核验",145,136);
+  ctx.fillStyle="#fff";ctx.font="700 38px Georgia, serif";ctx.fillText(report.date,48,183);
+  ctx.textAlign="right";ctx.fillStyle="#aec3df";ctx.font='18px "Microsoft YaHei", sans-serif';ctx.fillText(page?`HBF 日报｜${page.current}/${page.total}`:"HBF 日报｜完整清单",width-48,178);ctx.textAlign="left";
 }
 function drawSummary(ctx:CanvasRenderingContext2D,report:Snapshot,rows:EventRow[],shareholders:number,pledgees:number,y:number,width:number){
   const items=[["新增质押",rows.length],["涉及公司",report.event.companies||0],["质押股东",shareholders],["质权人",pledgees]] as const;
   const gap=14,margin=48,card=(width-margin*2-gap*3)/4;
-  items.forEach(([label,value],index)=>{const x=margin+index*(card+gap);ctx.fillStyle="#f2f6fc";ctx.fillRect(x,y,card,118);ctx.fillStyle="#66758a";ctx.font='20px "Microsoft YaHei", sans-serif';ctx.fillText(label,x+20,y+35);ctx.fillStyle="#071a34";ctx.font="700 39px Georgia, serif";ctx.fillText(number(Number(value)),x+20,y+87);});
+  items.forEach(([label,value],index)=>{const x=margin+index*(card+gap);ctx.fillStyle="#f2f6fc";ctx.fillRect(x,y,card,76);ctx.fillStyle="#66758a";ctx.font='16px "Microsoft YaHei", sans-serif';ctx.fillText(label,x+16,y+27);ctx.fillStyle="#071a34";ctx.font="700 28px Georgia, serif";ctx.fillText(number(Number(value)),x+16,y+61);});
 }
-function drawEventCard(ctx:CanvasRenderingContext2D,row:EventRow,index:number,y:number,width:number){
-  const margin=48;ctx.fillStyle=index%2===0?"#f7f9fc":"#eef3fa";ctx.fillRect(margin,y,width-margin*2,142);ctx.fillStyle="#1769e0";ctx.fillRect(margin,y,7,142);
-  ctx.fillStyle="#071a34";ctx.font='700 27px "Microsoft YaHei", sans-serif';ctx.fillText(fitText(ctx,row.name,210),margin+25,y+40);ctx.fillStyle="#738096";ctx.font="20px Arial";ctx.fillText(safe(row.code),margin+245,y+39);
-  ctx.textAlign="right";ctx.fillStyle="#071a34";ctx.font='700 25px "Microsoft YaHei", sans-serif';ctx.fillText(fitText(ctx,row.amount,230),width-margin-22,y+40);ctx.textAlign="left";
-  ctx.fillStyle="#7a8799";ctx.font='18px "Microsoft YaHei", sans-serif';ctx.fillText("质押股东",margin+25,y+82);ctx.fillStyle="#1c2e47";ctx.font='22px "Microsoft YaHei", sans-serif';ctx.fillText(fitText(ctx,row.shareholder,310),margin+122,y+82);
-  ctx.fillStyle="#1769e0";ctx.font="700 22px Arial";ctx.fillText("→",margin+450,y+82);ctx.fillStyle="#7a8799";ctx.font='18px "Microsoft YaHei", sans-serif';ctx.fillText("质权人",margin+495,y+82);ctx.fillStyle="#1c2e47";ctx.font='22px "Microsoft YaHei", sans-serif';ctx.fillText(fitText(ctx,row.pledgee,width-760),margin+580,y+82);
-  ctx.fillStyle="#7a8799";ctx.font='18px "Microsoft YaHei", sans-serif';ctx.fillText(`质押日期 ${safe(row.pledgeDate)}`,margin+25,y+119);
+function drawEventCard(ctx:CanvasRenderingContext2D,row:EventRow,index:number,x:number,y:number,width:number,height:number){
+  const compact=height<66;ctx.fillStyle=index%2===0?"#f7f9fc":"#eef3fa";ctx.fillRect(x,y,width,height);ctx.fillStyle="#1769e0";ctx.fillRect(x,y,6,height);
+  const left=x+18,right=x+width-16;ctx.fillStyle="#071a34";ctx.font=`700 ${compact?16:20}px "Microsoft YaHei", sans-serif`;ctx.fillText(fitText(ctx,row.name,width*.34),left,y+(compact?21:27));
+  ctx.fillStyle="#738096";ctx.font=`${compact?13:15}px Arial`;ctx.fillText(safe(row.code),left+width*.35,y+(compact?21:27));
+  ctx.textAlign="right";ctx.fillStyle="#071a34";ctx.font=`700 ${compact?15:18}px "Microsoft YaHei", sans-serif`;ctx.fillText(fitText(ctx,row.amount,width*.42),right,y+(compact?21:27));ctx.textAlign="left";
+  ctx.fillStyle="#65758b";ctx.font=`${compact?12:14}px "Microsoft YaHei", sans-serif`;ctx.fillText(`股东 ${fitText(ctx,row.shareholder,width-(compact?118:92))}`,left,y+(compact?42:54));
+  if(!compact){ctx.fillText(`质权人 ${fitText(ctx,row.pledgee,width-92)}`,left,y+78);ctx.textAlign="right";ctx.fillStyle="#8793a5";ctx.font='12px "Microsoft YaHei", sans-serif';ctx.fillText(safe(row.pledgeDate),right,y+78);ctx.textAlign="left";}
 }
 function drawFooter(ctx:CanvasRenderingContext2D,y:number,width:number,qr:HTMLImageElement){
-  ctx.fillStyle="#071a34";ctx.fillRect(0,y,width,220);ctx.fillStyle="#d4e0ef";ctx.font='20px "Microsoft YaHei", sans-serif';ctx.fillText("数据来源：交易所与上市公司官方公告",48,y+112);
-  const crop=Math.min(qr.naturalWidth*.68,qr.naturalHeight*.68),sx=qr.naturalWidth*.16,sy=qr.naturalHeight*.10,qrSize=180,cardX=width-228,cardY=y+12;
-  ctx.fillStyle="#fff";ctx.fillRect(cardX,cardY,196,196);ctx.drawImage(qr,sx,sy,crop,crop,cardX+8,cardY+8,qrSize,qrSize);
+  ctx.fillStyle="#071a34";ctx.fillRect(0,y,width,120);ctx.fillStyle="#d4e0ef";ctx.font='18px "Microsoft YaHei", sans-serif';ctx.fillText("数据来源：交易所与上市公司官方公告",48,y+68);
+  const crop=Math.min(qr.naturalWidth*.68,qr.naturalHeight*.68),sx=qr.naturalWidth*.16,sy=qr.naturalHeight*.10,qrSize=94,cardX=width-154,cardY=y+8;
+  ctx.fillStyle="#fff";ctx.fillRect(cardX,cardY,104,104);ctx.drawImage(qr,sx,sy,crop,crop,cardX+5,cardY+5,qrSize,qrSize);
 }
 
 export default function DailyReportClient(){
@@ -63,7 +63,7 @@ export default function DailyReportClient(){
   const load=useCallback(async()=>{setLoading(true);setError("");try{const response=await fetch("/api/daily-report",{cache:"no-store"});if(!response.ok)throw new Error("今日日报暂不可用");setReport(await response.json() as Snapshot);}catch(reason){setError(reason instanceof Error?reason.message:"今日日报暂不可用");}finally{setLoading(false);}},[]);
   useEffect(()=>{void load();},[load]);
   const rows=report?.events||[];const shareholderCount=useMemo(()=>new Set(rows.map(row=>row.shareholder).filter(Boolean)).size,[rows]);const pledgeeCount=useMemo(()=>new Set(rows.map(row=>row.pledgee).filter(Boolean)).size,[rows]);
-  const downloadDailyImage=async()=>{if(!report||!rows.length)return;try{const qr=await loadQrImage();const width=1080,firstY=468,rowStep=154,footerY=firstY+rows.length*rowStep+28,height=Math.max(1510,footerY+220);const canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;const ctx=canvas.getContext("2d");if(!ctx)return;ctx.fillStyle="#fff";ctx.fillRect(0,0,width,height);drawHeader(ctx,report,width);drawSummary(ctx,report,rows,shareholderCount,pledgeeCount,328,width);rows.forEach((row,index)=>drawEventCard(ctx,row,index,firstY+index*rowStep,width));drawFooter(ctx,height-220,width,qr);saveCanvas(canvas,`HBF-A股新增质押日报-${report.date}.png`);}catch{setError("公众号二维码加载失败，请刷新页面后重试");}};
+  const downloadDailyImage=async()=>{if(!report||!rows.length)return;try{const qr=await loadQrImage();const width=1080,height=1080,margin=48,gap=12,firstY=318,footerY=960;const columns=rows.length>14?3:2,gridRows=Math.ceil(rows.length/columns),cardWidth=(width-margin*2-gap*(columns-1))/columns,rowGap=8,cardHeight=Math.max(40,Math.min(94,(footerY-firstY-rowGap*Math.max(0,gridRows-1))/Math.max(1,gridRows)));const canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;const ctx=canvas.getContext("2d");if(!ctx)return;ctx.fillStyle="#fff";ctx.fillRect(0,0,width,height);drawHeader(ctx,report,width);drawSummary(ctx,report,rows,shareholderCount,pledgeeCount,226,width);rows.forEach((row,index)=>{const column=index%columns,rowIndex=Math.floor(index/columns);drawEventCard(ctx,row,index,margin+column*(cardWidth+gap),firstY+rowIndex*(cardHeight+rowGap),cardWidth,cardHeight);});drawFooter(ctx,footerY,width,qr);saveCanvas(canvas,`HBF-A股新增质押日报-${report.date}.png`);}catch{setError("公众号二维码加载失败，请刷新页面后重试");}};
   return <main className="dailyPage"><header className="dailyHeader"><a className="dailyBrand" href="/"><span>HBF</span><b>质押日报<small>SHAREHOLDER FINANCE INTELLIGENCE</small></b></a><nav><a className="active" href="/">今日日报</a><a href="/match">撮合服务</a><a href="/match/desk">我的撮合</a></nav><a className="dailyEn" href="/en">EN</a></header>
     <div className="dailyShell">{loading?<div className="dailyState">正在生成今日日报…</div>:error?<div className="dailyState error">{error}<button onClick={()=>void load()}>重试</button></div>:report&&<>
       <section className="dailyMasthead"><div><p className="eyebrow">ONE DAY · ONE VERIFIED IMAGE</p><h1>{report.date}<br/>新增质押日报</h1><p>不做实时消息流，不堆叠历史页面。每天完成官方公告核验后，只发布一份轻量、清晰、可直接传播的新增质押日报图。</p></div><aside><span className={`closingStatus ${report.status}`}>{statusMap[report.status].label}</span><b>{statusMap[report.status].note}</b><small>公告口径：当日 20:00 截止</small><small>自动处理：20:30 截止，未完成转人工</small><small>数据范围：仅新增质押</small><small>品牌发布：HBF</small></aside></section>
